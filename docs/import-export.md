@@ -72,6 +72,13 @@ embed   F32     [2]     8       104     2       -       -
 
 `bytes` is the stored length. For a GGUF tensor, that includes alignment padding up to the next tensor. `offset` is where that payload starts in the file. Inside `.npz` it is the offset inside that array's `.npy` entry. `params` is the element count. `shard` is filled for a shard index. `detail` is a padding note, `fortran_order`, `zip deflate`, a quant-pack name, or the shard file name. GPTQ, AWQ, bitsandbytes, compressed-tensors, and MLX stay packed; the note names the pack and the bytes are not dequantized.
 
+```
+tenspile -t --columns -f model.safetensors
+tenspile -t --columns --fold -f model.safetensors
+```
+
+`--columns` prints the same fields aligned for a terminal. A shared parent is a heading, and the leaf name is indented under it. `bytes` is a power-of-two size (`64 MiB`) and `params` is a decimal count (`16.8M`). `offset` stays an integer. `shard` and `detail` are omitted when every value is empty. `--fold` implies `--columns` and merges one numeric name segment across a consecutive run when dtype, shape, stored size, shard, and detail all match. `model.layers.[3-5].self_attn.` is one copy of each leaf, not the sum, and the offset column is `-`. A tensor that differs, or a gap in the numbers, stays on its own line. A second number in the name, such as an expert id, is not folded in the same pass. `--json` stays the tab-free machine listing; `--columns` and `--fold` are refused with it.
+
 `tenspile -i` adds format, version, member count, data bytes, metadata, a dtype tally, and any spec notes. `-i --json` and `-t --json` print one document.
 
 ## Files that are refused

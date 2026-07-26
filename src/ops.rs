@@ -87,6 +87,14 @@ pub fn execute(cli: Cli) -> Result<()> {
     if cli.output.is_some() && matches!(cli.op, Op::List | Op::Info) {
         return Err(msg("-o does not apply to list or info"));
     }
+    if cli.columns || cli.fold {
+        if cli.json {
+            return Err(msg("--columns and --fold do not apply to --json"));
+        }
+        if !matches!(cli.op, Op::List | Op::Info) {
+            return Err(msg("--columns and --fold apply to list or info"));
+        }
+    }
     match cli.op {
         Op::List => list(&cli),
         Op::Info => info(&cli),
@@ -105,7 +113,7 @@ fn list(cli: &Cli) -> Result<()> {
         println!("{}", json_document(&archive, &selected)?);
         return Ok(());
     }
-    print_members(&selected, cli.verbose);
+    print_members(&selected, member_style(cli));
     Ok(())
 }
 
@@ -146,18 +154,44 @@ fn info(cli: &Cli) -> Result<()> {
     for note in &archive.notes {
         println!("note: {note}");
     }
-    if cli.verbose {
-        print_members(&members, true);
+    if cli.verbose || cli.columns || cli.fold {
+        print_members(&members, member_style(cli));
     }
     Ok(())
 }
 
-fn print_members(members: &[&Member], verbose: bool) {
-    if !verbose {
-        for member in members {
-            println!("{}", member.name);
+enum MemberStyle {
+    Names,
+    Tabs,
+    Columns { fold: bool },
+}
+
+fn member_style(cli: &Cli) -> MemberStyle {
+    if cli.fold || cli.columns {
+        MemberStyle::Columns { fold: cli.fold }
+    } else if cli.verbose {
+        MemberStyle::Tabs
+    } else {
+        MemberStyle::Names
+    }
+}
+
+fn print_members(members: &[&Member], style: MemberStyle) {
+    match style {
+        MemberStyle::Names => {
+            for member in members {
+                println!("{}", member.name);
+            }
+            return;
         }
-        return;
+        MemberStyle::Columns { fold } => {
+            let text = crate::listing::render_columns(members, fold);
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            return;
+        }
+        MemberStyle::Tabs => {}
     }
     println!("name\tdtype\tshape\tbytes\toffset\tparams\tshard\tdetail");
     for member in members {

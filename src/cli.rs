@@ -105,6 +105,8 @@ pub struct Cli {
     pub op: Op,
     pub file: Option<PathBuf>,
     pub verbose: bool,
+    pub columns: bool,
+    pub fold: bool,
     pub directory: PathBuf,
     pub output: Option<PathBuf>,
     pub format: Option<FormatName>,
@@ -123,6 +125,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut op: Option<Op> = None;
     let mut file: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut columns = false;
+    let mut fold = false;
     let mut directory = PathBuf::from(".");
     let mut output: Option<PathBuf> = None;
     let mut format: Option<FormatName> = None;
@@ -188,6 +192,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 }
                 "json" => json = true,
                 "verbose" => verbose = true,
+                "columns" => columns = true,
+                "fold" => fold = true,
                 "dry-run" => dry_run = true,
                 "force" => force = true,
                 "delete" => set_op(&mut op, Op::Delete)?,
@@ -269,6 +275,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         op,
         file,
         verbose,
+        columns,
+        fold,
         directory,
         output,
         format,
@@ -360,7 +368,7 @@ tenspile — inspect and edit tensor containers
 
 Usage:
   tenspile -c [-f] ARCHIVE [KEY=FILE ...]
-  tenspile -t [-v] [-f] ARCHIVE [KEY ...]
+  tenspile -t [-v] [--columns] [--fold] [-f] ARCHIVE [KEY ...]
   tenspile -x [-f] ARCHIVE [KEY ...]
   tenspile -r [-f] ARCHIVE KEY=FILE ...
   tenspile -u [-f] ARCHIVE KEY=FILE ...
@@ -378,7 +386,14 @@ Operations (exactly one):
 
 Options:
   -f, --file FILE           Archive path. If omitted, the first argument is the archive.
-  -v, --verbose             Longer listing.
+  -v, --verbose             Longer listing. Fields are separated by tabs.
+  --columns                 Aligned listing for the console. Implies -v.
+                            Bytes and parameter counts are scaled. Shard and
+                            detail columns appear only when a member has them.
+  --fold                    With --columns, merge a consecutive run of one
+                            numeric name segment when the tensors match.
+                            model.layers.[3-5] is one copy per layer. A
+                            mismatch stays on its own line. Implies --columns.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are
@@ -404,6 +419,7 @@ Members:
 
 Examples:
   tenspile -tvf model.safetensors
+  tenspile -t --columns --fold -f model.safetensors
   tenspile -i model.gguf
   tenspile -xf model.safetensors -C out embed
   tenspile -cf out.safetensors embed=embed.npy --metadata format=pt

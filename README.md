@@ -6,6 +6,7 @@ Nick Reynolds ([goldnode](https://github.com/goldnode) on GitHub, [goldnode](htt
 
 ```
 tenspile -tvf model.safetensors
+tenspile -t --columns --fold -f model.safetensors
 tenspile -i model.gguf
 tenspile -xf model.safetensors -C out embed
 tenspile -cf out.safetensors embed=embed.npy --metadata format=pt
@@ -13,7 +14,7 @@ tenspile -uf model.safetensors norm=new_norm.npy
 tenspile --delete -f model.safetensors optimizer.step
 ```
 
-`cargo build --release` builds the binary. `tenspile -h` lists the flags.
+`cargo build --release` builds the binary. `tenspile -h` lists the flags. `-v` stays tab-separated. `--columns` aligns that listing for a terminal, and `--fold` collapses a consecutive run of identical layers such as `model.layers.[3-5]`. Both are described in [docs/import-export.md](docs/import-export.md).
 
 ## Specifications
 

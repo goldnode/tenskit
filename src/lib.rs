@@ -7,6 +7,7 @@ mod dtype;
 mod error;
 mod formats;
 mod io_util;
+mod listing;
 mod ops;
 mod payload;
 mod sha256;
