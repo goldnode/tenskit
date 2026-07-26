@@ -8,7 +8,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::{io_err, msg, Result};
-use crate::npy::{self, NpyInfo};
+use super::npy::{self, NpyInfo};
 
 #[derive(Debug, Clone)]
 pub struct NpzEntry {

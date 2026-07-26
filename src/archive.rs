@@ -8,12 +8,8 @@ use crate::cli::FormatName;
 use crate::detect::{self, Detected};
 use crate::dtype::{self, ggml_dense};
 use crate::error::{io_err, msg, Result};
-use crate::gguf::{self, GgufFile};
 use crate::io_util::relative_child;
-use crate::npy;
-use crate::npz;
 use crate::payload::Payload;
-use crate::safetensors;
 
 #[derive(Debug, Clone)]
 pub struct Member {
@@ -43,12 +39,22 @@ pub struct Archive {
 
 #[derive(Debug, Clone)]
 pub enum Inner {
+    #[cfg(format_safetensors)]
     Safe,
-    Gguf(GgufFile),
+    #[cfg(format_gguf)]
+    Gguf(crate::formats::gguf::GgufFile),
+    #[cfg(format_npy)]
     Npy,
+    #[cfg(format_npz)]
     Npz,
+    #[cfg(format_safetensors)]
     Index(IndexFile),
-    Raw,
+    #[cfg(format_raw_sidecar)]
+    Raw(crate::formats::rawtensor::RawFile),
+    #[cfg(format_pytorch)]
+    Pytorch,
+    #[cfg(format_onnx)]
+    Onnx,
 }
 
 #[derive(Debug, Clone)]
@@ -66,21 +72,47 @@ pub fn open(
     dtype: Option<&str>,
     shape: Option<&[u64]>,
 ) -> Result<Archive> {
-    if format == Some(FormatName::Raw) {
-        return open_raw(path, dtype, shape);
+    let _ = (dtype, shape);
+    let mut archive = open_detected(path, format, max_header)?;
+    annotate_packs(&mut archive);
+    Ok(archive)
+}
+
+fn open_detected(path: &Path, format: Option<FormatName>, max_header: u64) -> Result<Archive> {
+    #[cfg(format_raw_sidecar)]
+    if crate::formats::rawtensor::is_manifest_name(file_name(path)) {
+        return open_rawtensor(path);
     }
     let detected = detect::sniff(path, max_header)?;
     detect::refuse_unsafe(detected, path)?;
     let forced = format;
     match (forced, detected) {
+        #[cfg(format_safetensors)]
         (Some(FormatName::Safetensors), Detected::Safetensors) | (None, Detected::Safetensors) => {
             open_safe(path, max_header)
         }
+        #[cfg(format_gguf)]
         (Some(FormatName::Gguf), Detected::Gguf) | (None, Detected::Gguf) => open_gguf(path),
+        #[cfg(format_npy)]
         (Some(FormatName::Npy), Detected::Npy) | (None, Detected::Npy) => open_npy(path),
+        #[cfg(format_npz)]
         (Some(FormatName::Npz), Detected::Zip) | (None, Detected::Zip) => open_npz(path),
+        #[cfg(format_safetensors)]
         (None, Detected::Index) => open_index(path, max_header),
+        #[cfg(format_safetensors)]
         (Some(FormatName::Safetensors), Detected::Index) => open_index(path, max_header),
+        #[cfg(format_raw_sidecar)]
+        (Some(FormatName::Raw), Detected::RawTensor) | (None, Detected::RawTensor) => {
+            open_rawtensor(path)
+        }
+        #[cfg(format_pytorch)]
+        (Some(FormatName::Pytorch), Detected::Pytorch) | (None, Detected::Pytorch) => {
+            open_pytorch(path)
+        }
+        #[cfg(format_onnx)]
+        (Some(FormatName::Onnx), Detected::Onnx) | (None, Detected::Onnx) => {
+            crate::formats::onnx::open(path)
+        }
         (Some(forced), detected) => Err(msg(format!(
             "{} is {detected:?}, not {}",
             path.display(),
@@ -93,57 +125,108 @@ pub fn open(
     }
 }
 
-fn open_raw(path: &Path, dtype: Option<&str>, shape: Option<&[u64]>) -> Result<Archive> {
-    let dtype_name = dtype.ok_or_else(|| msg("raw archives need --dtype"))?;
-    let shape = shape
-        .ok_or_else(|| msg("raw archives need --shape"))?
-        .to_vec();
-    let dtype = dtype::safe_dtype(dtype_name)?;
-    let nbytes = dtype::packed_bytes(dtype, &shape)?;
-    let file_len = fs::metadata(path).map_err(|err| io_err(path, err))?.len();
-    if file_len != nbytes {
-        return Err(msg(format!(
-            "{} is {file_len} bytes and dtype {} shape {:?} needs {nbytes}",
-            path.display(),
-            dtype.name,
-            shape
-        )));
+#[cfg(format_pytorch)]
+fn open_pytorch(path: &Path) -> Result<Archive> {
+    crate::formats::pytorch::open(path)
+}
+
+fn annotate_packs(archive: &mut Archive) {
+    let owned: Vec<String> = archive.members.iter().map(|member| member.name.clone()).collect();
+    let peers: Vec<&str> = owned.iter().map(String::as_str).collect();
+    for member in &mut archive.members {
+        if member.detail.is_some() {
+            continue;
+        }
+        if let Some(note) = pack_note(&member.name, &peers) {
+            member.detail = Some(note.to_string());
+        }
     }
-    let name = path
-        .file_stem()
+    #[cfg(format_mlx)]
+    if archive.members.iter().any(|member| member.dtype.contains('V'))
+        || archive.metadata.iter().any(|(_, value)| value.contains('V'))
+    {
+        if let Some(note) = crate::formats::mlx::void_note("<V2") {
+            archive.notes.push(note.to_string());
+        }
+    }
+}
+
+fn pack_note(name: &str, peers: &[&str]) -> Option<&'static str> {
+    #[cfg(format_gptq)]
+    if let Some(note) = crate::formats::gptq::detail(name, peers) {
+        return Some(note);
+    }
+    #[cfg(format_awq)]
+    if let Some(note) = crate::formats::awq::detail(name, peers) {
+        return Some(note);
+    }
+    #[cfg(format_bitsandbytes)]
+    if let Some(note) = crate::formats::bitsandbytes::detail(name, peers) {
+        return Some(note);
+    }
+    #[cfg(format_compressed_tensors)]
+    if let Some(note) = crate::formats::compressed_tensors::detail(name) {
+        return Some(note);
+    }
+    #[cfg(format_mlx)]
+    if let Some(note) = crate::formats::mlx::quant_detail(name, peers) {
+        return Some(note);
+    }
+    let _ = (name, peers);
+    None
+}
+
+#[cfg(format_raw_sidecar)]
+fn file_name(path: &Path) -> &str {
+    path.file_name()
         .and_then(|text| text.to_str())
-        .unwrap_or("tensor")
-        .to_string();
-    let elements = dtype::numel(&shape);
+        .unwrap_or("")
+}
+
+#[cfg(format_raw_sidecar)]
+fn open_rawtensor(path: &Path) -> Result<Archive> {
+    let file = crate::formats::rawtensor::read_file(path)?;
+    let members = file
+        .tensors
+        .iter()
+        .map(|tensor| Member {
+            name: tensor.name.clone(),
+            dtype: tensor.dtype.clone(),
+            shape: tensor.shape.clone(),
+            file_offset: tensor.offset,
+            nbytes: tensor.nbytes,
+            numel: dtype::numel(&tensor.shape),
+            payload: tensor.payload.clone(),
+            shard: None,
+            detail: if tensor.fortran {
+                Some("fortran_order recorded in native; bytes were not transposed".into())
+            } else {
+                None
+            },
+            fortran: tensor.fortran,
+        })
+        .collect();
+    let data_bytes = file
+        .tensors
+        .iter()
+        .fold(0u64, |acc, tensor| acc.saturating_add(tensor.nbytes));
+    let metadata = crate::formats::rawtensor::display_metadata(&file.metadata);
+    let notes = file.notes.clone();
     Ok(Archive {
         format: FormatName::Raw,
-        version: "raw".into(),
+        version: crate::formats::rawtensor::VERSION.to_string(),
         path: path.to_path_buf(),
-        data_bytes: nbytes,
-        metadata: Vec::new(),
-        notes: Vec::new(),
-        inner: Inner::Raw,
-        members: vec![Member {
-            name,
-            dtype: dtype.name.to_string(),
-            shape,
-            file_offset: 0,
-            nbytes,
-            numel: elements,
-            payload: Payload::Range {
-                path: path.to_path_buf(),
-                offset: 0,
-                len: nbytes,
-            },
-            shard: None,
-            detail: None,
-            fortran: false,
-        }],
+        members,
+        metadata,
+        data_bytes,
+        notes,
+        inner: Inner::Raw(file),
     })
 }
 
+#[cfg(format_safetensors)]
 fn open_safe(path: &Path, max_header: u64) -> Result<Archive> {
-    let file = safetensors::read_file(path, max_header)?;
+    let file = crate::formats::safetensors::read_file(path, max_header)?;
     let mut members: Vec<_> = file
         .tensors
         .iter()
@@ -167,6 +250,7 @@ fn open_safe(path: &Path, max_header: u64) -> Result<Archive> {
     members.sort_by_key(|member| member.file_offset);
     let data_bytes = file.data_len;
     let metadata = file.metadata.clone();
+    let notes = file.warnings.clone();
     Ok(Archive {
         format: FormatName::Safetensors,
         version: "header+blob".into(),
@@ -174,13 +258,14 @@ fn open_safe(path: &Path, max_header: u64) -> Result<Archive> {
         members,
         metadata,
         data_bytes,
-        notes: Vec::new(),
+        notes,
         inner: Inner::Safe,
     })
 }
 
+#[cfg(format_gguf)]
 fn open_gguf(path: &Path) -> Result<Archive> {
-    let file = gguf::read_file(path)?;
+    let file = crate::formats::gguf::read_file(path)?;
     let mut members: Vec<_> = file
         .tensors
         .iter()
@@ -189,19 +274,19 @@ fn open_gguf(path: &Path) -> Result<Archive> {
             let detail = if dtype::is_quant_ggml(tensor.ggml_type) {
                 Some("quantized span includes alignment padding".to_string())
             } else if dense.is_some()
-                && gguf::logical_dense_bytes(tensor).is_some_and(|logical| logical != tensor.span)
+                && crate::formats::gguf::logical_dense_bytes(tensor).is_some_and(|logical| logical != tensor.span)
             {
                 Some(format!(
                     "stored span {} includes padding; dense payload is {} bytes",
                     tensor.span,
-                    gguf::logical_dense_bytes(tensor).unwrap_or(0)
+                    crate::formats::gguf::logical_dense_bytes(tensor).unwrap_or(0)
                 ))
             } else {
                 None
             };
             Member {
                 name: tensor.name.clone(),
-                dtype: gguf::type_label(tensor),
+                dtype: crate::formats::gguf::type_label(tensor),
                 shape: tensor.shape.clone(),
                 file_offset: tensor.file_offset,
                 nbytes: tensor.span,
@@ -236,13 +321,15 @@ fn open_gguf(path: &Path) -> Result<Archive> {
         notes: vec![
             format!("alignment {alignment}"),
             format!("data starts at {}", file.data_start),
+            "shapes are ggml ne[] (innermost first); a conversion reverses them".into(),
         ],
         inner: Inner::Gguf(file),
     })
 }
 
+#[cfg(format_npy)]
 fn open_npy(path: &Path) -> Result<Archive> {
-    let info = npy::read_info(path)?;
+    let info = crate::formats::npy::read_info(path)?;
     let name = path
         .file_stem()
         .and_then(|text| text.to_str())
@@ -255,6 +342,11 @@ fn open_npy(path: &Path) -> Result<Archive> {
     let mut notes = Vec::new();
     if info.fortran_order {
         notes.push("fortran_order: import into safetensors is refused".into());
+    }
+    if info.data_offset % 64 != 0 {
+        notes.push(
+            "npy data is not 64-byte aligned (NPY-005); the array is still read".into(),
+        );
     }
     Ok(Archive {
         format: FormatName::Npy,
@@ -283,8 +375,9 @@ fn open_npy(path: &Path) -> Result<Archive> {
     })
 }
 
+#[cfg(format_npz)]
 fn open_npz(path: &Path) -> Result<Archive> {
-    let entries = npz::read_entries(path)?;
+    let entries = crate::formats::npz::read_entries(path)?;
     let mut data_bytes = 0u64;
     let mut members = Vec::with_capacity(entries.len());
     let mut any_compressed = false;
@@ -336,6 +429,7 @@ fn open_npz(path: &Path) -> Result<Archive> {
     })
 }
 
+#[cfg(format_safetensors)]
 fn open_index(path: &Path, max_header: u64) -> Result<Archive> {
     let bytes = fs::read(path).map_err(|err| io_err(path, err))?;
     let value: Value = serde_json::from_slice(&bytes)?;
@@ -373,7 +467,7 @@ fn open_index(path: &Path, max_header: u64) -> Result<Archive> {
             continue;
         }
         let shard_path = relative_child(&directory, shard_name)?;
-        let file = safetensors::read_file(&shard_path, max_header)?;
+        let file = crate::formats::safetensors::read_file(&shard_path, max_header)?;
         shards.insert(shard_name.clone(), file);
     }
     let mut claimed: BTreeSet<(String, String)> = BTreeSet::new();

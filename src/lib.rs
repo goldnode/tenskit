@@ -5,13 +5,14 @@ mod cli;
 mod detect;
 mod dtype;
 mod error;
-mod gguf;
+mod formats;
 mod io_util;
-mod npy;
-mod npz;
 mod ops;
 mod payload;
-mod safetensors;
+mod sha256;
+
+#[cfg(test)]
+mod spec_audit;
 
 pub use error::{Error, Result};
 
@@ -31,11 +32,12 @@ pub fn run(args: &[String]) -> Result<()> {
 
 /// Small GGUF v3 writer used by tests. Creating GGUF is not a CLI operation.
 #[doc(hidden)]
+#[cfg(format_gguf)]
 pub fn write_gguf_fixture(
     path: &std::path::Path,
     name: &str,
     tensor_name: &str,
     f32_values: &[f32],
 ) -> Result<()> {
-    gguf::write_fixture(path, name, tensor_name, f32_values)
+    formats::gguf::write_fixture(path, name, tensor_name, f32_values)
 }

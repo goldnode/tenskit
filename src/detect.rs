@@ -13,6 +13,13 @@ pub enum Detected {
     LegacyGgml,
     Pickle,
     Index,
+    RawTensor,
+    /// Present even when the pytorch module is left out of the build.
+    #[allow(dead_code)]
+    Pytorch,
+    /// Present even when the onnx module is left out of the build.
+    #[allow(dead_code)]
+    Onnx,
 }
 
 pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
@@ -28,6 +35,10 @@ pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
         return Ok(Detected::Npy);
     }
     if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+        #[cfg(format_pytorch)]
+        if crate::formats::pytorch::is_torch_zip(path)? {
+            return Ok(Detected::Pytorch);
+        }
         return Ok(Detected::Zip);
     }
     if head.starts_with(b"ggml") || head.starts_with(b"ggmf") || head.starts_with(b"ggjt") {
@@ -44,8 +55,12 @@ pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if matches!(ext.as_str(), "pt" | "pth" | "bin" | "pkl") {
+    if matches!(ext.as_str(), "pt" | "pth" | "bin" | "pkl" | "ckpt") {
         return Ok(Detected::Pickle);
+    }
+    #[cfg(format_onnx)]
+    if matches!(ext.as_str(), "onnx" | "pb") {
+        return Ok(Detected::Onnx);
     }
     Err(msg(format!(
         "cannot tell what kind of tensor file {} is; pass --format",
@@ -91,6 +106,9 @@ fn safetensors_or_index(
     }
     let bytes = std::fs::read(path).map_err(|err| io_err(path, err))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value.get("format").and_then(serde_json::Value::as_str) == Some("rawtensor") {
+        return Ok(Some(Detected::RawTensor));
+    }
     if value
         .get("weight_map")
         .and_then(|item| item.as_object())
@@ -99,7 +117,7 @@ fn safetensors_or_index(
         Ok(Some(Detected::Index))
     } else {
         Err(msg(format!(
-            "{} is JSON without a weight_map",
+            "{} is JSON without a weight_map or a rawtensor manifest",
             path.display()
         )))
     }

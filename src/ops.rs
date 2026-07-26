@@ -10,12 +10,17 @@ use crate::cli::{Cli, FormatName, Op};
 use crate::detect::{self, Detected};
 use crate::dtype::{self, format_shape};
 use crate::error::{io_err, msg, Result};
-use crate::gguf::{self, MetaValue};
 use crate::io_util::{self, relative_child, safe_member_path};
-use crate::npy;
-use crate::npz::{self, NpzMember, NpzMemberBody};
 use crate::payload::Payload;
-use crate::safetensors::{self, OutTensor};
+
+#[cfg(format_gguf)]
+use crate::formats::gguf::{self, MetaValue};
+#[cfg(format_npy)]
+use crate::formats::npy;
+#[cfg(format_npz)]
+use crate::formats::npz::{self, NpzMember, NpzMemberBody};
+#[cfg(format_safetensors)]
+use crate::formats::safetensors::{self, OutTensor};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Modify {
@@ -32,28 +37,44 @@ struct Planned {
     payload: Payload,
     /// Set when the source is an `.npy` file that can be stored whole.
     npy_file: Option<PathBuf>,
+    fortran: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Pack {
     Npy,
     Safe,
+    Raw,
 }
 
 enum ExtractJob {
+    #[cfg(format_npy)]
     Npy {
         path: PathBuf,
         tensor: Planned,
     },
+    #[cfg(format_raw_sidecar)]
     Raw {
         path: PathBuf,
-        payload: Payload,
+        members: Vec<Planned>,
     },
+    #[cfg(format_npz)]
     Npz {
         path: PathBuf,
         members: Vec<Planned>,
     },
+    #[cfg(format_safetensors)]
     Safe {
+        path: PathBuf,
+        members: Vec<Planned>,
+    },
+    #[cfg(format_pytorch)]
+    Pytorch {
+        path: PathBuf,
+        members: Vec<Planned>,
+    },
+    #[cfg(format_onnx)]
+    Onnx {
         path: PathBuf,
         members: Vec<Planned>,
     },
@@ -217,9 +238,10 @@ fn json_document(archive: &Archive, members: &[&Member]) -> Result<String> {
 }
 
 fn extract(cli: &Cli) -> Result<()> {
+    #[cfg(format_gguf)]
     if cli.format == Some(FormatName::Gguf) {
         return Err(msg(
-            "extract cannot write GGUF; choose npy, raw, npz, or safetensors",
+            "extract cannot write GGUF; choose npy, raw, npz, safetensors, pytorch, or onnx",
         ));
     }
     let archive = open_extract_source(cli.file.as_ref().unwrap(), cli)?;
@@ -238,18 +260,38 @@ fn extract(cli: &Cli) -> Result<()> {
     for job in &jobs {
         ensure_parent(job_path(job))?;
         match job {
+                #[cfg(format_npy)]
             ExtractJob::Npy { path, tensor } => write_npy(path, tensor)?,
-            ExtractJob::Raw { path, payload } => {
-                io_util::atomic_write(path, |file| payload.copy_to(file))?;
+            #[cfg(format_raw_sidecar)]
+            ExtractJob::Raw { path, members } => {
+                let tensors = members
+                    .iter()
+                    .map(|item| {
+                        crate::formats::rawtensor::to_out(
+                            &item.name,
+                            &item.dtype,
+                            &item.shape,
+                            &item.payload,
+                            item.fortran,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                crate::formats::rawtensor::write_archive(path, &Map::new(), &tensors)?;
             }
+            #[cfg(format_npz)]
             ExtractJob::Npz { path, members } => {
                 let stored = members.iter().map(npz_member).collect::<Result<Vec<_>>>()?;
                 npz::write_archive(path, &stored)?;
             }
+            #[cfg(format_safetensors)]
             ExtractJob::Safe { path, members } => {
                 let tensors = members.iter().map(as_out).collect::<Result<Vec<_>>>()?;
                 safetensors::write_file(path, &[], &tensors)?;
             }
+            #[cfg(format_pytorch)]
+            ExtractJob::Pytorch { path, members } => write_pytorch(path, members)?,
+            #[cfg(format_onnx)]
+            ExtractJob::Onnx { path, members } => write_onnx(path, &[], members)?,
         }
     }
     Ok(())
@@ -257,35 +299,53 @@ fn extract(cli: &Cli) -> Result<()> {
 
 fn job_path(job: &ExtractJob) -> &Path {
     match job {
-        ExtractJob::Npy { path, .. }
-        | ExtractJob::Raw { path, .. }
-        | ExtractJob::Npz { path, .. }
-        | ExtractJob::Safe { path, .. } => path,
+        #[cfg(format_npy)]
+        ExtractJob::Npy { path, .. } => path,
+        #[cfg(format_raw_sidecar)]
+        ExtractJob::Raw { path, .. } => path,
+        #[cfg(format_npz)]
+        ExtractJob::Npz { path, .. } => path,
+        #[cfg(format_safetensors)]
+        ExtractJob::Safe { path, .. } => path,
+        #[cfg(format_pytorch)]
+        ExtractJob::Pytorch { path, .. } => path,
+        #[cfg(format_onnx)]
+        ExtractJob::Onnx { path, .. } => path,
     }
 }
 
 fn extract_jobs(cli: &Cli, archive: &Archive, selected: &[&Member]) -> Result<Vec<ExtractJob>> {
     if let Some(format) = combined_format(cli) {
         let path = combined_path(cli, selected, format)?;
-        let pack = if format == FormatName::Npz {
-            Pack::Npy
-        } else {
-            Pack::Safe
+        let pack = match format {
+            #[cfg(format_npz)]
+            FormatName::Npz => Pack::Npy,
+            #[cfg(format_raw_sidecar)]
+            FormatName::Raw => Pack::Raw,
+            #[allow(unreachable_patterns)]
+            _ => Pack::Safe,
         };
         let members = selected
             .iter()
             .map(|member| planned_export(archive, member, pack))
             .collect::<Result<Vec<_>>>()?;
-        let job = if format == FormatName::Npz {
-            ExtractJob::Npz { path, members }
-        } else {
-            ExtractJob::Safe { path, members }
+        let job = match format {
+            #[cfg(format_npz)]
+            FormatName::Npz => ExtractJob::Npz { path, members },
+            #[cfg(format_raw_sidecar)]
+            FormatName::Raw => ExtractJob::Raw { path, members },
+            #[cfg(format_pytorch)]
+            FormatName::Pytorch => ExtractJob::Pytorch { path, members },
+            #[cfg(format_onnx)]
+            FormatName::Onnx => ExtractJob::Onnx { path, members },
+            #[allow(unreachable_patterns)]
+            _ => ExtractJob::Safe { path, members },
         };
         return Ok(vec![job]);
     }
     if selected.len() > 1 && cli.output.is_some() {
         return Err(msg(
-            "several members need --format npz or safetensors, or -o with a .npz or .safetensors name; omit -o to write one file each",
+            "several members need --format npz, safetensors, or raw, or -o with a .npz, .safetensors, or .rawtensor.json name; omit -o to write one file each",
         ));
     }
     let mut jobs = Vec::with_capacity(selected.len());
@@ -305,13 +365,15 @@ fn extract_jobs(cli: &Cli, archive: &Archive, selected: &[&Member]) -> Result<Ve
         }
         let encoding = single_encoding(cli, Some(&path), member)?;
         let job = match encoding {
+            #[cfg(format_npy)]
             FormatName::Npy => ExtractJob::Npy {
                 path,
                 tensor: planned_export(archive, member, Pack::Npy)?,
             },
+            #[cfg(format_raw_sidecar)]
             FormatName::Raw => ExtractJob::Raw {
                 path,
-                payload: member.payload.clone(),
+                members: vec![planned_export(archive, member, Pack::Raw)?],
             },
             other => {
                 return Err(msg(format!(
@@ -327,10 +389,29 @@ fn extract_jobs(cli: &Cli, archive: &Archive, selected: &[&Member]) -> Result<Ve
 
 fn combined_format(cli: &Cli) -> Option<FormatName> {
     match cli.format {
-        Some(FormatName::Npz) | Some(FormatName::Safetensors) => cli.format,
+        #[cfg(format_npz)]
+        Some(FormatName::Npz) => cli.format,
+        #[cfg(format_safetensors)]
+        Some(FormatName::Safetensors) => cli.format,
+        #[cfg(format_raw_sidecar)]
+        Some(FormatName::Raw) => cli.format,
+        #[cfg(format_pytorch)]
+        Some(FormatName::Pytorch) => cli.format,
+        #[cfg(format_onnx)]
+        Some(FormatName::Onnx) => cli.format,
         _ => match cli.output.as_deref() {
+            #[cfg(format_npz)]
             Some(path) if ends_with(path, ".npz") => Some(FormatName::Npz),
+            #[cfg(format_safetensors)]
             Some(path) if ends_with(path, ".safetensors") => Some(FormatName::Safetensors),
+            #[cfg(format_raw_sidecar)]
+            Some(path) if ends_with(path, ".rawtensor.json") => Some(FormatName::Raw),
+            #[cfg(format_pytorch)]
+            Some(path) if ends_with(path, ".pt") || ends_with(path, ".pth") => {
+                Some(FormatName::Pytorch)
+            }
+            #[cfg(format_onnx)]
+            Some(path) if ends_with(path, ".onnx") => Some(FormatName::Onnx),
             _ => None,
         },
     }
@@ -341,10 +422,17 @@ fn combined_path(cli: &Cli, selected: &[&Member], format: FormatName) -> Result<
         return Ok(output.clone());
     }
     if selected.len() == 1 {
-        let ext = if format == FormatName::Npz {
-            "npz"
-        } else {
-            "safetensors"
+        let ext = match format {
+            #[cfg(format_npz)]
+            FormatName::Npz => "npz",
+            #[cfg(format_raw_sidecar)]
+            FormatName::Raw => "rawtensor.json",
+            #[cfg(format_pytorch)]
+            FormatName::Pytorch => "pt",
+            #[cfg(format_onnx)]
+            FormatName::Onnx => "onnx",
+            #[allow(unreachable_patterns)]
+            _ => "safetensors",
         };
         return per_file_path(&cli.directory, selected[0], ext_format(ext));
     }
@@ -356,26 +444,46 @@ fn combined_path(cli: &Cli, selected: &[&Member], format: FormatName) -> Result<
 
 fn ext_format(ext: &str) -> FormatName {
     match ext {
+        #[cfg(format_npz)]
         "npz" => FormatName::Npz,
+        #[cfg(format_safetensors)]
         "safetensors" => FormatName::Safetensors,
-        "raw" => FormatName::Raw,
+        #[cfg(format_raw_sidecar)]
+        "raw" | "rawtensor.json" => FormatName::Raw,
+        #[cfg(format_pytorch)]
+        "pt" => FormatName::Pytorch,
+        #[cfg(format_onnx)]
+        "onnx" => FormatName::Onnx,
+        #[cfg(format_npy)]
         _ => FormatName::Npy,
+        #[cfg(not(format_npy))]
+        _ => unreachable!("extract extension {ext} needs npy"),
     }
 }
 
 fn per_file_path(dir: &Path, member: &Member, encoding: FormatName) -> Result<PathBuf> {
     let ext = match encoding {
-        FormatName::Raw => "raw",
+        #[cfg(format_raw_sidecar)]
+        FormatName::Raw => "rawtensor.json",
+        #[cfg(format_npz)]
         FormatName::Npz => "npz",
+        #[cfg(format_safetensors)]
         FormatName::Safetensors => "safetensors",
-        FormatName::Npy | FormatName::Gguf => "npy",
+        #[cfg(format_pytorch)]
+        FormatName::Pytorch => "pt",
+        #[cfg(format_onnx)]
+        FormatName::Onnx => "onnx",
+        #[allow(unreachable_patterns)]
+        _ => "npy",
     };
     safe_member_path(dir, &member.name, ext)
 }
 
 fn single_encoding(cli: &Cli, path: Option<&Path>, member: &Member) -> Result<FormatName> {
     match cli.format {
+        #[cfg(format_raw_sidecar)]
         Some(FormatName::Raw) => return Ok(FormatName::Raw),
+        #[cfg(format_npy)]
         Some(FormatName::Npy) => return Ok(FormatName::Npy),
         Some(other) => {
             return Err(msg(format!(
@@ -386,40 +494,63 @@ fn single_encoding(cli: &Cli, path: Option<&Path>, member: &Member) -> Result<Fo
         None => {}
     }
     if let Some(path) = path {
-        if ends_with(path, ".raw") {
+        #[cfg(format_raw_sidecar)]
+        if ends_with(path, ".rawtensor.json") {
             return Ok(FormatName::Raw);
         }
+        #[cfg(format_npy)]
         if ends_with(path, ".npy") {
             return Ok(FormatName::Npy);
         }
     }
+    #[cfg(format_npy)]
     if !member.fortran && numpy_descr(&member.dtype).is_ok() {
-        Ok(FormatName::Npy)
-    } else {
-        Ok(FormatName::Raw)
+        return Ok(FormatName::Npy);
     }
+    #[cfg(format_raw_sidecar)]
+    {
+        let _ = member;
+        return Ok(FormatName::Raw);
+    }
+    #[allow(unreachable_code)]
+    Err(msg(format!(
+        "tensor {} has no compiled single-file encoding",
+        member.name
+    )))
 }
 
 fn planned_export(archive: &Archive, member: &Member, pack: Pack) -> Result<Planned> {
-    if member.fortran {
+    if member.fortran && pack != Pack::Raw {
         return Err(msg(format!(
-            "member {} is fortran-order; extract it with --format raw",
+            "member {} is fortran-order; tenspile does not transpose it. --format raw stores the bytes and records fortran_order",
             member.name
         )));
     }
     if matches!(pack, Pack::Npy) {
         numpy_descr(&member.dtype)?;
     }
+    let mut shape = member.shape.clone();
+    #[cfg(format_gguf)]
+    if matches!(archive.inner, Inner::Gguf(_)) {
+        shape.reverse();
+    }
     Ok(Planned {
         name: member.name.clone(),
         dtype: member.dtype.clone(),
-        shape: member.shape.clone(),
-        payload: clip(&member.payload, logical_len(archive, member)?)?,
+        shape,
+        payload: clip(&member.payload, logical_len(archive, member, pack)?)?,
         npy_file: None,
+        fortran: member.fortran,
     })
 }
 
-fn logical_len(archive: &Archive, member: &Member) -> Result<u64> {
+fn logical_len(archive: &Archive, member: &Member, pack: Pack) -> Result<u64> {
+    #[cfg(not(format_gguf))]
+    {
+        let _ = (archive, pack);
+        return Ok(member.nbytes);
+    }
+    #[cfg(format_gguf)]
     let Inner::Gguf(file) = &archive.inner else {
         return Ok(member.nbytes);
     };
@@ -428,17 +559,20 @@ fn logical_len(archive: &Archive, member: &Member) -> Result<u64> {
         .iter()
         .find(|tensor| tensor.name == member.name)
         .ok_or_else(|| msg(format!("missing GGUF tensor {}", member.name)))?;
-    match gguf::logical_dense_bytes(tensor) {
-        Some(logical) if logical <= member.nbytes => Ok(logical),
-        Some(_) => Err(msg(format!(
-            "tensor {} is larger than its stored span",
-            member.name
-        ))),
-        None => Err(msg(format!(
+    if dtype::is_quant_ggml(tensor.ggml_type) && pack != Pack::Raw {
+        return Err(msg(format!(
             "tensor {} is a quantized span; extract it with --format raw",
             member.name
-        ))),
+        )));
     }
+    let logical = dtype::ggml_payload_bytes(tensor.ggml_type, &tensor.shape)?;
+    if logical > member.nbytes {
+        return Err(msg(format!(
+            "tensor {} is larger than its stored span",
+            member.name
+        )));
+    }
+    Ok(logical)
 }
 
 fn clip(payload: &Payload, len: u64) -> Result<Payload> {
@@ -455,6 +589,10 @@ fn clip(payload: &Payload, len: u64) -> Result<Payload> {
             skip,
             len,
         },
+        Payload::Bytes(bytes) => {
+            let end = usize::try_from(len).map_err(|_| msg("export is too large"))?;
+            Payload::Bytes(bytes[..end].to_vec())
+        }
     })
 }
 
@@ -466,13 +604,17 @@ fn create(cli: &Cli) -> Result<()> {
     }
     let dest = cli.file.as_ref().unwrap();
     let format = dest_format(cli, dest)?;
+    #[cfg(format_gguf)]
     if format == FormatName::Gguf {
         return Err(msg("creating a GGUF file is not supported"));
     }
     let incoming = load_incoming(cli)?;
     let metadata = string_updates(cli)?;
+    #[allow(unreachable_patterns)]
     match format {
+        #[cfg(format_safetensors)]
         FormatName::Safetensors => {}
+        #[cfg(format_npy)]
         FormatName::Npy => {
             if incoming.len() != 1 {
                 return Err(msg("an npy file holds one array; use .npz for several"));
@@ -481,6 +623,7 @@ fn create(cli: &Cli) -> Result<()> {
                 return Err(msg("npy files have no string metadata"));
             }
         }
+        #[cfg(format_npz)]
         FormatName::Npz => {
             if incoming.is_empty() {
                 return Err(msg("an npz archive needs at least one array"));
@@ -489,15 +632,26 @@ fn create(cli: &Cli) -> Result<()> {
                 return Err(msg("npz files have no string metadata"));
             }
         }
-        FormatName::Raw => {
-            if incoming.len() != 1 {
-                return Err(msg("a raw file holds one tensor"));
+        #[cfg(format_raw_sidecar)]
+        FormatName::Raw => {}
+        #[cfg(format_pytorch)]
+        FormatName::Pytorch => {
+            if incoming.is_empty() {
+                return Err(msg("a pytorch checkpoint needs at least one tensor"));
             }
             if !metadata.is_empty() {
-                return Err(msg("raw files have no metadata"));
+                return Err(msg("a pytorch state_dict written here has no string metadata"));
             }
         }
+        #[cfg(format_onnx)]
+        FormatName::Onnx => {
+            if incoming.is_empty() {
+                return Err(msg("an ONNX file needs at least one initializer"));
+            }
+        }
+        #[cfg(format_gguf)]
         FormatName::Gguf => unreachable!("gguf create is refused above"),
+        _ => return Err(msg("that format is not compiled in")),
     }
     if dest.exists() && !cli.force {
         return Err(msg(format!(
@@ -505,18 +659,34 @@ fn create(cli: &Cli) -> Result<()> {
             dest.display()
         )));
     }
+    #[cfg(format_raw_sidecar)]
+    if format == FormatName::Raw {
+        if let Ok(data_name) = crate::formats::rawtensor::data_file_name(dest) {
+            let data_path = dest.parent().unwrap_or_else(|| Path::new(".")).join(data_name);
+            if data_path.exists() && !cli.force {
+                return Err(msg(format!(
+                    "{} exists; pass --force to overwrite",
+                    data_path.display()
+                )));
+            }
+        }
+    }
     if cli.dry_run {
         println!("dry-run: create {}", dest.display());
         print_plan(&incoming, &metadata);
         return Ok(());
     }
     ensure_parent(dest)?;
+    #[allow(unreachable_patterns)]
     match format {
+        #[cfg(format_safetensors)]
         FormatName::Safetensors => {
             let tensors = incoming.iter().map(as_out).collect::<Result<Vec<_>>>()?;
             safetensors::write_file(dest, &metadata, &tensors)?;
         }
+        #[cfg(format_npy)]
         FormatName::Npy => write_npy(dest, &incoming[0])?,
+        #[cfg(format_npz)]
         FormatName::Npz => {
             let members = incoming
                 .iter()
@@ -524,10 +694,15 @@ fn create(cli: &Cli) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             npz::write_archive(dest, &members)?;
         }
-        FormatName::Raw => {
-            io_util::atomic_write(dest, |file| incoming[0].payload.copy_to(file))?;
-        }
+        #[cfg(format_raw_sidecar)]
+        FormatName::Raw => write_rawtensor(dest, &metadata, &incoming)?,
+        #[cfg(format_pytorch)]
+        FormatName::Pytorch => write_pytorch(dest, &incoming)?,
+        #[cfg(format_onnx)]
+        FormatName::Onnx => write_onnx(dest, &metadata, &incoming)?,
+        #[cfg(format_gguf)]
         FormatName::Gguf => unreachable!("gguf create is refused above"),
+        _ => return Err(msg("that format is not compiled in")),
     }
     Ok(())
 }
@@ -542,21 +717,35 @@ fn modify(cli: &Cli, mode: Modify) -> Result<()> {
         cli.dtype.as_deref(),
         cli.shape.as_deref(),
     )?;
+    #[cfg(format_safetensors)]
     if matches!(archive.inner, Inner::Index(_)) && !same_parent(source, &dest) {
         return Err(msg(
             "-o for a shard index must stay in the same directory as the index",
         ));
     }
+    #[allow(unreachable_patterns)]
     match &archive.inner {
+        #[cfg(format_gguf)]
         Inner::Gguf(_) => edit_gguf(cli, &archive, mode, &dest),
+        #[cfg(format_safetensors)]
         Inner::Index(_) => edit_index(cli, &archive, mode, &dest),
+        #[cfg(format_safetensors)]
         Inner::Safe => edit_safe(cli, &archive, mode, &dest),
+        #[cfg(format_npy)]
         Inner::Npy => edit_single_file(cli, &archive, mode, &dest, false),
+        #[cfg(format_npz)]
         Inner::Npz => edit_npz(cli, &archive, mode, &dest),
-        Inner::Raw => edit_single_file(cli, &archive, mode, &dest, true),
+        #[cfg(format_raw_sidecar)]
+        Inner::Raw(_) => edit_raw(cli, &archive, mode, &dest),
+        #[cfg(format_pytorch)]
+        Inner::Pytorch => edit_pytorch(cli, &archive, mode, &dest),
+        #[cfg(format_onnx)]
+        Inner::Onnx => edit_onnx(cli, &archive, mode, &dest),
+        _ => Err(msg("this format cannot be edited in this build")),
     }
 }
 
+#[cfg(format_gguf)]
 fn edit_gguf(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
     if mode == Modify::Delete || !cli.operands.is_empty() {
         return Err(msg(
@@ -582,6 +771,7 @@ fn edit_gguf(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     gguf::rewrite_metadata(file, dest, &updates)
 }
 
+#[cfg(format_safetensors)]
 fn edit_safe(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
     let updates = string_updates(cli)?;
     let metadata = merge_strings(&archive.metadata, &updates);
@@ -597,6 +787,7 @@ fn edit_safe(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     safetensors::write_file(dest, &metadata, &tensors)
 }
 
+#[cfg(format_npz)]
 fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
     let updates = string_updates(cli)?;
     if !updates.is_empty() {
@@ -617,6 +808,121 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     npz::write_archive(dest, &members)
 }
 
+#[cfg(format_pytorch)]
+fn write_pytorch(dest: &Path, incoming: &[Planned]) -> Result<()> {
+    let tensors = incoming
+        .iter()
+        .map(|item| crate::formats::pytorch::OutTensor {
+            name: item.name.clone(),
+            dtype: item.dtype.clone(),
+            shape: item.shape.clone(),
+            payload: item.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::formats::pytorch::write_archive(dest, &tensors)
+}
+
+#[cfg(format_onnx)]
+fn write_onnx(dest: &Path, metadata: &[(String, String)], incoming: &[Planned]) -> Result<()> {
+    let tensors = incoming
+        .iter()
+        .map(|item| crate::formats::onnx::OutTensor {
+            name: item.name.clone(),
+            dtype: item.dtype.clone(),
+            shape: item.shape.clone(),
+            payload: item.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::formats::onnx::write_archive(dest, metadata, &tensors)
+}
+
+#[cfg(format_pytorch)]
+fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
+    let updates = string_updates(cli)?;
+    if !updates.is_empty() {
+        return Err(msg("a pytorch state_dict written here has no string metadata"));
+    }
+    let planned = plan_members(cli, &archive.members, mode, &updates)?;
+    if planned.is_empty() {
+        return Err(msg("a pytorch checkpoint needs at least one tensor"));
+    }
+    if cli.dry_run {
+        println!("dry-run: write {}", dest.display());
+        print_plan(&planned, &[]);
+        return Ok(());
+    }
+    refuse_overwrite(dest, Some(&archive.path), cli.force)?;
+    ensure_parent(dest)?;
+    write_pytorch(dest, &planned)
+}
+
+#[cfg(format_onnx)]
+fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
+    let updates = string_updates(cli)?;
+    let metadata = merge_strings(&archive.metadata, &updates);
+    let planned = plan_members(cli, &archive.members, mode, &updates)?;
+    if planned.is_empty() {
+        return Err(msg("an ONNX file needs at least one initializer"));
+    }
+    if cli.dry_run {
+        println!("dry-run: write {}", dest.display());
+        print_plan(&planned, &metadata);
+        return Ok(());
+    }
+    refuse_overwrite(dest, Some(&archive.path), cli.force)?;
+    ensure_parent(dest)?;
+    write_onnx(dest, &metadata, &planned)
+}
+
+#[cfg(format_raw_sidecar)]
+fn write_rawtensor(dest: &Path, metadata: &[(String, String)], incoming: &[Planned]) -> Result<()> {
+    let typed = crate::formats::rawtensor::string_metadata(metadata)?;
+    let tensors = incoming
+        .iter()
+        .map(|item| {
+            crate::formats::rawtensor::to_out(&item.name, &item.dtype, &item.shape, &item.payload, item.fortran)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::formats::rawtensor::write_archive(dest, &typed, &tensors)
+}
+
+#[cfg(format_raw_sidecar)]
+fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
+    let Inner::Raw(file) = &archive.inner else {
+        return Err(msg("internal error: expected a rawtensor archive"));
+    };
+    let updates = string_updates(cli)?;
+    let metadata = crate::formats::rawtensor::merge_metadata(&file.metadata, &updates)?;
+    let planned = plan_members(cli, &archive.members, mode, &updates)?;
+    if cli.dry_run {
+        println!("dry-run: write {}", dest.display());
+        print_plan(&planned, &archive.metadata);
+        return Ok(());
+    }
+    refuse_overwrite(dest, Some(&archive.path), cli.force)?;
+    let data_name = crate::formats::rawtensor::data_file_name(dest)?;
+    let data_path = dest.parent().unwrap_or_else(|| Path::new(".")).join(data_name);
+    if data_path != file_beside(&archive.path) {
+        refuse_overwrite(&data_path, None, cli.force)?;
+    }
+    ensure_parent(dest)?;
+    let tensors = planned
+        .iter()
+        .map(|item| {
+            crate::formats::rawtensor::to_out(&item.name, &item.dtype, &item.shape, &item.payload, item.fortran)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::formats::rawtensor::write_archive(dest, &metadata, &tensors)
+}
+
+#[cfg(format_raw_sidecar)]
+fn file_beside(manifest: &Path) -> PathBuf {
+    crate::formats::rawtensor::data_file_name(manifest)
+        .map(|name| manifest.parent().unwrap_or_else(|| Path::new(".")).join(name))
+        .unwrap_or_else(|_| manifest.to_path_buf())
+}
+
+#[cfg(any(format_npy, format_raw_sidecar))]
 fn edit_single_file(
     cli: &Cli,
     archive: &Archive,
@@ -664,6 +970,7 @@ fn edit_single_file(
     }
 }
 
+#[cfg(format_safetensors)]
 fn edit_index(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
     let Inner::Index(index) = &archive.inner else {
         return Err(msg("internal error: expected a shard index"));
@@ -948,6 +1255,7 @@ fn from_member(member: &Member) -> Planned {
         shape: member.shape.clone(),
         payload: member.payload.clone(),
         npy_file: None,
+        fortran: member.fortran,
     }
 }
 
@@ -986,13 +1294,6 @@ fn open_extract_source(path: &Path, cli: &Cli) -> Result<Archive> {
             detect::refuse_unsafe(kind, path)?;
             archive::open(path, None, cli.max_header, None, None)
         }
-        Err(_) if cli.format == Some(FormatName::Raw) => archive::open(
-            path,
-            Some(FormatName::Raw),
-            cli.max_header,
-            cli.dtype.as_deref(),
-            cli.shape.as_deref(),
-        ),
         Err(err) => Err(err),
     }
 }
@@ -1032,20 +1333,33 @@ fn dest_format(cli: &Cli, dest: &Path) -> Result<FormatName> {
             "creating a shard index is not supported; edit an existing index instead",
         ));
     }
+    #[cfg(format_safetensors)]
     if name.ends_with(".safetensors") {
         return Ok(FormatName::Safetensors);
     }
+    #[cfg(format_gguf)]
     if name.ends_with(".gguf") {
         return Ok(FormatName::Gguf);
     }
+    #[cfg(format_npy)]
     if name.ends_with(".npy") {
         return Ok(FormatName::Npy);
     }
+    #[cfg(format_npz)]
     if name.ends_with(".npz") {
         return Ok(FormatName::Npz);
     }
-    if name.ends_with(".raw") {
+    #[cfg(format_raw_sidecar)]
+    if name.ends_with(".rawtensor.json") {
         return Ok(FormatName::Raw);
+    }
+    #[cfg(format_pytorch)]
+    if name.ends_with(".pt") || name.ends_with(".pth") || name.ends_with(".ckpt") {
+        return Ok(FormatName::Pytorch);
+    }
+    #[cfg(format_onnx)]
+    if name.ends_with(".onnx") {
+        return Ok(FormatName::Onnx);
     }
     Err(msg(format!(
         "cannot tell the format of {}; pass --format",
@@ -1155,7 +1469,12 @@ fn load_file(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Vec<Planned>> 
                     }
                     load_npz_all(path, cli)
                 }
-                Detected::Safetensors | Detected::Gguf | Detected::Index => Err(msg(format!(
+                Detected::Safetensors
+                | Detected::Gguf
+                | Detected::Index
+                | Detected::RawTensor
+                | Detected::Pytorch
+                | Detected::Onnx => Err(msg(format!(
                     "{} holds named tensors; copy one with KEY={}:MEMBER",
                     path.display(),
                     path.display()
@@ -1203,6 +1522,7 @@ fn load_npy(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Planned> {
             len: info.nbytes,
         },
         npy_file: Some(path.to_path_buf()),
+        fortran: false,
     })
 }
 
@@ -1237,6 +1557,7 @@ fn load_npz_all(path: &Path, cli: &Cli) -> Result<Vec<Planned>> {
                 len: entry.info.nbytes,
             },
             npy_file: None,
+            fortran: false,
         });
     }
     Ok(planned)
@@ -1272,6 +1593,7 @@ fn load_raw(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Planned> {
             len: nbytes,
         },
         npy_file: None,
+        fortran: false,
     })
 }
 
@@ -1288,19 +1610,31 @@ fn load_member(path: &Path, member_name: &str, key: &str, cli: &Cli) -> Result<P
             path.display()
         )));
     }
-    check_declared(cli, key, &member.dtype, &member.shape)?;
+    let mut shape = member.shape.clone();
+    let mut payload = member.payload.clone();
+    #[cfg(format_gguf)]
+    if matches!(archive.inner, Inner::Gguf(_)) {
+        shape.reverse();
+        let logical = logical_len(&archive, member, Pack::Safe).or_else(|_| logical_len(&archive, member, Pack::Raw))?;
+        payload = clip(&payload, logical)?;
+    }
+    check_declared(cli, key, &member.dtype, &shape)?;
     Ok(Planned {
         name: key.to_string(),
         dtype: member.dtype.clone(),
-        shape: member.shape.clone(),
-        payload: member.payload.clone(),
+        shape,
+        payload,
         npy_file: None,
+        fortran: member.fortran,
     })
 }
 
 fn check_declared(cli: &Cli, name: &str, dtype: &str, shape: &[u64]) -> Result<()> {
     if let Some(want) = &cli.dtype {
-        if want != dtype {
+        let same = want == dtype
+            || dtype::canonical_id(want).ok() == dtype::canonical_id(dtype).ok()
+                && dtype::canonical_id(want).is_ok();
+        if !same {
             return Err(msg(format!(
                 "--dtype {want} does not match tensor {name} ({dtype})"
             )));
@@ -1437,11 +1771,21 @@ fn validate_safe(item: &Planned) -> Result<()> {
     Ok(())
 }
 
+#[cfg(format_safetensors)]
 fn as_out(item: &Planned) -> Result<OutTensor> {
-    validate_safe(item)?;
+    let dtype = dtype::safe_dtype(&item.dtype)?;
+    let expected = dtype::packed_bytes(dtype, &item.shape)?;
+    if expected != item.payload.len() {
+        return Err(msg(format!(
+            "tensor {} is {} bytes and dtype {} needs {expected}",
+            item.name,
+            item.payload.len(),
+            dtype.name
+        )));
+    }
     Ok(OutTensor {
         name: item.name.clone(),
-        dtype: item.dtype.clone(),
+        dtype: dtype.name.to_string(),
         shape: item.shape.clone(),
         bytes: item.payload.clone(),
     })
@@ -1456,11 +1800,13 @@ fn numpy_descr(dtype_name: &str) -> Result<String> {
     })
 }
 
+#[cfg(format_npy)]
 fn write_npy(path: &Path, item: &Planned) -> Result<()> {
     let descr = numpy_descr(&item.dtype)?;
     npy::write_file(path, &descr, &item.shape, |file| item.payload.copy_to(file))
 }
 
+#[cfg(format_npz)]
 fn npz_member(item: &Planned) -> Result<NpzMember> {
     validate_safe(item)?;
     let body = if let Some(path) = &item.npy_file {

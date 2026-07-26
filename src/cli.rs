@@ -17,35 +17,86 @@ pub enum Op {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatName {
+    #[cfg(format_safetensors)]
     Safetensors,
+    #[cfg(format_gguf)]
     Gguf,
+    #[cfg(format_npy)]
     Npy,
+    #[cfg(format_npz)]
     Npz,
+    #[cfg(format_raw_sidecar)]
     Raw,
+    #[cfg(format_pytorch)]
+    Pytorch,
+    #[cfg(format_onnx)]
+    Onnx,
 }
 
 impl FormatName {
     pub fn parse(text: &str) -> Result<Self> {
         match text {
+            #[cfg(format_safetensors)]
             "safetensors" | "safetensor" => Ok(Self::Safetensors),
+            #[cfg(format_gguf)]
             "gguf" => Ok(Self::Gguf),
+            #[cfg(format_npy)]
             "npy" => Ok(Self::Npy),
+            #[cfg(format_npz)]
             "npz" => Ok(Self::Npz),
-            "raw" => Ok(Self::Raw),
+            #[cfg(format_raw_sidecar)]
+            "raw" | "rawtensor" => Ok(Self::Raw),
+            #[cfg(format_pytorch)]
+            "pytorch" | "pt" => Ok(Self::Pytorch),
+            #[cfg(format_onnx)]
+            "onnx" => Ok(Self::Onnx),
             _ => Err(msg(format!(
-                "unknown format {text}; expected safetensors, gguf, npy, npz, or raw"
+                "unknown format {text}; this build accepts {}",
+                enabled_format_names()
             ))),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            #[cfg(format_safetensors)]
             Self::Safetensors => "safetensors",
+            #[cfg(format_gguf)]
             Self::Gguf => "gguf",
+            #[cfg(format_npy)]
             Self::Npy => "npy",
+            #[cfg(format_npz)]
             Self::Npz => "npz",
+            #[cfg(format_raw_sidecar)]
             Self::Raw => "raw",
+            #[cfg(format_pytorch)]
+            Self::Pytorch => "pytorch",
+            #[cfg(format_onnx)]
+            Self::Onnx => "onnx",
         }
+    }
+}
+
+fn enabled_format_names() -> String {
+    let mut names = Vec::new();
+    #[cfg(format_safetensors)]
+    names.push("safetensors");
+    #[cfg(format_gguf)]
+    names.push("gguf");
+    #[cfg(format_npy)]
+    names.push("npy");
+    #[cfg(format_npz)]
+    names.push("npz");
+    #[cfg(format_raw_sidecar)]
+    names.push("raw");
+    #[cfg(format_pytorch)]
+    names.push("pytorch");
+    #[cfg(format_onnx)]
+    names.push("onnx");
+    if names.is_empty() {
+        "no container formats".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -330,11 +381,13 @@ Options:
   -v, --verbose             Longer listing.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
-  --format NAME             safetensors, gguf, npy, npz, or raw.
-                            On extract, npy, raw, npz, or safetensors selects the output.
+  --format NAME             Container to read or write. This build's names are
+                            printed when the name is unknown. Which formats are
+                            compiled in is local/supported-formats.txt.
+                            raw is rawtensor/1 (a .rawtensor.json manifest plus a .bin).
   --json                    Machine-readable listing or info.
-  --dtype NAME              Dtype for a raw input, or for a raw extract.
-  --shape LIST              Shape for a raw input, for example 2,2 or [2, 2].
+  --dtype NAME              Dtype for a headerless input file (safetensors name or canonical id).
+  --shape LIST              Shape for a headerless input, for example 2,2 or [2, 2].
   --metadata KEY=VALUE      Set a text metadata entry.
   --metadata-file FILE      JSON object of metadata. GGUF values are typed.
   --max-header-size SIZE    Safetensors header cap (default 100M).

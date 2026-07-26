@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::dtype::{ggml_dense, ggml_type_name, numel};
+use crate::dtype::{ggml_dense, ggml_type_name, numel, require_ggml};
 use crate::error::{io_err, msg, Result};
 use crate::io_util::{atomic_write, copy_range};
 
@@ -171,6 +171,9 @@ pub fn read_file(path: &Path) -> Result<GgufFile> {
             shape.push(input.read_u64()?);
         }
         let ggml_type = input.read_u32()?;
+        require_ggml(ggml_type).map_err(|err| {
+            msg(format!("{}: tensor {name}: {err}", path.display()))
+        })?;
         let offset = input.read_u64()?;
         tensors_raw.push((name, ggml_type, shape, offset));
     }

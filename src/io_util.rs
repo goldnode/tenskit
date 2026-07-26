@@ -41,7 +41,7 @@ pub fn with_temp_file(dest: &Path, body: impl FnOnce(&Path) -> Result<()>) -> Re
             return Err(msg(format!("directory {} does not exist", dir.display())));
         }
     }
-    let tmp = tmp_path(dest);
+    let tmp = temp_beside(dest);
     let result = body(&tmp);
     if let Err(err) = result {
         let _ = fs::remove_file(&tmp);
@@ -51,7 +51,7 @@ pub fn with_temp_file(dest: &Path, body: impl FnOnce(&Path) -> Result<()>) -> Re
     Ok(())
 }
 
-fn tmp_path(dest: &Path) -> PathBuf {
+pub fn temp_beside(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
         .and_then(|text| text.to_str())

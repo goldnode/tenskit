@@ -30,6 +30,7 @@ pub struct SafeFile {
     pub data_len: u64,
     pub metadata: Vec<(String, String)>,
     pub tensors: Vec<TensorEntry>,
+    pub warnings: Vec<String>,
 }
 
 pub fn read_file(path: &Path, max_header: u64) -> Result<SafeFile> {
@@ -72,6 +73,20 @@ pub fn read_file(path: &Path, max_header: u64) -> Result<SafeFile> {
         ))
     })?;
     check_duplicate_keys(header_text)?;
+    let mut warnings = Vec::new();
+    if header_len % 8 != 0 {
+        warnings.push(
+            "safetensors header length is not a multiple of 8 (ST-016); the file is still read"
+                .to_string(),
+        );
+    }
+    let space_trimmed = header_text.trim_end_matches(' ');
+    if header_text.trim_end().len() != space_trimmed.len() {
+        warnings.push(
+            "safetensors header padding is not only spaces (ST-006); the file is still read"
+                .to_string(),
+        );
+    }
     let value: Value = serde_json::from_str(header_text)?;
     let object = value.as_object().ok_or_else(|| {
         msg(format!(
@@ -79,7 +94,25 @@ pub fn read_file(path: &Path, max_header: u64) -> Result<SafeFile> {
             path.display()
         ))
     })?;
-    parse_object(path, header_len, file_len, object)
+    let mut parsed = parse_object(path, header_len, file_len, object)?;
+    for tensor in &parsed.tensors {
+        if tensor.dtype == "F4" {
+            warnings.push(
+                "F4 nibble order is an open question (ST-Q2); bytes are copied and not interpreted"
+                    .to_string(),
+            );
+        }
+        if tensor.dtype == "F6_E2M3" || tensor.dtype == "F6_E3M2" {
+            warnings.push(
+                "F6 bit packing is an open question (ST-Q1); bytes are copied and not interpreted"
+                    .to_string(),
+            );
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    parsed.warnings = warnings;
+    Ok(parsed)
 }
 
 fn parse_object(
@@ -210,6 +243,7 @@ fn parse_object(
         data_len,
         metadata,
         tensors,
+        warnings: Vec::new(),
     })
 }
 

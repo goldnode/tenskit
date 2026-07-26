@@ -1,133 +1,97 @@
 use crate::error::{msg, Result};
 
+include!(concat!(env!("OUT_DIR"), "/spec_tables.rs"));
+
 /// A safetensors dtype name and its width in bits.
+///
+/// The rows come from `dtypes.yaml` joined with `dtype-mapping.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SafeDtype {
     pub name: &'static str,
     pub bits: u32,
-    /// NumPy `descr` for a little-endian array, when one exists.
+    /// NumPy `descr` for a little-endian array, when the mapping has one.
     pub numpy: Option<&'static str>,
+    /// Canonical id in `dtypes.yaml`.
+    pub canonical: &'static str,
 }
 
-const SAFE_DTYPES: &[SafeDtype] = &[
+fn row_to_safe(row: &SafeRow) -> SafeDtype {
     SafeDtype {
-        name: "BOOL",
-        bits: 8,
-        numpy: Some("|b1"),
-    },
-    SafeDtype {
-        name: "F4",
-        bits: 4,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F6_E2M3",
-        bits: 6,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F6_E3M2",
-        bits: 6,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "U8",
-        bits: 8,
-        numpy: Some("|u1"),
-    },
-    SafeDtype {
-        name: "I8",
-        bits: 8,
-        numpy: Some("|i1"),
-    },
-    SafeDtype {
-        name: "F8_E5M2",
-        bits: 8,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F8_E4M3",
-        bits: 8,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F8_E8M0",
-        bits: 8,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F8_E4M3FNUZ",
-        bits: 8,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "F8_E5M2FNUZ",
-        bits: 8,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "I16",
-        bits: 16,
-        numpy: Some("<i2"),
-    },
-    SafeDtype {
-        name: "U16",
-        bits: 16,
-        numpy: Some("<u2"),
-    },
-    SafeDtype {
-        name: "F16",
-        bits: 16,
-        numpy: Some("<f2"),
-    },
-    SafeDtype {
-        name: "BF16",
-        bits: 16,
-        numpy: None,
-    },
-    SafeDtype {
-        name: "I32",
-        bits: 32,
-        numpy: Some("<i4"),
-    },
-    SafeDtype {
-        name: "U32",
-        bits: 32,
-        numpy: Some("<u4"),
-    },
-    SafeDtype {
-        name: "F32",
-        bits: 32,
-        numpy: Some("<f4"),
-    },
-    SafeDtype {
-        name: "C64",
-        bits: 64,
-        numpy: Some("<c8"),
-    },
-    SafeDtype {
-        name: "F64",
-        bits: 64,
-        numpy: Some("<f8"),
-    },
-    SafeDtype {
-        name: "I64",
-        bits: 64,
-        numpy: Some("<i8"),
-    },
-    SafeDtype {
-        name: "U64",
-        bits: 64,
-        numpy: Some("<u8"),
-    },
-];
+        name: row.name,
+        bits: row.bits,
+        numpy: row.numpy,
+        canonical: row.canonical,
+    }
+}
 
 pub fn safe_dtype(name: &str) -> Result<SafeDtype> {
-    SAFE_DTYPES
+    SAFE_ROWS
         .iter()
-        .copied()
-        .find(|dtype| dtype.name == name)
+        .find(|row| row.name == name || row.canonical == name)
+        .map(row_to_safe)
         .ok_or_else(|| msg(format!("unknown safetensors dtype {name}")))
+}
+
+/// Canonical id for a safetensors name, a ggml type name, or an id that is already canonical.
+pub fn canonical_id(name: &str) -> Result<&'static str> {
+    if let Some(row) = SAFE_ROWS.iter().find(|row| row.name == name || row.canonical == name) {
+        return Ok(row.canonical);
+    }
+    if let Some(row) = GGML_TYPES.iter().find(|row| row.name == name) {
+        return row.canonical.ok_or_else(|| {
+            msg(format!(
+                "ggml type {name} has no canonical dtype and cannot be stored"
+            ))
+        });
+    }
+    if CANON.iter().any(|row| row.id == name) {
+        return Ok(CANON.iter().find(|row| row.id == name).unwrap().id);
+    }
+    Err(msg(format!("unknown dtype {name}")))
+}
+
+/// Byte length of a canonical tensor. Block dtypes use the last axis as the block axis.
+pub fn canonical_nbytes(id: &str, shape: &[u64]) -> Result<u64> {
+    let row = CANON
+        .iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| msg(format!("unknown canonical dtype {id}")))?;
+    let elements = numel(shape).ok_or_else(|| msg("shape is too large to count"))?;
+    if row.kind == "block" {
+        if shape.is_empty() {
+            return Err(msg(format!("block dtype {id} needs a shape")));
+        }
+        let inner = *shape.last().unwrap();
+        let block = u64::from(row.block_elements);
+        if block == 0 || inner % block != 0 {
+            return Err(msg(format!(
+                "block dtype {id} needs the last dimension to be a multiple of {}",
+                row.block_elements
+            )));
+        }
+        let blocks = elements / block;
+        return blocks
+            .checked_mul(u64::from(row.block_bytes))
+            .ok_or_else(|| msg("tensor is too large"));
+    }
+    let bits = elements
+        .checked_mul(u64::from(row.bits_num))
+        .ok_or_else(|| msg("tensor is too large"))?;
+    let denom = u64::from(row.bits_den) * 8;
+    Ok(bits.div_ceil(denom))
+}
+
+pub fn canon_kind(id: &str) -> Option<&'static str> {
+    CANON.iter().find(|row| row.id == id).map(|row| row.kind)
+}
+
+pub fn canon_bits(id: &str) -> Option<u32> {
+    let row = CANON.iter().find(|row| row.id == id)?;
+    if row.bits_den == 1 {
+        Some(row.bits_num)
+    } else {
+        None
+    }
 }
 
 pub fn numel(shape: &[u64]) -> Option<u64> {
@@ -169,11 +133,13 @@ pub fn numpy_descr_to_safe(descr: &str) -> Result<SafeDtype> {
             "numpy object dtype is a pickle payload and is not opened",
         ));
     }
-    let matched = SAFE_DTYPES.iter().copied().find(|dtype| {
-        dtype
-            .numpy
-            .is_some_and(|numpy| numpy == descr || numpy_aliases(dtype.name).contains(&descr))
-    });
+    let matched = SAFE_ROWS
+        .iter()
+        .find(|row| {
+            row.numpy
+                .is_some_and(|numpy| numpy == descr || numpy_aliases(row.name).contains(&descr))
+        })
+        .map(row_to_safe);
     matched.ok_or_else(|| {
         msg(format!(
             "numpy descr {descr} has no safetensors dtype; pass --dtype and --format raw"
@@ -214,73 +180,76 @@ pub fn format_shape(shape: &[u64]) -> String {
     format!("[{body}]")
 }
 
-/// GGML tensor type ids from the pinned GGUF spec.
-pub fn ggml_type_name(id: u32) -> String {
-    let name = match id {
-        0 => "F32",
-        1 => "F16",
-        2 => "Q4_0",
-        3 => "Q4_1",
-        4 => "Q4_2",
-        5 => "Q4_3",
-        6 => "Q5_0",
-        7 => "Q5_1",
-        8 => "Q8_0",
-        9 => "Q8_1",
-        10 => "Q2_K",
-        11 => "Q3_K",
-        12 => "Q4_K",
-        13 => "Q5_K",
-        14 => "Q6_K",
-        15 => "Q8_K",
-        16 => "IQ2_XXS",
-        17 => "IQ2_XS",
-        18 => "IQ3_XXS",
-        19 => "IQ1_S",
-        20 => "IQ4_NL",
-        21 => "IQ3_S",
-        22 => "IQ2_S",
-        23 => "IQ4_XS",
-        24 => "I8",
-        25 => "I16",
-        26 => "I32",
-        27 => "I64",
-        28 => "F64",
-        29 => "IQ1_M",
-        30 => "BF16",
-        31 => "Q4_0_4_4",
-        32 => "Q4_0_4_8",
-        33 => "Q4_0_8_8",
-        34 => "TQ1_0",
-        35 => "TQ2_0",
-        36 => "IQ4_NL_4_4",
-        37 => "IQ4_NL_4_8",
-        38 => "IQ4_NL_8_8",
-        39 => "MXFP4",
-        40 => "COUNT",
-        _ => return format!("ggml_type_{id}"),
-    };
-    name.to_string()
+pub fn ggml_row(id: u32) -> Option<&'static GgmlRow> {
+    GGML_TYPES.iter().find(|row| row.code == id)
 }
 
-/// Dense GGML types that have a fixed width and a NumPy descr.
+/// Refuse removed codes and the COUNT sentinel. GGUF-011.
+pub fn require_ggml(id: u32) -> Result<&'static GgmlRow> {
+    if id == GGML_TYPE_COUNT {
+        return Err(msg(
+            "ggml type COUNT is a sentinel, not a tensor type",
+        ));
+    }
+    let row = ggml_row(id).ok_or_else(|| msg(format!("unknown ggml type {id}")))?;
+    if row.removed {
+        return Err(msg(format!(
+            "ggml type {} ({id}) was removed from GGUF and is rejected",
+            row.name
+        )));
+    }
+    Ok(row)
+}
+
+/// GGML tensor type names from `formats/gguf.yaml`.
+pub fn ggml_type_name(id: u32) -> String {
+    if id == GGML_TYPE_COUNT {
+        return "COUNT".to_string();
+    }
+    ggml_row(id)
+        .map(|row| row.name.to_string())
+        .unwrap_or_else(|| format!("ggml_type_{id}"))
+}
+
+/// Element GGML types that map onto a safetensors dtype.
 pub fn ggml_dense(id: u32) -> Option<SafeDtype> {
-    let name = match id {
-        0 => "F32",
-        1 => "F16",
-        24 => "I8",
-        25 => "I16",
-        26 => "I32",
-        27 => "I64",
-        28 => "F64",
-        30 => "BF16",
-        _ => return None,
-    };
-    safe_dtype(name).ok()
+    let row = ggml_row(id)?;
+    if !row.element || row.removed {
+        return None;
+    }
+    safe_dtype(row.name).ok()
 }
 
 pub fn is_quant_ggml(id: u32) -> bool {
-    ggml_dense(id).is_none() && id != 40
+    ggml_row(id).is_some_and(|row| !row.element && !row.removed)
+}
+
+/// On-disk payload size for a ggml tensor. `shape` is file order (`ne[]`).
+pub fn ggml_payload_bytes(id: u32, shape: &[u64]) -> Result<u64> {
+    let row = require_ggml(id)?;
+    if row.element {
+        let dtype = safe_dtype(row.name)?;
+        return packed_bytes(dtype, shape);
+    }
+    if shape.is_empty() {
+        return Err(msg(format!(
+            "ggml type {} needs a dimension for its blocks",
+            row.name
+        )));
+    }
+    let inner = shape[0];
+    let block = u64::from(row.block_elements);
+    if block == 0 || inner % block != 0 {
+        return Err(msg(format!(
+            "ggml type {} needs ne[0] to be a multiple of {}",
+            row.name, row.block_elements
+        )));
+    }
+    let elements = numel(shape).ok_or_else(|| msg("shape is too large to count"))?;
+    elements
+        .checked_div(block)
+        .and_then(|blocks| blocks.checked_mul(u64::from(row.block_bytes)))
+        .ok_or_else(|| msg("tensor is too large"))
 }
 
 #[cfg(test)]
@@ -298,5 +267,23 @@ mod tests {
     fn rank_zero_is_one_element() {
         assert_eq!(numel(&[]), Some(1));
         assert_eq!(packed_bytes(safe_dtype("F32").unwrap(), &[]).unwrap(), 4);
+    }
+
+    #[test]
+    fn registry_comes_from_the_specs() {
+        assert_eq!(SPEC_FORMATS.len(), 23);
+        let mut ids: Vec<_> = SPEC_FORMATS.iter().map(|row| row.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 23);
+        assert!(SPEC_FORMATS.iter().any(|row| row.id == "safetensors" && row.depth == "full"));
+        assert!(SPEC_FORMATS.iter().any(|row| row.id == "raw-sidecar" && row.depth == "full"));
+        assert_eq!(safe_dtype("F32").unwrap().canonical, "float32");
+        assert_eq!(safe_dtype("float32").unwrap().name, "F32");
+        assert_eq!(ggml_type_name(40), "NVFP4");
+        assert_eq!(ggml_type_name(GGML_TYPE_COUNT), "COUNT");
+        assert!(require_ggml(4).is_err());
+        assert_eq!(canonical_nbytes("float32", &[4, 64]).unwrap(), 1024);
+        assert_eq!(canonical_nbytes("ggml_q8_0", &[4, 64]).unwrap(), 8 * 34);
     }
 }
