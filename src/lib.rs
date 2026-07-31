@@ -3,6 +3,7 @@
 mod archive;
 mod cli;
 mod detect;
+mod diff;
 mod dtype;
 mod error;
 mod formats;
@@ -17,18 +18,22 @@ mod spec_audit;
 
 pub use error::{Error, Result};
 
-pub fn run(args: &[String]) -> Result<()> {
+pub fn run(args: &[String]) -> Result<i32> {
     match cli::parse(args)? {
         cli::Parsed::Help => {
             println!("{}", cli::help_text());
-            Ok(())
+            Ok(0)
         }
         cli::Parsed::Version => {
             println!("{}", cli::version_text());
-            Ok(())
+            Ok(0)
         }
         cli::Parsed::Run(command) => ops::execute(command),
     }
+}
+
+pub fn diff_main(args: &[String]) -> Result<i32> {
+    diff::diff_main(args)
 }
 
 /// Small GGUF v3 writer used by tests. Creating GGUF is not a CLI operation.

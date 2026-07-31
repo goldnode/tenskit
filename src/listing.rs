@@ -91,15 +91,31 @@ fn layout(rows: &[Row]) -> String {
             }
         })
         .max()
-        .unwrap_or(0);
-    let dtype_width = width(ordered.iter().map(|row| row.dtype.as_str()));
-    let shape_width = width(ordered.iter().map(|row| row.shape.as_str()));
-    let bytes_width = width(ordered.iter().map(|row| row.bytes.as_str()));
-    let offset_width = width(ordered.iter().map(|row| row.offset.as_str()));
-    let params_width = width(ordered.iter().map(|row| row.params.as_str()));
-    let shard_width = width(ordered.iter().map(|row| row.shard.as_str()));
+        .unwrap_or(0)
+        .max("name".len());
+    let dtype_width = column_width(ordered.iter().map(|row| row.dtype.as_str()), "dtype");
+    let shape_width = column_width(ordered.iter().map(|row| row.shape.as_str()), "shape");
+    let bytes_width = column_width(ordered.iter().map(|row| row.bytes.as_str()), "bytes");
+    let offset_width = column_width(ordered.iter().map(|row| row.offset.as_str()), "offset");
+    let params_width = column_width(ordered.iter().map(|row| row.params.as_str()), "params");
+    let shard_width = column_width(ordered.iter().map(|row| row.shard.as_str()), "shard");
 
     let mut lines = Vec::new();
+    let mut head = vec![
+        pad_end("name", name_width),
+        pad_end("dtype", dtype_width),
+        pad_end("shape", shape_width),
+        pad_start("bytes", bytes_width),
+        pad_start("offset", offset_width),
+        pad_start("params", params_width),
+    ];
+    if show_shard {
+        head.push(pad_end("shard", shard_width));
+    }
+    if show_detail {
+        head.push("detail".to_string());
+    }
+    lines.push(head.join("  "));
     let mut previous_header: Option<&str> = None;
     for row in ordered {
         if previous_header != Some(row.header.as_str()) {
@@ -137,6 +153,10 @@ fn layout(rows: &[Row]) -> String {
 
 fn width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
     values.map(|value| value.chars().count()).max().unwrap_or(0)
+}
+
+fn column_width<'a>(values: impl Iterator<Item = &'a str>, label: &str) -> usize {
+    width(values).max(label.chars().count())
 }
 
 fn pad_end(text: &str, width: usize) -> String {
@@ -448,9 +468,10 @@ mod tests {
         assert_eq!(
             text,
             "\
+name             dtype  shape          bytes  offset  params
 model.layers.0.self_attn.
-  q_proj.weight  F32  [4096, 4096]  64 MiB  104  16.8M
-  k_proj.weight  F32  [4096, 1024]  16 MiB  200   4.2M"
+  q_proj.weight  F32    [4096, 4096]  64 MiB     104   16.8M
+  k_proj.weight  F32    [4096, 1024]  16 MiB     200    4.2M"
         );
     }
 
@@ -482,11 +503,21 @@ model.layers.0.self_attn.
         ));
         let refs: Vec<&Member> = owned.iter().collect();
         let text = render_columns(&refs, true);
-        assert!(text.contains("model.layers.[3-5].self_attn."));
-        assert!(text.contains("  q_proj.weight  F32  [4096, 4096]  64 MiB   -  16.8M"));
-        assert!(text.contains("  k_proj.weight  F32  [4096, 1024]  16 MiB   -   4.2M"));
-        assert!(text.contains("model.layers.4.self_attn."));
-        assert!(text.contains("  v_proj.weight  F16  [4096, 1024]   8 MiB  99   4.2M"));
+        assert!(text.starts_with("name"), "{text}");
+        assert!(text.contains("model.layers.[3-5].self_attn."), "{text}");
+        assert!(
+            text.contains("  q_proj.weight  F32    [4096, 4096]  64 MiB       -   16.8M"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  k_proj.weight  F32    [4096, 1024]  16 MiB       -    4.2M"),
+            "{text}"
+        );
+        assert!(text.contains("model.layers.4.self_attn."), "{text}");
+        assert!(
+            text.contains("  v_proj.weight  F16    [4096, 1024]   8 MiB      99    4.2M"),
+            "{text}"
+        );
         assert!(!text.contains("model.layers.3.self_attn."));
     }
 

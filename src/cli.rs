@@ -13,6 +13,7 @@ pub enum Op {
     Update,
     Delete,
     Info,
+    Diff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +204,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 "append" => set_op(&mut op, Op::Append)?,
                 "update" => set_op(&mut op, Op::Update)?,
                 "info" => set_op(&mut op, Op::Info)?,
+                "diff" => set_op(&mut op, Op::Diff)?,
                 _ => return Err(msg(format!("unknown option --{name}"))),
             }
             index += 1;
@@ -245,11 +247,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 'i' => set_op(&mut op, Op::Info)?,
                 'v' => verbose = true,
                 'n' => dry_run = true,
-                'd' => {
-                    return Err(msg(
-                        "-d is reserved for a later compare command; use --delete to remove members",
-                    ));
-                }
+                'd' => set_op(&mut op, Op::Diff)?,
                 'h' => return Ok(Parsed::Help),
                 _ => return Err(msg(format!("unknown option -{ch}"))),
             }
@@ -258,8 +256,21 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         index += 1;
     }
 
-    let op = op.ok_or_else(|| msg("choose one operation: -c, -t, -x, -r, -u, -i, or --delete"))?;
-    if file.is_none() {
+    let op =
+        op.ok_or_else(|| msg("choose one operation: -c, -t, -x, -r, -u, -i, -d, or --delete"))?;
+    if op == Op::Diff {
+        let (left, right) = if file.is_none() && operands.len() == 2 {
+            let right = operands.pop().unwrap();
+            let left = operands.pop().unwrap();
+            (PathBuf::from(left), right)
+        } else if file.is_some() && operands.len() == 1 {
+            (file.clone().unwrap(), operands[0].clone())
+        } else {
+            return Err(msg("diff needs two archive paths"));
+        };
+        file = Some(left);
+        operands = vec![right];
+    } else if file.is_none() {
         if operands.is_empty() {
             return Err(msg(
                 "missing archive path; pass -f FILE or the path as the first argument",
@@ -295,7 +306,9 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
 fn set_op(slot: &mut Option<Op>, op: Op) -> Result<()> {
     if let Some(existing) = *slot {
         if existing != op {
-            return Err(msg("pass only one of -c, -t, -x, -r, -u, -i, or --delete"));
+            return Err(msg(
+                "pass only one of -c, -t, -x, -r, -u, -i, -d, or --delete",
+            ));
         }
     }
     *slot = Some(op);
@@ -374,6 +387,7 @@ Usage:
   tenspile -u [-f] ARCHIVE KEY=FILE ...
   tenspile --delete [-f] ARCHIVE KEY ...
   tenspile -i [-f] ARCHIVE
+  tenspile -d ARCHIVE ARCHIVE
 
 Operations (exactly one):
   -c, --create     Create an archive. Refuses to overwrite unless --force.
@@ -383,11 +397,12 @@ Operations (exactly one):
   -u, --update     Replace a tensor key, or add it if it is missing.
   --delete         Remove tensor keys and write the archive again.
   -i, --info       Summarize the archive from its header.
+  -d, --diff       Compare two archives. Exit 1 when they differ.
 
 Options:
   -f, --file FILE           Archive path. If omitted, the first argument is the archive.
   -v, --verbose             Longer listing. Fields are separated by tabs.
-  --columns                 Aligned listing for the console. Implies -v.
+  --columns                 Aligned listing for the console, with headings. Implies -v.
                             Bytes and parameter counts are scaled. Shard and
                             detail columns appear only when a member has them.
   --fold                    With --columns, merge a consecutive run of one
@@ -425,6 +440,7 @@ Examples:
   tenspile -cf out.safetensors embed=embed.npy --metadata format=pt
   tenspile -uf model.safetensors norm=new_norm.npy
   tenspile --delete -f model.safetensors optimizer.step
+  tenspile -d left.safetensors right.gguf
 "
 }
 

@@ -80,7 +80,7 @@ enum ExtractJob {
     },
 }
 
-pub fn execute(cli: Cli) -> Result<()> {
+pub fn execute(cli: Cli) -> Result<i32> {
     if cli.directory != Path::new(".") && cli.op != Op::Extract {
         return Err(msg("-C applies to extract"));
     }
@@ -95,15 +95,20 @@ pub fn execute(cli: Cli) -> Result<()> {
             return Err(msg("--columns and --fold apply to list or info"));
         }
     }
-    match cli.op {
-        Op::List => list(&cli),
-        Op::Info => info(&cli),
-        Op::Extract => extract(&cli),
-        Op::Create => create(&cli),
-        Op::Append => modify(&cli, Modify::Append),
-        Op::Update => modify(&cli, Modify::Update),
-        Op::Delete => modify(&cli, Modify::Delete),
+    if cli.op == Op::Diff {
+        return crate::diff::from_cli(&cli);
     }
+    match cli.op {
+        Op::List => list(&cli)?,
+        Op::Info => info(&cli)?,
+        Op::Extract => extract(&cli)?,
+        Op::Create => create(&cli)?,
+        Op::Append => modify(&cli, Modify::Append)?,
+        Op::Update => modify(&cli, Modify::Update)?,
+        Op::Delete => modify(&cli, Modify::Delete)?,
+        Op::Diff => unreachable!(),
+    }
+    Ok(0)
 }
 
 fn list(cli: &Cli) -> Result<()> {

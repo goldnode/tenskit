@@ -13,6 +13,10 @@ publish = false
 name = "tenspile"
 path = "src/main.rs"
 
+[[bin]]
+name = "tensdiff"
+path = "src/tensdiff.rs"
+
 [dependencies]
 serde_json = "1"
 sha2 = "0.10"
