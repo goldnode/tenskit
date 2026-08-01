@@ -87,6 +87,13 @@ tenspile -t --columns --fold -f model.safetensors
 
 A dtype match uses the canonical id, so `F32` and `float32` are the same type. A GGUF shape is reversed from `ne[]` before it is compared. The bytes compared are the logical tensor: GGUF alignment padding is dropped, and a quantized tensor is the block bytes, not a dequantized float. Exit 0 means the names, types, shapes, values, and metadata match. Exit 1 means a difference was printed. `tensdiff` exits 2 when a file cannot be read. `--json` prints the same findings as a document.
 
+`--match-names` pairs names that differ through `tables/gguf-tensor-roles.json`. A GGUF `general.architecture` value selects that architecture. Otherwise every architecture is tried, and the smallest role set that explains every remaining name wins. When several architectures still fit, the report says `names: may be refact, qwen2vl, or granite`. Each pair lists both names. `language_model.` is removed before the lookup. Vision and audio tensors are left unpaired in a language file. Qwen3.5 `dt_bias` and `mtp.*` names use the rewrites in `qwen35_tensor_names_to_gguf`. If nothing covers the names, the report says `names: no table matched` and falls back to exact names. Paired Q and K weights stay in the order stored in the file, so a permuted or quantized tensor still shows a value or dtype difference.
+
+```bash
+tensdiff --match-names model.safetensors model.gguf
+tenspile -d --match-names model.safetensors model.gguf
+```
+
 ## Files that are refused
 
 A PyTorch zip checkpoint is read with a restricted unpickler. A pickle that is not that zip — a bare `.pt` or `.pth` without `data.pkl`, or bytes that start with a pickle opcode — stops with a message that names pickle, and no code from the file runs. A global outside the tensor allowlist is rejected. A `.bin` whose bytes are ordinary tensor data can be imported when `--dtype` and `--shape` are set. Legacy `ggml`, `ggmf`, and `ggjt` stop with `is legacy GGML/GGMF/GGJT; tenspile reads GGUF`. Removed ggml type codes are rejected. GGUF version 1 and big-endian GGUF are refused. A strided PyTorch tensor is refused rather than gathered.

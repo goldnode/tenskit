@@ -95,6 +95,9 @@ pub fn execute(cli: Cli) -> Result<i32> {
             return Err(msg("--columns and --fold apply to list or info"));
         }
     }
+    if cli.match_names && cli.op != Op::Diff {
+        return Err(msg("--match-names applies to diff"));
+    }
     if cli.op == Op::Diff {
         return crate::diff::from_cli(&cli);
     }

@@ -21,8 +21,13 @@ fn main() {
     check_gguf(&ggml, &mapping, &yaml_dtypes);
 
     let safe = safetensors_rows(&yaml_dtypes, &mapping);
+    let name_tables = parse_name_tables(&specs.join("mappings/metadata-mapping.yaml"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    fs::write(out_dir.join("spec_tables.rs"), render(&yaml_dtypes, &formats, &ggml, &safe)).unwrap();
+    fs::write(
+        out_dir.join("spec_tables.rs"),
+        render(&yaml_dtypes, &formats, &ggml, &safe, &name_tables),
+    )
+    .unwrap();
 
     for row in &formats {
         println!(
@@ -46,7 +51,8 @@ fn main() {
 fn enabled_format_ids(manifest: &Path, formats: &[FormatRow]) -> Vec<String> {
     let path = manifest.join("local/supported-formats.txt");
     println!("cargo:rerun-if-changed={}", path.display());
-    let text = fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let known: BTreeSet<&str> = formats.iter().map(|row| row.id.as_str()).collect();
     let mut ids = Vec::new();
     for (line_no, line) in text.lines().enumerate() {
@@ -97,9 +103,7 @@ fn module_name(id: &str) -> String {
 }
 
 fn render_enabled(dir: &Path, ids: &[String]) -> String {
-    let mut out = String::from(
-        "// Generated from local/supported-formats.txt. Do not edit.\n",
-    );
+    let mut out = String::from("// Generated from local/supported-formats.txt. Do not edit.\n");
     let list = ids
         .iter()
         .map(|id| format!("    \"{id}\""))
@@ -160,7 +164,8 @@ struct GgmlType {
 }
 
 fn parse_dtype_registry(path: &Path) -> Vec<Canon> {
-    let text = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let mut rows = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -201,7 +206,8 @@ fn parse_dtype_registry(path: &Path) -> Vec<Canon> {
 }
 
 fn parse_mapping(path: &Path) -> Vec<MapDtype> {
-    let text = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     let rows = value["dtypes"].as_array().expect("dtypes array");
     rows.iter()
@@ -241,11 +247,17 @@ fn check_registry(yaml: &[Canon], mapping: &[MapDtype]) {
     for row in yaml {
         let mapped = mapping.iter().find(|item| item.id == row.id).unwrap();
         if mapped.kind != row.kind {
-            panic!("{} kind is {} in yaml and {} in the mapping", row.id, row.kind, mapped.kind);
+            panic!(
+                "{} kind is {} in yaml and {} in the mapping",
+                row.id, row.kind, mapped.kind
+            );
         }
         let bits = row.bits_num as f64 / row.bits_den as f64;
         if (bits - mapped.bits).abs() > 1e-6 {
-            panic!("{} bits are {bits} in yaml and {} in the mapping", row.id, mapped.bits);
+            panic!(
+                "{} bits are {bits} in yaml and {} in the mapping",
+                row.id, mapped.bits
+            );
         }
     }
 }
@@ -360,7 +372,13 @@ fn parse_gguf_types(path: &Path) -> (u32, Vec<GgmlType>) {
                 if let Some((key, value)) = trimmed.split_once(':') {
                     if matches!(
                         key,
-                        "name" | "canonical" | "storage" | "status" | "block_elements" | "block_bytes" | "bits"
+                        "name"
+                            | "canonical"
+                            | "storage"
+                            | "status"
+                            | "block_elements"
+                            | "block_bytes"
+                            | "bits"
                     ) && !value.trim().is_empty()
                         && !value.trim().starts_with('|')
                     {
@@ -425,12 +443,17 @@ fn check_gguf(ggml: &(u32, Vec<GgmlType>), mapping: &[MapDtype], yaml: &[Canon])
                 .unwrap_or_else(|| panic!("bad gguf mapping entry {entry}"))
                 .parse()
                 .unwrap_or_else(|_| panic!("bad gguf code in {entry}"));
-            let name = parts.next().unwrap_or_else(|| panic!("bad gguf name in {entry}"));
+            let name = parts
+                .next()
+                .unwrap_or_else(|| panic!("bad gguf name in {entry}"));
             let row = by_code
                 .get(&code)
                 .unwrap_or_else(|| panic!("dtype-mapping gguf code {code} is not in gguf.yaml"));
             if row.name != name {
-                panic!("gguf code {code} is {} in gguf.yaml and {name} in dtype-mapping.json", row.name);
+                panic!(
+                    "gguf code {code} is {} in gguf.yaml and {name} in dtype-mapping.json",
+                    row.name
+                );
             }
             if row.canonical != mapped.id {
                 panic!(
@@ -448,9 +471,15 @@ fn check_gguf(ggml: &(u32, Vec<GgmlType>), mapping: &[MapDtype], yaml: &[Canon])
             continue;
         }
         if !yaml.iter().any(|canon| canon.id == row.canonical) {
-            panic!("gguf type {} canonical {} is not in dtypes.yaml", row.name, row.canonical);
+            panic!(
+                "gguf type {} canonical {} is not in dtypes.yaml",
+                row.name, row.canonical
+            );
         }
-        let mapped = mapping.iter().find(|item| item.id == row.canonical).unwrap();
+        let mapped = mapping
+            .iter()
+            .find(|item| item.id == row.canonical)
+            .unwrap();
         let needle = format!("{} {}", row.code, row.name);
         if !mapped.gguf.iter().any(|entry| entry == &needle) {
             panic!("gguf type {needle} is missing from dtype-mapping.json");
@@ -490,8 +519,74 @@ fn safetensors_rows(yaml: &[Canon], mapping: &[MapDtype]) -> Vec<SafeRow> {
 fn is_numpy_descr(code: &str) -> bool {
     let rest = code.trim_start_matches(['<', '>', '|', '=']);
     rest.len() >= 2
-        && rest.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
         && rest.chars().skip(1).all(|ch| ch.is_ascii_digit())
+}
+
+struct NameTable {
+    id: String,
+    patterns: Vec<(String, String)>,
+}
+
+/// Hugging Face <-> GGUF tensor names from metadata-mapping.yaml.
+/// A `(dropped)` GGUF name is not a pair.
+fn parse_name_tables(path: &Path) -> Vec<NameTable> {
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let mut tables = Vec::new();
+    let mut current: Option<NameTable> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.ends_with(':') {
+            if let Some(table) = current.take() {
+                if !table.patterns.is_empty() {
+                    tables.push(table);
+                }
+            }
+            current = Some(NameTable {
+                id: trimmed.trim_end_matches(':').to_string(),
+                patterns: Vec::new(),
+            });
+            continue;
+        }
+        if !trimmed.starts_with("- {") || !trimmed.contains("hf:") || !trimmed.contains("gguf:") {
+            continue;
+        }
+        let Some(table) = current.as_mut() else {
+            continue;
+        };
+        let fields = parse_flow_map(trimmed.trim_start_matches('-').trim());
+        let hf = fields
+            .iter()
+            .find(|(key, _)| key == "hf")
+            .map(|(_, value)| value.clone());
+        let gguf = fields
+            .iter()
+            .find(|(key, _)| key == "gguf")
+            .map(|(_, value)| value.clone());
+        let (Some(hf), Some(gguf)) = (hf, gguf) else {
+            continue;
+        };
+        if gguf == "(dropped)" || hf.is_empty() || gguf.is_empty() {
+            continue;
+        }
+        table.patterns.push((hf, gguf));
+    }
+    if let Some(table) = current {
+        if !table.patterns.is_empty() {
+            tables.push(table);
+        }
+    }
+    if tables.is_empty() {
+        panic!("{} has no tensor name tables", path.display());
+    }
+    tables
 }
 
 fn render(
@@ -499,6 +594,7 @@ fn render(
     formats: &[FormatRow],
     ggml: &(u32, Vec<GgmlType>),
     safe: &[SafeRow],
+    name_tables: &[NameTable],
 ) -> String {
     let mut out = String::from("// Generated from tensdataspecs_readonly. Do not edit.\n\n");
     out.push_str(&format!("pub const GGML_TYPE_COUNT: u32 = {};\n\n", ggml.0));
@@ -566,6 +662,26 @@ fn render(
             row.bits,
             rust_str(&row.canonical)
         ));
+    }
+    out.push_str("];\n\n");
+    out.push_str(
+        "#[allow(dead_code)]\npub struct NamePattern {\n    pub hf: &'static str,\n    pub gguf: &'static str,\n}\n\n",
+    );
+    out.push_str("#[allow(dead_code)]\npub struct NameTable {\n    pub id: &'static str,\n    pub patterns: &'static [NamePattern],\n}\n\n");
+    out.push_str("#[allow(dead_code)]\npub static NAME_TABLES: &[NameTable] = &[\n");
+    for table in name_tables {
+        out.push_str(&format!(
+            "    NameTable {{ id: {}, patterns: &[\n",
+            rust_str(&table.id)
+        ));
+        for (hf, gguf) in &table.patterns {
+            out.push_str(&format!(
+                "        NamePattern {{ hf: {}, gguf: {} }},\n",
+                rust_str(hf),
+                rust_str(gguf)
+            ));
+        }
+        out.push_str("    ] },\n");
     }
     out.push_str("];\n");
     out
@@ -664,7 +780,10 @@ fn rational(text: &str) -> (u32, u32) {
         let divisor = gcd(num, den);
         (num / divisor, den / divisor)
     } else {
-        (text.parse().unwrap_or_else(|_| panic!("bad bits {text}")), 1)
+        (
+            text.parse().unwrap_or_else(|_| panic!("bad bits {text}")),
+            1,
+        )
     }
 }
 

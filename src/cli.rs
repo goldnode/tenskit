@@ -112,6 +112,7 @@ pub struct Cli {
     pub output: Option<PathBuf>,
     pub format: Option<FormatName>,
     pub json: bool,
+    pub match_names: bool,
     pub dtype: Option<String>,
     pub shape: Option<Vec<u64>>,
     pub metadata: Vec<(String, String)>,
@@ -132,6 +133,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut output: Option<PathBuf> = None;
     let mut format: Option<FormatName> = None;
     let mut json = false;
+    let mut match_names = false;
     let mut dtype: Option<String> = None;
     let mut shape: Option<String> = None;
     let mut metadata = Vec::new();
@@ -192,6 +194,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     max_header = parse_size(&take("max-header-size")?)?;
                 }
                 "json" => json = true,
+                "match-names" => match_names = true,
                 "verbose" => verbose = true,
                 "columns" => columns = true,
                 "fold" => fold = true,
@@ -292,6 +295,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         output,
         format,
         json,
+        match_names,
         dtype,
         shape,
         metadata,
@@ -398,6 +402,7 @@ Operations (exactly one):
   --delete         Remove tensor keys and write the archive again.
   -i, --info       Summarize the archive from its header.
   -d, --diff       Compare two archives. Exit 1 when they differ.
+                   --match-names pairs tensors through the GGUF role table.
 
 Options:
   -f, --file FILE           Archive path. If omitted, the first argument is the archive.
@@ -416,6 +421,10 @@ Options:
                             compiled in is local/supported-formats.txt.
                             raw is rawtensor/1 (a .rawtensor.json manifest plus a .bin).
   --json                    Machine-readable listing or info.
+  --match-names             On diff, pair tensors through the GGUF role
+                            table. A GGUF general.architecture selects it.
+                            Otherwise the smallest matching role set is used,
+                            and a tie is printed as \"may be A, B, or C\".
   --dtype NAME              Dtype for a headerless input file (safetensors name or canonical id).
   --shape LIST              Shape for a headerless input, for example 2,2 or [2, 2].
   --metadata KEY=VALUE      Set a text metadata entry.
@@ -441,6 +450,7 @@ Examples:
   tenspile -uf model.safetensors norm=new_norm.npy
   tenspile --delete -f model.safetensors optimizer.step
   tenspile -d left.safetensors right.gguf
+  tenspile -d --match-names model.safetensors model.gguf
 "
 }
 

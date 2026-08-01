@@ -15,7 +15,7 @@ tenspile --delete -f model.safetensors optimizer.step
 tensdiff a.safetensors b.gguf
 ```
 
-`cargo build --release` builds `tenspile` and `tensdiff`. `tenspile -h` lists the flags. `tensdiff LEFT RIGHT` compares container type, member names, canonical dtypes, canonical shapes, logical tensor bytes, and metadata. `tenspile -d` is the same comparison. GGUF alignment padding is not part of the value. Exit 1 means they differ. `tensdiff` exits 2 when a file cannot be read. `-v` stays tab-separated. `--columns` aligns that listing for a terminal, and `--fold` collapses a consecutive run of identical layers such as `model.layers.[3-5]`. Both are described in [docs/import-export.md](docs/import-export.md).
+`cargo build --release` builds `tenspile` and `tensdiff`. `tenspile -h` lists the flags. `tensdiff LEFT RIGHT` compares container type, member names, canonical dtypes, canonical shapes, logical tensor bytes, and metadata. `tenspile -d` is the same comparison. `--match-names` pairs tensors through the GGUF role table. `general.architecture` selects the architecture, and a tie is reported as `may be A, B, or C`. GGUF alignment padding is not part of the value. Exit 1 means they differ. `tensdiff` exits 2 when a file cannot be read. `-v` stays tab-separated. `--columns` aligns that listing for a terminal, and `--fold` collapses a consecutive run of identical layers such as `model.layers.[3-5]`. Both are described in [docs/import-export.md](docs/import-export.md).
 
 ## Specifications
 

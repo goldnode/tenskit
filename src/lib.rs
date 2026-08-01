@@ -7,6 +7,7 @@ mod diff;
 mod dtype;
 mod error;
 mod formats;
+mod gguf_names;
 mod io_util;
 mod listing;
 mod ops;
