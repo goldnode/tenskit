@@ -83,7 +83,16 @@ tenspile -t --columns --fold -f model.safetensors
 
 ## Comparing two files
 
-`tensdiff LEFT RIGHT` and `tenspile -d LEFT RIGHT` compare two containers. The report lists a format difference, member names only on one side, dtype and shape mismatches, and the first byte where values differ. Metadata keys are a separate section. Comparison continues after the first mismatch.
+`tensdiff LEFT RIGHT` and `tenspile -d LEFT RIGHT` compare two containers. The report lists a format difference, member names only on one side, and one line for each tensor that differs or was paired under another name. Metadata keys stay on their own lines. Comparison continues after the first mismatch.
+
+A tensor line is `name : dtype : shape`. `=>` appears only on a field that differs, so a shared dtype or shape is written once:
+
+```
+blk.18.ssm_conv1d.weight => model.language_model.layers.17.linear_attn.conv1d.weight : F32 : [6144, 4] => [6144, 1, 4]
+blk.19.ssm_conv1d.weight : F32 : [6144, 4] => [6144, 1, 4]
+```
+
+When the dtype and shape match and the bytes do not, the line ends with `values differ at byte N`. A renamed pair whose dtype, shape, and bytes match is printed and does not by itself make the exit status 1. Tensor lines and names only on one side are sorted by name, and a run of digits compares as a number, so `.10.` follows `.9.`.
 
 A dtype match uses the canonical id, so `F32` and `float32` are the same type. A GGUF shape is reversed from `ne[]` before it is compared. The bytes compared are the logical tensor: GGUF alignment padding is dropped, and a quantized tensor is the block bytes, not a dequantized float. Exit 0 means the names, types, shapes, values, and metadata match. Exit 1 means a difference was printed. `tensdiff` exits 2 when a file cannot be read. `--json` prints the same findings as a document.
 

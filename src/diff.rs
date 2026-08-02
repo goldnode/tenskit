@@ -1,6 +1,7 @@
 //! Compare two tensor containers. Names, canonical dtypes, canonical shapes,
 //! and logical tensor bytes. GGUF alignment padding is not part of the value.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -28,24 +29,17 @@ enum Finding {
         path: String,
         name: String,
     },
-    Dtype {
-        name: String,
-        left: String,
-        right: String,
-    },
-    Shape {
-        name: String,
-        left: String,
-        right: String,
-    },
-    Order {
-        name: String,
-        left: String,
-        right: String,
-    },
-    Values {
-        name: String,
-        at: u64,
+    Tensor {
+        left_name: String,
+        right_name: String,
+        left_dtype: String,
+        right_dtype: String,
+        dtype_differs: bool,
+        left_shape: String,
+        right_shape: String,
+        left_order: String,
+        right_order: String,
+        values_at: Option<u64>,
         left_len: u64,
         right_len: u64,
     },
@@ -61,15 +55,28 @@ enum Finding {
     Names {
         table: String,
     },
-    Pair {
-        left: String,
-        right: String,
-    },
 }
 
 impl Finding {
     fn is_difference(&self) -> bool {
-        !matches!(self, Finding::Names { .. } | Finding::Pair { .. })
+        match self {
+            Finding::Names { .. } => false,
+            Finding::Tensor {
+                dtype_differs,
+                left_shape,
+                right_shape,
+                left_order,
+                right_order,
+                values_at,
+                ..
+            } => {
+                *dtype_differs
+                    || left_shape != right_shape
+                    || left_order != right_order
+                    || values_at.is_some()
+            }
+            _ => true,
+        }
     }
 }
 
@@ -139,37 +146,36 @@ fn findings_of(left: &Archive, right: &Archive, match_names: bool) -> Result<Vec
     }
     let linked_left: BTreeSet<_> = links.iter().map(|link| link.left.clone()).collect();
     let linked_right: BTreeSet<_> = links.iter().map(|link| link.right.clone()).collect();
-    for name in left_members.keys() {
-        if !linked_left.contains(name) {
-            findings.push(Finding::OnlyLeft {
-                path: left.path.display().to_string(),
-                name: name.clone(),
-            });
-        }
+    let mut only_left: Vec<_> = left_members
+        .keys()
+        .filter(|name| !linked_left.contains(*name))
+        .cloned()
+        .collect();
+    let mut only_right: Vec<_> = right_members
+        .keys()
+        .filter(|name| !linked_right.contains(*name))
+        .cloned()
+        .collect();
+    only_left.sort_by(|left_name, right_name| cmp_name(left_name, right_name));
+    only_right.sort_by(|left_name, right_name| cmp_name(left_name, right_name));
+    for name in only_left {
+        findings.push(Finding::OnlyLeft {
+            path: left.path.display().to_string(),
+            name,
+        });
     }
-    for name in right_members.keys() {
-        if !linked_right.contains(name) {
-            findings.push(Finding::OnlyRight {
-                path: right.path.display().to_string(),
-                name: name.clone(),
-            });
-        }
+    for name in only_right {
+        findings.push(Finding::OnlyRight {
+            path: right.path.display().to_string(),
+            name,
+        });
     }
     for link in links {
-        if link.left != link.right {
-            findings.push(Finding::Pair {
-                left: link.left.clone(),
-                right: link.right.clone(),
-            });
-        }
-        let label = if link.left == link.right {
-            link.left.clone()
-        } else {
-            format!("{}  =  {}", link.left, link.right)
-        };
         let left_side = prepare(left, left_members.get(&link.left).unwrap())?;
         let right_side = prepare(right, right_members.get(&link.right).unwrap())?;
-        push_member(&mut findings, &label, &left_side, &right_side)?;
+        if let Some(finding) = tensor_finding(&link.left, &link.right, &left_side, &right_side)? {
+            findings.push(finding);
+        }
     }
     push_metadata(&mut findings, left, right);
     Ok(findings)
@@ -208,31 +214,87 @@ fn link_members(
             right_free.push(name.clone());
         }
     }
-    if !match_names {
-        return (links, None);
-    }
-    let hit = crate::gguf_names::match_free(left_archive, right_archive, &left_free, &right_free);
-    let note = if left_free.is_empty() && right_free.is_empty() {
-        None
+    let note = if match_names {
+        let hit =
+            crate::gguf_names::match_free(left_archive, right_archive, &left_free, &right_free);
+        for (left_name, right_name) in hit.pairs {
+            links.push(Link {
+                left: left_name,
+                right: right_name,
+            });
+        }
+        if left_free.is_empty() && right_free.is_empty() {
+            None
+        } else {
+            Some(crate::gguf_names::note(&hit.arches))
+        }
     } else {
-        Some(crate::gguf_names::note(&hit.arches))
+        None
     };
-    if hit.pairs.is_empty() {
-        return (links, note);
-    }
-    for (left_name, right_name) in hit.pairs {
-        links.push(Link {
-            left: left_name,
-            right: right_name,
-        });
-    }
     links.sort_by(|left_link, right_link| {
-        left_link
-            .left
-            .cmp(&right_link.left)
-            .then(left_link.right.cmp(&right_link.right))
+        cmp_name(&left_link.left, &right_link.left)
+            .then_with(|| cmp_name(&left_link.right, &right_link.right))
     });
     (links, note)
+}
+
+/// Text order, except a digit run compares as an integer. `blk.10` follows `blk.9`.
+fn cmp_name(left: &str, right: &str) -> Ordering {
+    let mut left_rest = left;
+    let mut right_rest = right;
+    loop {
+        if left_rest.is_empty() || right_rest.is_empty() {
+            return left_rest
+                .len()
+                .cmp(&right_rest.len())
+                .then_with(|| left.cmp(right));
+        }
+        let left_digit = left_rest.as_bytes()[0].is_ascii_digit();
+        let right_digit = right_rest.as_bytes()[0].is_ascii_digit();
+        if left_digit && right_digit {
+            let (left_num, left_next) = take_digits(left_rest);
+            let (right_num, right_next) = take_digits(right_rest);
+            match cmp_digits(left_num, right_num) {
+                Ordering::Equal => {
+                    left_rest = left_next;
+                    right_rest = right_next;
+                }
+                order => return order,
+            }
+        } else {
+            let left_char = left_rest.chars().next().unwrap();
+            let right_char = right_rest.chars().next().unwrap();
+            match left_char.cmp(&right_char) {
+                Ordering::Equal => {
+                    left_rest = &left_rest[left_char.len_utf8()..];
+                    right_rest = &right_rest[right_char.len_utf8()..];
+                }
+                order => return order,
+            }
+        }
+    }
+}
+
+fn take_digits(text: &str) -> (&str, &str) {
+    let end = text
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(text.len());
+    text.split_at(end)
+}
+
+fn cmp_digits(left: &str, right: &str) -> Ordering {
+    let left = trim_zeros(left);
+    let right = trim_zeros(right);
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+fn trim_zeros(text: &str) -> &str {
+    let trimmed = text.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0"
+    } else {
+        trimmed
+    }
 }
 
 fn describe(archive: &Archive) -> String {
@@ -295,41 +357,91 @@ fn logical_nbytes(archive: &Archive, member: &Member) -> Result<u64> {
     Ok(member.nbytes)
 }
 
-fn push_member(findings: &mut Vec<Finding>, name: &str, left: &Side, right: &Side) -> Result<()> {
-    if left.fortran != right.fortran {
-        findings.push(Finding::Order {
-            name: name.to_string(),
-            left: order_word(left.fortran),
-            right: order_word(right.fortran),
-        });
+fn tensor_finding(
+    left_name: &str,
+    right_name: &str,
+    left: &Side,
+    right: &Side,
+) -> Result<Option<Finding>> {
+    let left_order = order_word(left.fortran);
+    let right_order = order_word(right.fortran);
+    let dtype_differs = left.dtype != right.dtype;
+    let left_shape = format_shape(&left.shape);
+    let right_shape = format_shape(&right.shape);
+    let values = if !dtype_differs && left.shape == right.shape {
+        first_mismatch(&left.payload, &right.payload)?
+    } else {
+        None
+    };
+    let names_differ = left_name != right_name;
+    let content_differs =
+        dtype_differs || left_shape != right_shape || left_order != right_order || values.is_some();
+    if !names_differ && !content_differs {
+        return Ok(None);
     }
-    let same_type = left.dtype == right.dtype;
-    if !same_type {
-        findings.push(Finding::Dtype {
-            name: name.to_string(),
-            left: left.label.clone(),
-            right: right.label.clone(),
-        });
+    Ok(Some(Finding::Tensor {
+        left_name: left_name.to_string(),
+        right_name: right_name.to_string(),
+        left_dtype: left.label.clone(),
+        right_dtype: right.label.clone(),
+        dtype_differs,
+        left_shape,
+        right_shape,
+        left_order,
+        right_order,
+        values_at: values,
+        left_len: left.payload.len(),
+        right_len: right.payload.len(),
+    }))
+}
+
+fn tensor_line(finding: &Finding) -> String {
+    let Finding::Tensor {
+        left_name,
+        right_name,
+        left_dtype,
+        right_dtype,
+        dtype_differs,
+        left_shape,
+        right_shape,
+        left_order,
+        right_order,
+        values_at,
+        left_len,
+        right_len,
+    } = finding
+    else {
+        return String::new();
+    };
+    let names = side_by_side(left_name, right_name);
+    let dtype = if *dtype_differs {
+        format!("{left_dtype} => {right_dtype}")
+    } else {
+        left_dtype.clone()
+    };
+    let shape = side_by_side(left_shape, right_shape);
+    let mut line = format!("{names} : {dtype} : {shape}");
+    if left_order != right_order {
+        line.push_str(&format!(" : {left_order} => {right_order}"));
     }
-    let same_shape = left.shape == right.shape;
-    if !same_shape {
-        findings.push(Finding::Shape {
-            name: name.to_string(),
-            left: format_shape(&left.shape),
-            right: format_shape(&right.shape),
-        });
-    }
-    if same_type && same_shape {
-        if let Some(at) = first_mismatch(&left.payload, &right.payload)? {
-            findings.push(Finding::Values {
-                name: name.to_string(),
-                at,
-                left_len: left.payload.len(),
-                right_len: right.payload.len(),
-            });
+    if let Some(at) = values_at {
+        if left_len == right_len {
+            line.push_str(&format!(" : values differ at byte {at}"));
+        } else {
+            line.push_str(&format!(
+                " : values differ at byte {at} ({left_len} vs {right_len} bytes)"
+            ));
         }
     }
-    Ok(())
+    line
+}
+
+fn side_by_side(left: &str, right: &str) -> String {
+    if left == right {
+        left.to_string()
+    } else {
+        format!("{left} => {right}")
+    }
 }
 
 fn order_word(fortran: bool) -> String {
@@ -408,27 +520,12 @@ fn render_text(findings: &[Finding]) -> String {
             Finding::Format { left, right } => format!("format: {left}  vs  {right}"),
             Finding::OnlyLeft { path, name } => format!("only in {path}: {name}"),
             Finding::OnlyRight { path, name } => format!("only in {path}: {name}"),
-            Finding::Dtype { name, left, right } => format!("dtype: {name}  {left}  vs  {right}"),
-            Finding::Shape { name, left, right } => format!("shape: {name}  {left}  vs  {right}"),
-            Finding::Order { name, left, right } => format!("order: {name}  {left}  vs  {right}"),
-            Finding::Values {
-                name,
-                at,
-                left_len,
-                right_len,
-            } => {
-                if left_len == right_len {
-                    format!("values: {name}  differ at byte {at}")
-                } else {
-                    format!("values: {name}  differ at byte {at} ({left_len} vs {right_len} bytes)")
-                }
-            }
+            Finding::Tensor { .. } => tensor_line(finding),
             Finding::MetaOnly { path, key } => format!("metadata: {key}  only in {path}"),
             Finding::MetaValue { key, left, right } => {
                 format!("metadata: {key}  {left}  vs  {right}")
             }
             Finding::Names { table } => format!("names: {table}"),
-            Finding::Pair { left, right } => format!("{left}  =  {right}"),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -447,24 +544,30 @@ fn render_json(findings: &[Finding], same: bool) -> String {
             Finding::OnlyRight { path, name } => {
                 json!({"kind": "only_right", "path": path, "name": name})
             }
-            Finding::Dtype { name, left, right } => {
-                json!({"kind": "dtype", "name": name, "left": left, "right": right})
-            }
-            Finding::Shape { name, left, right } => {
-                json!({"kind": "shape", "name": name, "left": left, "right": right})
-            }
-            Finding::Order { name, left, right } => {
-                json!({"kind": "order", "name": name, "left": left, "right": right})
-            }
-            Finding::Values {
-                name,
-                at,
+            Finding::Tensor {
+                left_name,
+                right_name,
+                left_dtype,
+                right_dtype,
+                left_shape,
+                right_shape,
+                left_order,
+                right_order,
+                values_at,
                 left_len,
                 right_len,
+                ..
             } => json!({
-                "kind": "values",
-                "name": name,
-                "at": at,
+                "kind": "tensor",
+                "left": left_name,
+                "right": right_name,
+                "left_dtype": left_dtype,
+                "right_dtype": right_dtype,
+                "left_shape": left_shape,
+                "right_shape": right_shape,
+                "left_order": left_order,
+                "right_order": right_order,
+                "values_at": values_at,
                 "left_bytes": left_len,
                 "right_bytes": right_len
             }),
@@ -475,9 +578,6 @@ fn render_json(findings: &[Finding], same: bool) -> String {
                 json!({"kind": "metadata", "key": key, "left": left, "right": right})
             }
             Finding::Names { table } => json!({"kind": "names", "table": table}),
-            Finding::Pair { left, right } => {
-                json!({"kind": "pair", "left": left, "right": right})
-            }
         })
         .collect();
     serde_json::to_string_pretty(&json!({"same": same, "findings": items}))
@@ -554,6 +654,7 @@ Exit status:
   2  a file could not be read
 
 The container format is reported and does not stop the member comparison.
+A tensor is one line: name, dtype, and shape. => marks a field that differs.
 GGUF shapes are reversed to canonical order. Alignment padding is not compared.
 Quantized blocks are compared as stored bytes.
 --match-names pairs leftover names through gguf-tensor-roles.json.
@@ -624,8 +725,66 @@ mod tests {
         let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
-        assert!(text.contains("values: weight  differ at byte 6"), "{text}");
+        assert!(
+            text.contains("weight : F32 : [2] : values differ at byte 6"),
+            "{text}"
+        );
         assert!(text.contains("metadata: source  left  vs  right"), "{text}");
+    }
+
+    #[test]
+    fn a_shape_change_keeps_the_shared_name_and_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.safetensors");
+        let right = dir.path().join("right.safetensors");
+        safetensors::write_file(&left, &[], &[f32_tensor("weight", &[1.0, 2.0, 3.0, 4.0])])
+            .unwrap();
+        let mut wide = f32_tensor("weight", &[1.0, 2.0, 3.0, 4.0]);
+        wide.shape = vec![1, 4];
+        safetensors::write_file(&right, &[], &[wide]).unwrap();
+        let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        assert!(text.contains("weight : F32 : [4] => [1, 4]"), "{text}");
+        assert!(!text.contains("values differ"), "{text}");
+    }
+
+    #[test]
+    fn numeric_parts_of_a_name_sort_as_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let left = dir.path().join("left.safetensors");
+        let right = dir.path().join("right.safetensors");
+        let names = [
+            "model.layers.10.mlp.weight",
+            "model.layers.2.mlp.weight",
+            "model.layers.9.mlp.weight",
+        ];
+        let mut left_tensors: Vec<_> = names.iter().map(|name| f32_tensor(name, &[1.0])).collect();
+        left_tensors.push(f32_tensor("extra.10.weight", &[1.0]));
+        left_tensors.push(f32_tensor("extra.9.weight", &[1.0]));
+        let right_tensors: Vec<_> = names.iter().map(|name| f32_tensor(name, &[2.0])).collect();
+        safetensors::write_file(&left, &[], &left_tensors).unwrap();
+        safetensors::write_file(&right, &[], &right_tensors).unwrap();
+        let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let at = |name: &str| {
+            text.find(name)
+                .unwrap_or_else(|| panic!("{name} missing in {text}"))
+        };
+        assert!(at("extra.9.weight") < at("extra.10.weight"), "{text}");
+        assert!(
+            at("extra.10.weight") < at("model.layers.2.mlp.weight"),
+            "{text}"
+        );
+        assert!(
+            at("model.layers.2.mlp.weight") < at("model.layers.9.mlp.weight"),
+            "{text}"
+        );
+        assert!(
+            at("model.layers.9.mlp.weight") < at("model.layers.10.mlp.weight"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -652,8 +811,8 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("only_right"), "{text}");
-        assert!(text.contains("dtype: keep  F32  vs  F16"), "{text}");
-        assert!(!text.contains("values: keep"), "{text}");
+        assert!(text.contains("keep : F32 => F16 : [1] => [2]"), "{text}");
+        assert!(!text.contains("values differ"), "{text}");
     }
 
     #[cfg(format_gguf)]
@@ -670,9 +829,8 @@ mod tests {
         let right_archive = archive::open(&gguf, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
         assert!(text.contains("format:"), "{text}");
-        assert!(!text.contains("values:"), "{text}");
-        assert!(!text.contains("dtype:"), "{text}");
-        assert!(!text.contains("shape:"), "{text}");
+        assert!(!text.contains("values differ"), "{text}");
+        assert!(!text.contains("=>"), "{text}");
     }
 
     #[test]
@@ -704,7 +862,7 @@ mod tests {
         assert!(!plain.contains("names:"), "{plain}");
         let text = render_text(&findings_of(&hf_archive, &gguf_archive, true).unwrap());
         assert!(text.contains("names: no table matched"), "{text}");
-        assert!(!text.contains(" = "), "{text}");
+        assert!(!text.contains("=>"), "{text}");
         assert!(text.contains("extra.weight"), "{text}");
         assert_eq!(
             compare(&hf_path, &gguf_path, false, DEFAULT_MAX_HEADER, true).unwrap(),
@@ -724,12 +882,15 @@ mod tests {
             "{paired_text}"
         );
         assert!(
-            paired_text.contains(&format!("{hf}  =  {gguf}")),
+            paired_text.contains(&format!("{hf} => {gguf} : F32 : [2]")),
             "{paired_text}"
         );
-        assert!(!paired_text.contains("values:"), "{paired_text}");
+        assert!(!paired_text.contains("values differ"), "{paired_text}");
         let flipped = render_text(&findings_of(&paired_archive, &hf_archive, true).unwrap());
-        assert!(flipped.contains(&format!("{gguf}  =  {hf}")), "{flipped}");
+        assert!(
+            flipped.contains(&format!("{gguf} => {hf} : F32 : [2]")),
+            "{flipped}"
+        );
         assert_eq!(
             compare(&hf_path, &paired, false, DEFAULT_MAX_HEADER, true).unwrap(),
             0
@@ -776,8 +937,11 @@ mod tests {
         let gguf_archive = archive::open(&gguf_path, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let text = render_text(&findings_of(&hf_archive, &gguf_archive, true).unwrap());
         assert!(text.contains("names: qwen35"), "{text}");
-        assert!(text.contains(&format!("{hf}  =  {gguf}")), "{text}");
+        assert!(
+            text.contains(&format!("{hf} => {gguf} : F32 : [2]")),
+            "{text}"
+        );
         assert!(text.contains("custom.bias"), "{text}");
-        assert!(!text.contains("values:"), "{text}");
+        assert!(!text.contains("values differ"), "{text}");
     }
 }
