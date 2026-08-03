@@ -131,7 +131,11 @@ fn open_pytorch(path: &Path) -> Result<Archive> {
 }
 
 fn annotate_packs(archive: &mut Archive) {
-    let owned: Vec<String> = archive.members.iter().map(|member| member.name.clone()).collect();
+    let owned: Vec<String> = archive
+        .members
+        .iter()
+        .map(|member| member.name.clone())
+        .collect();
     let peers: Vec<&str> = owned.iter().map(String::as_str).collect();
     for member in &mut archive.members {
         if member.detail.is_some() {
@@ -142,8 +146,14 @@ fn annotate_packs(archive: &mut Archive) {
         }
     }
     #[cfg(format_mlx)]
-    if archive.members.iter().any(|member| member.dtype.contains('V'))
-        || archive.metadata.iter().any(|(_, value)| value.contains('V'))
+    if archive
+        .members
+        .iter()
+        .any(|member| member.dtype.contains('V'))
+        || archive
+            .metadata
+            .iter()
+            .any(|(_, value)| value.contains('V'))
     {
         if let Some(note) = crate::formats::mlx::void_note("<V2") {
             archive.notes.push(note.to_string());
@@ -274,7 +284,8 @@ fn open_gguf(path: &Path) -> Result<Archive> {
             let detail = if dtype::is_quant_ggml(tensor.ggml_type) {
                 Some("quantized span includes alignment padding".to_string())
             } else if dense.is_some()
-                && crate::formats::gguf::logical_dense_bytes(tensor).is_some_and(|logical| logical != tensor.span)
+                && crate::formats::gguf::logical_dense_bytes(tensor)
+                    .is_some_and(|logical| logical != tensor.span)
             {
                 Some(format!(
                     "stored span {} includes padding; dense payload is {} bytes",
@@ -344,9 +355,7 @@ fn open_npy(path: &Path) -> Result<Archive> {
         notes.push("fortran_order: import into safetensors is refused".into());
     }
     if info.data_offset % 64 != 0 {
-        notes.push(
-            "npy data is not 64-byte aligned (NPY-005); the array is still read".into(),
-        );
+        notes.push("npy data is not 64-byte aligned (NPY-005); the array is still read".into());
     }
     Ok(Archive {
         format: FormatName::Npy,
@@ -539,4 +548,256 @@ fn open_index(path: &Path, max_header: u64) -> Result<Archive> {
             weight_map: weight_vec,
         }),
     })
+}
+
+/// A path the user named, after a directory is turned into its weight file.
+#[derive(Debug)]
+pub struct ResolvedPath {
+    pub path: PathBuf,
+    /// Set when the user named a directory. `-i` prints it.
+    pub note: Option<String>,
+}
+
+/// Open `path` after applying the Hugging Face directory rule.
+pub fn open_user(
+    path: &Path,
+    force_single: bool,
+    format: Option<FormatName>,
+    max_header: u64,
+    dtype: Option<&str>,
+    shape: Option<&[u64]>,
+) -> Result<Archive> {
+    let resolved = resolve_user_path(path, force_single)?;
+    let mut archive = open(&resolved.path, format, max_header, dtype, shape)?;
+    if let Some(note) = resolved.note {
+        archive.notes.push(note);
+    }
+    Ok(archive)
+}
+
+/// A directory is the safetensors weight set inside it. A `.safetensors` file
+/// whose directory contains `config.json` is refused unless `force_single`.
+pub fn resolve_user_path(path: &Path, force_single: bool) -> Result<ResolvedPath> {
+    let meta = fs::metadata(path).map_err(|err| io_err(path, err))?;
+    if meta.is_dir() {
+        return resolve_directory(path);
+    }
+    if !force_single && is_safetensors_name(path) && sibling_config(path) {
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        return Err(msg(format!(
+            "{} is likely part of a larger set of files because config.json is in {}. Pass that directory, or put --force-single-file immediately before this path.",
+            path.display(),
+            dir.display()
+        )));
+    }
+    Ok(ResolvedPath {
+        path: path.to_path_buf(),
+        note: None,
+    })
+}
+
+fn sibling_config(path: &Path) -> bool {
+    path.parent()
+        .map(|dir| dir.join("config.json").is_file())
+        .unwrap_or(false)
+}
+
+fn is_safetensors_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".safetensors") && !lower.ends_with(".safetensors.index.json")
+        })
+        .unwrap_or(false)
+}
+
+fn resolve_directory(dir: &Path) -> Result<ResolvedPath> {
+    let mut indexes = Vec::new();
+    let mut loose = Vec::new();
+    let mut shards = Vec::new();
+    let mut others = Vec::new();
+    let entries = fs::read_dir(dir).map_err(|err| io_err(dir, err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_err(dir, err))?;
+        // Follow a symlink to a file. DirEntry::metadata does not, so a
+        // Hugging Face snapshot (every name points at blobs/) looks empty.
+        // The chosen path stays the name in this directory; open follows it.
+        // A link to a directory is not walked. A dangling link is skipped.
+        let meta = match fs::metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".safetensors.index.json") {
+            indexes.push(name.to_string());
+        } else if lower.ends_with(".safetensors") && is_shard_name(&lower) {
+            shards.push(name.to_string());
+        } else if lower.ends_with(".safetensors") {
+            loose.push(name.to_string());
+        } else {
+            others.push(name.to_string());
+        }
+    }
+    indexes.sort();
+    loose.sort();
+    shards.sort();
+    others.sort();
+    let chosen = if indexes.len() == 1 {
+        indexes[0].clone()
+    } else if indexes.len() > 1 {
+        return Err(msg(format!(
+            "{} has more than one shard index: {}",
+            dir.display(),
+            indexes.join(", ")
+        )));
+    } else if loose.len() == 1 {
+        loose[0].clone()
+    } else if loose.len() > 1 {
+        return Err(msg(format!(
+            "{} has more than one safetensors file: {}",
+            dir.display(),
+            loose.join(", ")
+        )));
+    } else if !shards.is_empty() {
+        return Err(msg(format!(
+            "{} has safetensors shards but no index: {}",
+            dir.display(),
+            shards.join(", ")
+        )));
+    } else {
+        return Err(msg(format!("{} has no safetensors weights", dir.display())));
+    };
+    let mut listed = others;
+    if indexes.len() == 1 {
+        listed.extend(loose);
+    }
+    listed.retain(|name| name != &chosen);
+    listed.sort();
+    let note = if listed.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "directory {} also contains {}",
+            dir.display(),
+            listed.join(", ")
+        ))
+    };
+    Ok(ResolvedPath {
+        path: dir.join(chosen),
+        note,
+    })
+}
+
+/// `prefix-00001-of-00005.safetensors` is one shard, not the weight set.
+fn is_shard_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".safetensors") else {
+        return false;
+    };
+    let Some((head, count)) = stem.rsplit_once("-of-") else {
+        return false;
+    };
+    let Some((_, index)) = head.rsplit_once('-') else {
+        return false;
+    };
+    !index.is_empty()
+        && !count.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_json_refuses_a_lone_safetensors_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("model.safetensors");
+        fs::write(&weights, b"not read").unwrap();
+        fs::write(dir.path().join("config.json"), b"{}\n").unwrap();
+        let err = resolve_user_path(&weights, false).unwrap_err();
+        assert!(err.to_string().contains("config.json"), "{err}");
+        assert!(err.to_string().contains("--force-single-file"), "{err}");
+        let forced = resolve_user_path(&weights, true).unwrap();
+        assert_eq!(forced.path, weights);
+        assert!(forced.note.is_none());
+        let via_dir = resolve_user_path(dir.path(), false).unwrap();
+        assert_eq!(via_dir.path, weights);
+        let note = via_dir.note.unwrap();
+        assert!(note.contains("config.json"), "{note}");
+        let index = dir.path().join("model.safetensors.index.json");
+        fs::write(&index, b"{}").unwrap();
+        let index_path = resolve_user_path(&index, false).unwrap();
+        assert_eq!(index_path.path, index);
+        assert!(index_path.note.is_none());
+    }
+
+    #[test]
+    fn a_directory_prefers_one_index_and_rejects_two_loose_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"a").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"b").unwrap();
+        fs::write(dir.path().join("model.safetensors.index.json"), b"{}").unwrap();
+        fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        let resolved = resolve_user_path(dir.path(), false).unwrap();
+        assert_eq!(
+            resolved.path,
+            dir.path().join("model.safetensors.index.json")
+        );
+        let note = resolved.note.unwrap();
+        assert!(note.contains("tokenizer.json"), "{note}");
+        assert!(!note.contains("model-00001"), "{note}");
+
+        let loose = tempfile::tempdir().unwrap();
+        fs::write(loose.path().join("a.safetensors"), b"a").unwrap();
+        fs::write(loose.path().join("b.safetensors"), b"b").unwrap();
+        let err = resolve_user_path(loose.path(), false).unwrap_err();
+        assert!(
+            err.to_string().contains("more than one safetensors"),
+            "{err}"
+        );
+
+        let shards = tempfile::tempdir().unwrap();
+        fs::write(shards.path().join("model-00001-of-00002.safetensors"), b"a").unwrap();
+        let err = resolve_user_path(shards.path(), false).unwrap_err();
+        assert!(err.to_string().contains("no index"), "{err}");
+    }
+
+    #[test]
+    fn a_snapshot_directory_follows_symlinks_to_the_weight_files() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs");
+        let snap = root.path().join("snapshots").join("rev");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snap).unwrap();
+        let index_blob = blobs.join("index");
+        let shard_blob = blobs.join("shard");
+        let config_blob = blobs.join("config");
+        fs::write(&index_blob, b"{}").unwrap();
+        fs::write(&shard_blob, b"shard").unwrap();
+        fs::write(&config_blob, b"{}\n").unwrap();
+        std::os::unix::fs::symlink(&index_blob, snap.join("model.safetensors.index.json")).unwrap();
+        std::os::unix::fs::symlink(
+            &shard_blob,
+            snap.join("model.safetensors-00001-of-00001.safetensors"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&config_blob, snap.join("config.json")).unwrap();
+        let resolved = resolve_user_path(&snap, false).unwrap();
+        assert_eq!(resolved.path, snap.join("model.safetensors.index.json"));
+        let note = resolved.note.unwrap();
+        assert!(note.contains("config.json"), "{note}");
+        assert!(!note.contains("00001-of-00001"), "{note}");
+    }
 }

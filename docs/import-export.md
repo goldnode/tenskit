@@ -8,7 +8,7 @@ Byte layouts, dtype codes, and validation rules are the files under [tensdataspe
 - [NumPy `.npy` and `.npz`](numpy.md) follow [npy.yaml](../tensdataspecs_readonly/specs/formats/npy.yaml) and [npz.yaml](../tensdataspecs_readonly/specs/formats/npz.yaml)
 - [rawtensor/1](raw.md) follows [raw-sidecar.yaml](../tensdataspecs_readonly/specs/formats/raw-sidecar.yaml)
 - [GGUF](gguf.md) follows [gguf.yaml](../tensdataspecs_readonly/specs/formats/gguf.yaml)
-- [shard index](shards.md) is the sharding section of the safetensors spec
+- [shard index](shards.md) is the sharding section of the safetensors spec. A directory with those weights is the same archive. A `.safetensors` file next to `config.json` is refused unless `--force-single-file` is written immediately before that path.
 - PyTorch zip checkpoints follow [pytorch.yaml](../tensdataspecs_readonly/specs/formats/pytorch.yaml). `--format pytorch` reads and writes a state_dict.
 - ONNX initializers follow [onnx.yaml](../tensdataspecs_readonly/specs/formats/onnx.yaml). `--format onnx` reads and writes those tensors, not the graph.
 
@@ -93,6 +93,12 @@ blk.19.ssm_conv1d.weight : F32 : [6144, 4] => [6144, 1, 4]
 ```
 
 When the dtype and shape match and the bytes do not, the line ends with `values differ at byte N`. A renamed pair whose dtype, shape, and bytes match is printed and does not by itself make the exit status 1. Tensor lines and names only on one side are sorted by name, and a run of digits compares as a number, so `.10.` follows `.9.`.
+
+`--fold` merges tensor lines that are the same except for a consecutive number. A number that advances on both sides is written as a range on both sides. A number that stays the same is written once. A gap is not bridged.
+
+```
+blk.[20-21].attn_norm.weight => model.language_model.layers.[20-21].input_layernorm.weight : F32 => BF16 : [1024]
+```
 
 A dtype match uses the canonical id, so `F32` and `float32` are the same type. A GGUF shape is reversed from `ne[]` before it is compared. The bytes compared are the logical tensor: GGUF alignment padding is dropped, and a quantized tensor is the block bytes, not a dequantized float. Exit 0 means the names, types, shapes, values, and metadata match. Exit 1 means a difference was printed. `tensdiff` exits 2 when a file cannot be read. `--json` prints the same findings as a document.
 

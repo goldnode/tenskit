@@ -100,12 +100,16 @@ pub fn from_cli(cli: &Cli) -> Result<i32> {
     if cli.operands.len() != 1 {
         return Err(msg("diff needs two archive paths"));
     }
+    let right_force = cli.operand_force.first().copied().unwrap_or(false);
+    let left = archive::resolve_user_path(left, cli.file_force_single)?;
+    let right = archive::resolve_user_path(Path::new(right), right_force)?;
     compare(
-        left,
-        Path::new(right),
+        &left.path,
+        &right.path,
         cli.json,
         cli.max_header,
         cli.match_names,
+        cli.fold,
     )
 }
 
@@ -115,6 +119,7 @@ pub fn compare(
     json_out: bool,
     max_header: u64,
     match_names: bool,
+    fold: bool,
 ) -> Result<i32> {
     let left_archive = archive::open(left, None, max_header, None, None)?;
     let right_archive = archive::open(right, None, max_header, None, None)?;
@@ -123,7 +128,7 @@ pub fn compare(
     if json_out {
         println!("{}", render_json(&findings, same));
     } else if !findings.is_empty() {
-        println!("{}", render_text(&findings));
+        println!("{}", render_text(&findings, fold));
     }
     Ok(if same { 0 } else { 1 })
 }
@@ -399,6 +404,208 @@ fn tensor_line(finding: &Finding) -> String {
     let Finding::Tensor {
         left_name,
         right_name,
+        ..
+    } = finding
+    else {
+        return String::new();
+    };
+    tensor_line_named(finding, left_name, right_name)
+}
+
+fn side_by_side(left: &str, right: &str) -> String {
+    if left == right {
+        left.to_string()
+    } else {
+        format!("{left} => {right}")
+    }
+}
+
+enum NamePart {
+    Text(String),
+    Index(u64),
+}
+
+struct FoldItem {
+    index: usize,
+    slots: Vec<u64>,
+    left: Vec<NamePart>,
+    right: Vec<NamePart>,
+}
+
+/// Merge tensor lines whose names differ only by a consecutive integer.
+fn fold_lines(findings: &[Finding]) -> Vec<String> {
+    let mut groups: BTreeMap<String, Vec<FoldItem>> = BTreeMap::new();
+    for (index, finding) in findings.iter().enumerate() {
+        let Finding::Tensor {
+            left_name,
+            right_name,
+            left_dtype,
+            right_dtype,
+            dtype_differs,
+            left_shape,
+            right_shape,
+            left_order,
+            right_order,
+            values_at,
+            left_len,
+            right_len,
+        } = finding
+        else {
+            continue;
+        };
+        let left = name_parts(left_name);
+        let right = name_parts(right_name);
+        let mut slots = indices_of(&left);
+        slots.extend(indices_of(&right));
+        let key = format!(
+            "{} => {} | {dtype_differs} {left_dtype} {right_dtype} {left_shape} {right_shape} {left_order} {right_order} {values_at:?} {left_len} {right_len}",
+            name_pattern(&left),
+            name_pattern(&right)
+        );
+        groups.entry(key).or_default().push(FoldItem {
+            index,
+            slots,
+            left,
+            right,
+        });
+    }
+    let mut skip = vec![false; findings.len()];
+    let mut folded: Vec<Option<String>> = vec![None; findings.len()];
+    for mut items in groups.into_values() {
+        items.sort_by(|left, right| {
+            left.slots
+                .cmp(&right.slots)
+                .then(left.index.cmp(&right.index))
+        });
+        let mut start = 0;
+        while start < items.len() {
+            let mut end = start + 1;
+            while end < items.len()
+                && continues(&items[start].slots, &items[end].slots, (end - start) as u64)
+            {
+                end += 1;
+            }
+            if end - start >= 2 {
+                let run = &items[start..end];
+                let anchor = run.iter().map(|item| item.index).min().unwrap();
+                let mut vary = vec![false; run[0].slots.len()];
+                for item in run.iter().skip(1) {
+                    for (slot, (&first, &next)) in run[0].slots.iter().zip(&item.slots).enumerate()
+                    {
+                        if next != first {
+                            vary[slot] = true;
+                        }
+                    }
+                }
+                let steps = (run.len() - 1) as u64;
+                let left_name = fold_name(&run[0].left, &vary, steps);
+                let left_slots = indices_of(&run[0].left).len();
+                let right_name = fold_name(&run[0].right, &vary[left_slots..], steps);
+                folded[anchor] = Some(tensor_line_named(
+                    &findings[anchor],
+                    &left_name,
+                    &right_name,
+                ));
+                for item in run {
+                    if item.index != anchor {
+                        skip[item.index] = true;
+                    }
+                }
+            }
+            start = end;
+        }
+    }
+    findings
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !skip[*index])
+        .map(|(index, finding)| {
+            folded[index]
+                .clone()
+                .unwrap_or_else(|| render_finding(finding))
+        })
+        .collect()
+}
+
+fn continues(first: &[u64], next: &[u64], step: u64) -> bool {
+    if step == 0 || first.len() != next.len() {
+        return false;
+    }
+    let mut moved = false;
+    for (&start, &value) in first.iter().zip(next) {
+        if value == start {
+            continue;
+        }
+        if value == start.saturating_add(step) {
+            moved = true;
+            continue;
+        }
+        return false;
+    }
+    moved
+}
+
+fn fold_name(parts: &[NamePart], vary: &[bool], steps: u64) -> String {
+    let mut slot = 0;
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            NamePart::Text(text) => out.push(text.clone()),
+            NamePart::Index(index) => {
+                if vary.get(slot).copied().unwrap_or(false) {
+                    out.push(format!("[{}-{}]", index, index + steps));
+                } else {
+                    out.push(index.to_string());
+                }
+                slot += 1;
+            }
+        }
+    }
+    out.join(".")
+}
+
+fn name_parts(name: &str) -> Vec<NamePart> {
+    name.split('.')
+        .map(|segment| match parse_index(segment) {
+            Some(index) => NamePart::Index(index),
+            None => NamePart::Text(segment.to_string()),
+        })
+        .collect()
+}
+
+fn name_pattern(parts: &[NamePart]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            NamePart::Text(text) => text.as_str(),
+            NamePart::Index(_) => "{}",
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn indices_of(parts: &[NamePart]) -> Vec<u64> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            NamePart::Index(index) => Some(*index),
+            NamePart::Text(_) => None,
+        })
+        .collect()
+}
+
+fn parse_index(segment: &str) -> Option<u64> {
+    if segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if segment.len() > 1 && segment.starts_with('0') {
+        return None;
+    }
+    segment.parse().ok()
+}
+
+fn tensor_line_named(finding: &Finding, left_name: &str, right_name: &str) -> String {
+    let Finding::Tensor {
         left_dtype,
         right_dtype,
         dtype_differs,
@@ -409,6 +616,7 @@ fn tensor_line(finding: &Finding) -> String {
         values_at,
         left_len,
         right_len,
+        ..
     } = finding
     else {
         return String::new();
@@ -434,14 +642,6 @@ fn tensor_line(finding: &Finding) -> String {
         }
     }
     line
-}
-
-fn side_by_side(left: &str, right: &str) -> String {
-    if left == right {
-        left.to_string()
-    } else {
-        format!("{left} => {right}")
-    }
 }
 
 fn order_word(fortran: bool) -> String {
@@ -513,22 +713,27 @@ fn meta_map(pairs: &[(String, String)]) -> BTreeMap<String, String> {
     pairs.iter().cloned().collect()
 }
 
-fn render_text(findings: &[Finding]) -> String {
-    findings
-        .iter()
-        .map(|finding| match finding {
-            Finding::Format { left, right } => format!("format: {left}  vs  {right}"),
-            Finding::OnlyLeft { path, name } => format!("only in {path}: {name}"),
-            Finding::OnlyRight { path, name } => format!("only in {path}: {name}"),
-            Finding::Tensor { .. } => tensor_line(finding),
-            Finding::MetaOnly { path, key } => format!("metadata: {key}  only in {path}"),
-            Finding::MetaValue { key, left, right } => {
-                format!("metadata: {key}  {left}  vs  {right}")
-            }
-            Finding::Names { table } => format!("names: {table}"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+fn render_text(findings: &[Finding], fold: bool) -> String {
+    let lines = if fold {
+        fold_lines(findings)
+    } else {
+        findings.iter().map(render_finding).collect()
+    };
+    lines.join("\n")
+}
+
+fn render_finding(finding: &Finding) -> String {
+    match finding {
+        Finding::Format { left, right } => format!("format: {left}  vs  {right}"),
+        Finding::OnlyLeft { path, name } => format!("only in {path}: {name}"),
+        Finding::OnlyRight { path, name } => format!("only in {path}: {name}"),
+        Finding::Tensor { .. } => tensor_line(finding),
+        Finding::MetaOnly { path, key } => format!("metadata: {key}  only in {path}"),
+        Finding::MetaValue { key, left, right } => {
+            format!("metadata: {key}  {left}  vs  {right}")
+        }
+        Finding::Names { table } => format!("names: {table}"),
+    }
 }
 
 fn render_json(findings: &[Finding], same: bool) -> String {
@@ -597,9 +802,23 @@ pub fn diff_main(args: &[String]) -> Result<i32> {
         DiffCommand::Run {
             json,
             match_names,
+            fold,
             left,
+            left_force,
             right,
-        } => compare(&left, &right, json, DEFAULT_MAX_HEADER, match_names),
+            right_force,
+        } => {
+            let left = archive::resolve_user_path(&left, left_force)?;
+            let right = archive::resolve_user_path(&right, right_force)?;
+            compare(
+                &left.path,
+                &right.path,
+                json,
+                DEFAULT_MAX_HEADER,
+                match_names,
+                fold,
+            )
+        }
     }
 }
 
@@ -609,35 +828,88 @@ enum DiffCommand {
     Run {
         json: bool,
         match_names: bool,
+        fold: bool,
         left: PathBuf,
+        left_force: bool,
         right: PathBuf,
+        right_force: bool,
     },
 }
 
 fn parse_diff(args: &[String]) -> Result<DiffCommand> {
     let mut json = false;
     let mut match_names = false;
-    let mut paths = Vec::new();
+    let mut fold = false;
+    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
+    let mut force_next = false;
     for arg in args {
         match arg.as_str() {
             "-h" | "--help" => return Ok(DiffCommand::Help),
             "--version" => return Ok(DiffCommand::Version),
-            "--json" => json = true,
-            "--match-names" => match_names = true,
+            "--json" => {
+                if force_next {
+                    return Err(msg(
+                        "--force-single-file must come immediately before a path",
+                    ));
+                }
+                json = true;
+            }
+            "--match-names" => {
+                if force_next {
+                    return Err(msg(
+                        "--force-single-file must come immediately before a path",
+                    ));
+                }
+                match_names = true;
+            }
+            "--fold" => {
+                if force_next {
+                    return Err(msg(
+                        "--force-single-file must come immediately before a path",
+                    ));
+                }
+                fold = true;
+            }
+            "--force-single-file" => {
+                if force_next {
+                    return Err(msg(
+                        "--force-single-file must come immediately before a path",
+                    ));
+                }
+                force_next = true;
+            }
             other if other.starts_with('-') => {
                 return Err(msg(format!("unknown option {other}")));
             }
-            other => paths.push(PathBuf::from(other)),
+            other => {
+                paths.push((PathBuf::from(other), force_next));
+                force_next = false;
+            }
         }
     }
-    if paths.len() != 2 {
-        return Err(msg("usage: tensdiff [--json] [--match-names] LEFT RIGHT"));
+    if force_next {
+        return Err(msg(
+            "--force-single-file must come immediately before a path",
+        ));
     }
+    if json && fold {
+        return Err(msg("--fold does not apply to --json"));
+    }
+    if paths.len() != 2 {
+        return Err(msg(
+            "usage: tensdiff [--json] [--match-names] [--fold] [--force-single-file] LEFT RIGHT",
+        ));
+    }
+    let (right, right_force) = paths.pop().unwrap();
+    let (left, left_force) = paths.pop().unwrap();
     Ok(DiffCommand::Run {
         json,
         match_names,
-        left: paths.remove(0),
-        right: paths.remove(0),
+        fold,
+        left,
+        left_force,
+        right,
+        right_force,
     })
 }
 
@@ -646,7 +918,7 @@ pub fn diff_help() -> &'static str {
 tensdiff — compare two tensor containers
 
 Usage:
-  tensdiff [--json] [--match-names] LEFT RIGHT
+  tensdiff [--json] [--match-names] [--fold] [--force-single-file] LEFT RIGHT
 
 Exit status:
   0  same names, types, shapes, values, and metadata
@@ -661,6 +933,11 @@ Quantized blocks are compared as stored bytes.
 general.architecture selects the table. Otherwise the smallest role set that
 explains every remaining name is used, and a tie is reported as
 \"may be A, B, or C\". Vision tensors are not pairs in a language file.
+--fold merges tensor lines that match except for one consecutive number,
+so blk.20 and blk.21 become blk.[20-21]. A gap stays on its own line.
+--force-single-file applies only to the path written immediately after it.
+A .safetensors file beside config.json is refused unless that flag is set.
+Pass the directory to read the whole safetensors weight set.
 "
 }
 
@@ -714,7 +991,7 @@ mod tests {
         )
         .unwrap();
         safetensors::write_file(&right, &[("source".into(), "same".into())], &[tensor]).unwrap();
-        let code = compare(&left, &right, false, DEFAULT_MAX_HEADER, false).unwrap();
+        let code = compare(&left, &right, false, DEFAULT_MAX_HEADER, false, false).unwrap();
         assert_eq!(code, 0);
     }
 
@@ -724,7 +1001,10 @@ mod tests {
         let (left, right) = write_pair(dir.path(), &[1.0, 2.0], &[1.0, 3.0]);
         let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let text = render_text(
+            &findings_of(&left_archive, &right_archive, false).unwrap(),
+            false,
+        );
         assert!(
             text.contains("weight : F32 : [2] : values differ at byte 6"),
             "{text}"
@@ -744,7 +1024,10 @@ mod tests {
         safetensors::write_file(&right, &[], &[wide]).unwrap();
         let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let text = render_text(
+            &findings_of(&left_archive, &right_archive, false).unwrap(),
+            false,
+        );
         assert!(text.contains("weight : F32 : [4] => [1, 4]"), "{text}");
         assert!(!text.contains("values differ"), "{text}");
     }
@@ -767,7 +1050,10 @@ mod tests {
         safetensors::write_file(&right, &[], &right_tensors).unwrap();
         let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let text = render_text(
+            &findings_of(&left_archive, &right_archive, false).unwrap(),
+            false,
+        );
         let at = |name: &str| {
             text.find(name)
                 .unwrap_or_else(|| panic!("{name} missing in {text}"))
@@ -805,7 +1091,10 @@ mod tests {
         safetensors::write_file(&right, &[], &[other, f32_tensor("only_right", &[1.0])]).unwrap();
         let left_archive = archive::open(&left, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&right, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let text = render_text(
+            &findings_of(&left_archive, &right_archive, false).unwrap(),
+            false,
+        );
         assert!(
             text.contains("only in") && text.contains("only_left"),
             "{text}"
@@ -827,7 +1116,10 @@ mod tests {
             .unwrap();
         let left_archive = archive::open(&safe, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let right_archive = archive::open(&gguf, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&left_archive, &right_archive, false).unwrap());
+        let text = render_text(
+            &findings_of(&left_archive, &right_archive, false).unwrap(),
+            false,
+        );
         assert!(text.contains("format:"), "{text}");
         assert!(!text.contains("values differ"), "{text}");
         assert!(!text.contains("=>"), "{text}");
@@ -857,15 +1149,21 @@ mod tests {
         .unwrap();
         let hf_archive = archive::open(&hf_path, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let gguf_archive = archive::open(&gguf_path, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let plain = render_text(&findings_of(&hf_archive, &gguf_archive, false).unwrap());
+        let plain = render_text(
+            &findings_of(&hf_archive, &gguf_archive, false).unwrap(),
+            false,
+        );
         assert!(plain.contains(hf) && plain.contains("only in"), "{plain}");
         assert!(!plain.contains("names:"), "{plain}");
-        let text = render_text(&findings_of(&hf_archive, &gguf_archive, true).unwrap());
+        let text = render_text(
+            &findings_of(&hf_archive, &gguf_archive, true).unwrap(),
+            false,
+        );
         assert!(text.contains("names: no table matched"), "{text}");
         assert!(!text.contains("=>"), "{text}");
         assert!(text.contains("extra.weight"), "{text}");
         assert_eq!(
-            compare(&hf_path, &gguf_path, false, DEFAULT_MAX_HEADER, true).unwrap(),
+            compare(&hf_path, &gguf_path, false, DEFAULT_MAX_HEADER, true, false).unwrap(),
             1
         );
         let paired = dir.path().join("paired.safetensors");
@@ -876,7 +1174,10 @@ mod tests {
         )
         .unwrap();
         let paired_archive = archive::open(&paired, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let paired_text = render_text(&findings_of(&hf_archive, &paired_archive, true).unwrap());
+        let paired_text = render_text(
+            &findings_of(&hf_archive, &paired_archive, true).unwrap(),
+            false,
+        );
         assert!(
             paired_text.contains("names:") && !paired_text.contains("no table matched"),
             "{paired_text}"
@@ -886,13 +1187,16 @@ mod tests {
             "{paired_text}"
         );
         assert!(!paired_text.contains("values differ"), "{paired_text}");
-        let flipped = render_text(&findings_of(&paired_archive, &hf_archive, true).unwrap());
+        let flipped = render_text(
+            &findings_of(&paired_archive, &hf_archive, true).unwrap(),
+            false,
+        );
         assert!(
             flipped.contains(&format!("{gguf} => {hf} : F32 : [2]")),
             "{flipped}"
         );
         assert_eq!(
-            compare(&hf_path, &paired, false, DEFAULT_MAX_HEADER, true).unwrap(),
+            compare(&hf_path, &paired, false, DEFAULT_MAX_HEADER, true, false).unwrap(),
             0
         );
         let other = dir.path().join("other.safetensors");
@@ -903,7 +1207,10 @@ mod tests {
         )
         .unwrap();
         let other_archive = archive::open(&other, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let none = render_text(&findings_of(&hf_archive, &other_archive, true).unwrap());
+        let none = render_text(
+            &findings_of(&hf_archive, &other_archive, true).unwrap(),
+            false,
+        );
         assert!(none.contains("names: no table matched"), "{none}");
         assert!(none.contains(hf) && none.contains("not.in.table"), "{none}");
     }
@@ -935,7 +1242,10 @@ mod tests {
         .unwrap();
         let hf_archive = archive::open(&hf_path, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let gguf_archive = archive::open(&gguf_path, None, DEFAULT_MAX_HEADER, None, None).unwrap();
-        let text = render_text(&findings_of(&hf_archive, &gguf_archive, true).unwrap());
+        let text = render_text(
+            &findings_of(&hf_archive, &gguf_archive, true).unwrap(),
+            false,
+        );
         assert!(text.contains("names: qwen35"), "{text}");
         assert!(
             text.contains(&format!("{hf} => {gguf} : F32 : [2]")),
@@ -943,5 +1253,89 @@ mod tests {
         );
         assert!(text.contains("custom.bias"), "{text}");
         assert!(!text.contains("values differ"), "{text}");
+    }
+
+    fn paired(left: &str, right: &str, shape: &str) -> Finding {
+        Finding::Tensor {
+            left_name: left.to_string(),
+            right_name: right.to_string(),
+            left_dtype: "F32".to_string(),
+            right_dtype: "BF16".to_string(),
+            dtype_differs: true,
+            left_shape: shape.to_string(),
+            right_shape: shape.to_string(),
+            left_order: "c-order".to_string(),
+            right_order: "c-order".to_string(),
+            values_at: None,
+            left_len: 0,
+            right_len: 0,
+        }
+    }
+
+    #[test]
+    fn fold_merges_a_consecutive_number_and_keeps_a_gap() {
+        let findings = vec![
+            paired(
+                "blk.20.attn_norm.weight",
+                "model.language_model.layers.20.input_layernorm.weight",
+                "[1024]",
+            ),
+            paired(
+                "blk.21.attn_norm.weight",
+                "model.language_model.layers.21.input_layernorm.weight",
+                "[1024]",
+            ),
+            paired(
+                "blk.22.attn_norm.weight",
+                "model.language_model.layers.21.input_layernorm.weight",
+                "[1024]",
+            ),
+            paired(
+                "blk.24.attn_norm.weight",
+                "model.language_model.layers.24.input_layernorm.weight",
+                "[1024]",
+            ),
+            paired(
+                "blk.30.ssm_conv1d.weight",
+                "model.language_model.layers.30.linear_attn.conv1d.weight",
+                "[6144, 4]",
+            ),
+            paired(
+                "blk.40.attn_norm.weight",
+                "model.language_model.layers.7.input_layernorm.weight",
+                "[1024]",
+            ),
+            paired(
+                "blk.41.attn_norm.weight",
+                "model.language_model.layers.7.input_layernorm.weight",
+                "[1024]",
+            ),
+        ];
+        let text = render_text(&findings, true);
+        assert!(
+            text.contains("blk.[20-21].attn_norm.weight => model.language_model.layers.[20-21].input_layernorm.weight : F32 => BF16 : [1024]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("blk.20.attn_norm.weight =>")
+                && !text.contains("blk.21.attn_norm.weight =>"),
+            "{text}"
+        );
+        assert!(
+            text.contains("blk.22.attn_norm.weight => model.language_model.layers.21.input_layernorm.weight : F32 => BF16 : [1024]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("blk.24.attn_norm.weight => model.language_model.layers.24.input_layernorm.weight : F32 => BF16 : [1024]"),
+            "{text}"
+        );
+        assert!(text.contains("blk.30.ssm_conv1d.weight =>"), "{text}");
+        assert!(
+            text.contains("blk.[40-41].attn_norm.weight => model.language_model.layers.7.input_layernorm.weight : F32 => BF16 : [1024]"),
+            "{text}"
+        );
+        let plain = render_text(&findings, false);
+        assert!(plain.contains("blk.20.attn_norm.weight =>"), "{plain}");
+        assert!(!plain.contains("[20-21]"), "{plain}");
     }
 }

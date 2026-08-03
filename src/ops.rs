@@ -49,10 +49,7 @@ enum Pack {
 
 enum ExtractJob {
     #[cfg(format_npy)]
-    Npy {
-        path: PathBuf,
-        tensor: Planned,
-    },
+    Npy { path: PathBuf, tensor: Planned },
     #[cfg(format_raw_sidecar)]
     Raw {
         path: PathBuf,
@@ -87,13 +84,14 @@ pub fn execute(cli: Cli) -> Result<i32> {
     if cli.output.is_some() && matches!(cli.op, Op::List | Op::Info) {
         return Err(msg("-o does not apply to list or info"));
     }
-    if cli.columns || cli.fold {
-        if cli.json {
-            return Err(msg("--columns and --fold do not apply to --json"));
-        }
-        if !matches!(cli.op, Op::List | Op::Info) {
-            return Err(msg("--columns and --fold apply to list or info"));
-        }
+    if cli.json && (cli.columns || cli.fold) {
+        return Err(msg("--columns and --fold do not apply to --json"));
+    }
+    if cli.columns && !matches!(cli.op, Op::List | Op::Info) {
+        return Err(msg("--columns applies to list or info"));
+    }
+    if cli.fold && !matches!(cli.op, Op::List | Op::Info | Op::Diff) {
+        return Err(msg("--fold applies to list, info, or diff"));
     }
     if cli.match_names && cli.op != Op::Diff {
         return Err(msg("--match-names applies to diff"));
@@ -286,7 +284,8 @@ fn extract(cli: &Cli) -> Result<()> {
             "extract cannot write GGUF; choose npy, raw, npz, safetensors, pytorch, or onnx",
         ));
     }
-    let archive = open_extract_source(cli.file.as_ref().unwrap(), cli)?;
+    let resolved = archive::resolve_user_path(cli.file.as_ref().unwrap(), cli.file_force_single)?;
+    let archive = open_extract_source(&resolved.path, cli)?;
     let selected = select(&archive, &cli.operands)?;
     let jobs = extract_jobs(cli, &archive, &selected)?;
     if cli.dry_run {
@@ -302,7 +301,7 @@ fn extract(cli: &Cli) -> Result<()> {
     for job in &jobs {
         ensure_parent(job_path(job))?;
         match job {
-                #[cfg(format_npy)]
+            #[cfg(format_npy)]
             ExtractJob::Npy { path, tensor } => write_npy(path, tensor)?,
             #[cfg(format_raw_sidecar)]
             ExtractJob::Raw { path, members } => {
@@ -593,7 +592,8 @@ fn logical_len(archive: &Archive, member: &Member, pack: Pack) -> Result<u64> {
         return Ok(member.nbytes);
     }
     #[cfg(format_gguf)]
-    let Inner::Gguf(file) = &archive.inner else {
+    let Inner::Gguf(file) = &archive.inner
+    else {
         return Ok(member.nbytes);
     };
     let tensor = file
@@ -682,7 +682,9 @@ fn create(cli: &Cli) -> Result<()> {
                 return Err(msg("a pytorch checkpoint needs at least one tensor"));
             }
             if !metadata.is_empty() {
-                return Err(msg("a pytorch state_dict written here has no string metadata"));
+                return Err(msg(
+                    "a pytorch state_dict written here has no string metadata",
+                ));
             }
         }
         #[cfg(format_onnx)]
@@ -704,7 +706,10 @@ fn create(cli: &Cli) -> Result<()> {
     #[cfg(format_raw_sidecar)]
     if format == FormatName::Raw {
         if let Ok(data_name) = crate::formats::rawtensor::data_file_name(dest) {
-            let data_path = dest.parent().unwrap_or_else(|| Path::new(".")).join(data_name);
+            let data_path = dest
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(data_name);
             if data_path.exists() && !cli.force {
                 return Err(msg(format!(
                     "{} exists; pass --force to overwrite",
@@ -750,7 +755,9 @@ fn create(cli: &Cli) -> Result<()> {
 }
 
 fn modify(cli: &Cli, mode: Modify) -> Result<()> {
-    let source = cli.file.as_ref().unwrap();
+    let requested = cli.file.as_ref().unwrap();
+    let resolved = archive::resolve_user_path(requested, cli.file_force_single)?;
+    let source = &resolved.path;
     let dest = cli.output.clone().unwrap_or_else(|| source.clone());
     let archive = archive::open(
         source,
@@ -882,7 +889,9 @@ fn write_onnx(dest: &Path, metadata: &[(String, String)], incoming: &[Planned]) 
 fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
     let updates = string_updates(cli)?;
     if !updates.is_empty() {
-        return Err(msg("a pytorch state_dict written here has no string metadata"));
+        return Err(msg(
+            "a pytorch state_dict written here has no string metadata",
+        ));
     }
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if planned.is_empty() {
@@ -922,7 +931,13 @@ fn write_rawtensor(dest: &Path, metadata: &[(String, String)], incoming: &[Plann
     let tensors = incoming
         .iter()
         .map(|item| {
-            crate::formats::rawtensor::to_out(&item.name, &item.dtype, &item.shape, &item.payload, item.fortran)
+            crate::formats::rawtensor::to_out(
+                &item.name,
+                &item.dtype,
+                &item.shape,
+                &item.payload,
+                item.fortran,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     crate::formats::rawtensor::write_archive(dest, &typed, &tensors)
@@ -943,7 +958,10 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     let data_name = crate::formats::rawtensor::data_file_name(dest)?;
-    let data_path = dest.parent().unwrap_or_else(|| Path::new(".")).join(data_name);
+    let data_path = dest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(data_name);
     if data_path != file_beside(&archive.path) {
         refuse_overwrite(&data_path, None, cli.force)?;
     }
@@ -951,7 +969,13 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     let tensors = planned
         .iter()
         .map(|item| {
-            crate::formats::rawtensor::to_out(&item.name, &item.dtype, &item.shape, &item.payload, item.fortran)
+            crate::formats::rawtensor::to_out(
+                &item.name,
+                &item.dtype,
+                &item.shape,
+                &item.payload,
+                item.fortran,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     crate::formats::rawtensor::write_archive(dest, &metadata, &tensors)
@@ -960,7 +984,12 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
 #[cfg(format_raw_sidecar)]
 fn file_beside(manifest: &Path) -> PathBuf {
     crate::formats::rawtensor::data_file_name(manifest)
-        .map(|name| manifest.parent().unwrap_or_else(|| Path::new(".")).join(name))
+        .map(|name| {
+            manifest
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name)
+        })
         .unwrap_or_else(|_| manifest.to_path_buf())
 }
 
@@ -1319,10 +1348,12 @@ fn print_plan(planned: &[Planned], metadata: &[(String, String)]) {
 fn open_source(cli: &Cli) -> Result<Archive> {
     let path = cli.file.as_ref().unwrap();
     if cli.op == Op::Extract {
-        return open_extract_source(path, cli);
+        let resolved = archive::resolve_user_path(path, cli.file_force_single)?;
+        return open_extract_source(&resolved.path, cli);
     }
-    archive::open(
+    archive::open_user(
         path,
+        cli.file_force_single,
         cli.format,
         cli.max_header,
         cli.dtype.as_deref(),
@@ -1421,7 +1452,8 @@ enum Source {
 
 fn load_incoming(cli: &Cli) -> Result<Vec<Planned>> {
     let mut incoming = Vec::new();
-    for operand in &cli.operands {
+    for (index, operand) in cli.operands.iter().enumerate() {
+        let force_single = cli.operand_force.get(index).copied().unwrap_or(false);
         let spec = split_operand(operand)?;
         match resolve_source(&spec.source)? {
             Source::File(path) => incoming.extend(load_file(&path, spec.key.as_deref(), cli)?),
@@ -1433,7 +1465,7 @@ fn load_incoming(cli: &Cli) -> Result<Vec<Planned>> {
                         member
                     ))
                 })?;
-                incoming.push(load_member(&archive, &member, key, cli)?);
+                incoming.push(load_member(&archive, &member, key, cli, force_single)?);
             }
         }
     }
@@ -1639,8 +1671,15 @@ fn load_raw(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Planned> {
     })
 }
 
-fn load_member(path: &Path, member_name: &str, key: &str, cli: &Cli) -> Result<Planned> {
-    let archive = archive::open(path, None, cli.max_header, None, None)?;
+fn load_member(
+    path: &Path,
+    member_name: &str,
+    key: &str,
+    cli: &Cli,
+    force_single: bool,
+) -> Result<Planned> {
+    let resolved = archive::resolve_user_path(path, force_single)?;
+    let archive = archive::open(&resolved.path, None, cli.max_header, None, None)?;
     let member = archive
         .members
         .iter()
@@ -1657,7 +1696,8 @@ fn load_member(path: &Path, member_name: &str, key: &str, cli: &Cli) -> Result<P
     #[cfg(format_gguf)]
     if matches!(archive.inner, Inner::Gguf(_)) {
         shape.reverse();
-        let logical = logical_len(&archive, member, Pack::Safe).or_else(|_| logical_len(&archive, member, Pack::Raw))?;
+        let logical = logical_len(&archive, member, Pack::Safe)
+            .or_else(|_| logical_len(&archive, member, Pack::Raw))?;
         payload = clip(&payload, logical)?;
     }
     check_declared(cli, key, &member.dtype, &shape)?;

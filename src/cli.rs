@@ -119,13 +119,16 @@ pub struct Cli {
     pub metadata_file: Option<PathBuf>,
     pub dry_run: bool,
     pub force: bool,
+    /// The `-f` path was prefixed with `--force-single-file`.
+    pub file_force_single: bool,
     pub max_header: u64,
     pub operands: Vec<String>,
+    /// Parallel to `operands`. True when that operand was prefixed with `--force-single-file`.
+    pub operand_force: Vec<bool>,
 }
 
 pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut op: Option<Op> = None;
-    let mut file: Option<PathBuf> = None;
     let mut verbose = false;
     let mut columns = false;
     let mut fold = false;
@@ -141,14 +144,16 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut dry_run = false;
     let mut force = false;
     let mut max_header = DEFAULT_MAX_HEADER;
-    let mut operands = Vec::new();
+    let mut file_marked: Option<MarkedPath> = None;
+    let mut operands_marked: Vec<MarkedPath> = Vec::new();
+    let mut force_next = false;
 
     let mut index = 0;
     let mut ended = false;
     while index < args.len() {
         let arg = &args[index];
         if ended || arg == "-" || !arg.starts_with('-') {
-            operands.push(arg.clone());
+            operands_marked.push(marked(&mut force_next, arg.clone()));
             index += 1;
             continue;
         }
@@ -178,8 +183,23 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                         .ok_or_else(|| msg(format!("--{label} needs a value")))
                 }
             };
+            if force_next && name != "file" {
+                return Err(msg(
+                    "--force-single-file must come immediately before a path",
+                ));
+            }
             match name {
-                "file" => file = Some(PathBuf::from(take("file")?)),
+                "force-single-file" => {
+                    if inline.is_some() {
+                        return Err(msg(
+                            "--force-single-file must come immediately before a path",
+                        ));
+                    }
+                    force_next = true;
+                }
+                "file" => {
+                    file_marked = Some(marked(&mut force_next, take("file")?));
+                }
                 "directory" => directory = PathBuf::from(take("directory")?),
                 "output" => output = Some(PathBuf::from(take("output")?)),
                 "format" => format = Some(FormatName::parse(&take("format")?)?),
@@ -218,6 +238,11 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         if cluster.is_empty() {
             return Err(msg("missing short option"));
         }
+        if force_next && !cluster.starts_with('f') {
+            return Err(msg(
+                "--force-single-file must come immediately before a path",
+            ));
+        }
         let chars: Vec<char> = cluster.chars().collect();
         let mut cursor = 0;
         while cursor < chars.len() {
@@ -234,7 +259,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     rest
                 };
                 match ch {
-                    'f' => file = Some(PathBuf::from(value)),
+                    'f' => file_marked = Some(marked(&mut force_next, value)),
                     'C' => directory = PathBuf::from(value),
                     'o' => output = Some(PathBuf::from(value)),
                     _ => unreachable!(),
@@ -258,36 +283,42 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         }
         index += 1;
     }
+    if force_next {
+        return Err(msg(
+            "--force-single-file must come immediately before a path",
+        ));
+    }
 
     let op =
         op.ok_or_else(|| msg("choose one operation: -c, -t, -x, -r, -u, -i, -d, or --delete"))?;
     if op == Op::Diff {
-        let (left, right) = if file.is_none() && operands.len() == 2 {
-            let right = operands.pop().unwrap();
-            let left = operands.pop().unwrap();
-            (PathBuf::from(left), right)
-        } else if file.is_some() && operands.len() == 1 {
-            (file.clone().unwrap(), operands[0].clone())
+        let (left, right) = if file_marked.is_none() && operands_marked.len() == 2 {
+            let right = operands_marked.pop().unwrap();
+            let left = operands_marked.pop().unwrap();
+            (left, right)
+        } else if file_marked.is_some() && operands_marked.len() == 1 {
+            (file_marked.clone().unwrap(), operands_marked[0].clone())
         } else {
             return Err(msg("diff needs two archive paths"));
         };
-        file = Some(left);
-        operands = vec![right];
-    } else if file.is_none() {
-        if operands.is_empty() {
+        file_marked = Some(left);
+        operands_marked = vec![right];
+    } else if file_marked.is_none() {
+        if operands_marked.is_empty() {
             return Err(msg(
                 "missing archive path; pass -f FILE or the path as the first argument",
             ));
         }
-        file = Some(PathBuf::from(operands.remove(0)));
+        file_marked = Some(operands_marked.remove(0));
     }
     let shape = match shape {
         Some(text) => Some(parse_shape(&text)?),
         None => None,
     };
+    let file_marked = file_marked.unwrap();
     Ok(Parsed::Run(Cli {
         op,
-        file,
+        file: Some(PathBuf::from(file_marked.text)),
         verbose,
         columns,
         fold,
@@ -302,9 +333,29 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         metadata_file,
         dry_run,
         force,
+        file_force_single: file_marked.force_single,
         max_header,
-        operands,
+        operands: operands_marked
+            .iter()
+            .map(|item| item.text.clone())
+            .collect(),
+        operand_force: operands_marked
+            .iter()
+            .map(|item| item.force_single)
+            .collect(),
     }))
+}
+
+#[derive(Clone)]
+struct MarkedPath {
+    text: String,
+    force_single: bool,
+}
+
+fn marked(force_next: &mut bool, text: String) -> MarkedPath {
+    let force_single = *force_next;
+    *force_next = false;
+    MarkedPath { text, force_single }
 }
 
 fn set_op(slot: &mut Option<Op>, op: Op) -> Result<()> {
@@ -410,10 +461,12 @@ Options:
   --columns                 Aligned listing for the console, with headings. Implies -v.
                             Bytes and parameter counts are scaled. Shard and
                             detail columns appear only when a member has them.
-  --fold                    With --columns, merge a consecutive run of one
-                            numeric name segment when the tensors match.
-                            model.layers.[3-5] is one copy per layer. A
-                            mismatch stays on its own line. Implies --columns.
+  --fold                    Merge a consecutive numeric name segment.
+                            On a listing this implies --columns, and
+                            model.layers.[3-5] is one copy per layer.
+                            On diff, lines that match except for that
+                            number become blk.[20-21].attn_norm.weight.
+                            A gap stays on its own line.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are
@@ -431,6 +484,9 @@ Options:
   --metadata-file FILE      JSON object of metadata. GGUF values are typed.
   --max-header-size SIZE    Safetensors header cap (default 100M).
   --force                   Overwrite an existing file on create or extract.
+  --force-single-file PATH  Read this .safetensors file even when config.json
+                            is in the same directory. It applies only to the
+                            path written immediately after it.
   -n, --dry-run             Print the plan and do not write.
   -h, --help                Show this help.
   --version                 Show the version.
@@ -486,6 +542,60 @@ mod tests {
         assert_eq!(cli.op, Op::Create);
         assert_eq!(cli.file.unwrap(), PathBuf::from("out.safetensors"));
         assert_eq!(cli.operands, vec!["a.npy".to_string()]);
+        assert!(!cli.file_force_single);
+        assert_eq!(cli.operand_force, vec![false]);
+    }
+
+    #[test]
+    fn force_single_file_applies_only_to_the_next_path() {
+        let parsed = parse(&args(&[
+            "-t",
+            "--force-single-file",
+            "model.safetensors",
+            "embed",
+        ]))
+        .unwrap();
+        let Parsed::Run(cli) = parsed else {
+            panic!("expected a command");
+        };
+        assert!(cli.file_force_single);
+        assert_eq!(cli.file.unwrap(), PathBuf::from("model.safetensors"));
+        assert_eq!(cli.operand_force, vec![false]);
+        let both = parse(&args(&[
+            "-d",
+            "--force-single-file",
+            "left.safetensors",
+            "right.safetensors",
+        ]))
+        .unwrap();
+        let Parsed::Run(diff) = both else {
+            panic!("expected a command");
+        };
+        assert!(diff.file_force_single);
+        assert_eq!(diff.operand_force, vec![false]);
+        let flagged = parse(&args(&[
+            "-d",
+            "--force-single-file",
+            "-f",
+            "left.safetensors",
+            "right.safetensors",
+        ]))
+        .unwrap();
+        let Parsed::Run(diff) = flagged else {
+            panic!("expected a command");
+        };
+        assert!(diff.file_force_single);
+        assert_eq!(diff.file.unwrap(), PathBuf::from("left.safetensors"));
+        let stray = parse(&args(&[
+            "-t",
+            "--force-single-file",
+            "-v",
+            "model.safetensors",
+        ]));
+        assert!(stray
+            .unwrap_err()
+            .to_string()
+            .contains("immediately before"));
     }
 
     #[test]
