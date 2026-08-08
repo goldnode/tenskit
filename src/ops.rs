@@ -138,7 +138,7 @@ fn info(cli: &Cli) -> Result<()> {
     } else {
         println!("metadata:");
         for (key, value) in &archive.metadata {
-            println!("  {key}={value}");
+            println!("  {key}={}", short_value(value));
         }
     }
     println!("dtypes:");
@@ -252,6 +252,16 @@ fn print_members(members: &[&Member], style: MemberStyle) {
             member.nbytes,
             member.file_offset
         );
+    }
+}
+
+/// A metadata value for the text listing: long values such as a GGUF
+/// vocabulary are cut to their first 120 characters. `--json` prints them whole.
+fn short_value(value: &str) -> String {
+    const SHOWN: usize = 120;
+    match value.char_indices().nth(SHOWN) {
+        Some((end, _)) => format!("{}… ({} bytes)", &value[..end], value.len()),
+        None => value.to_string(),
     }
 }
 
@@ -705,7 +715,7 @@ fn create(cli: &Cli) -> Result<()> {
         #[cfg(format_npz)]
         FormatName::Npz => {
             if incoming.is_empty() {
-                return Err(msg("an npz archive needs at least one array"));
+                return Err(msg("writing an npz archive with no arrays is not supported"));
             }
             if !metadata.is_empty() {
                 return Err(msg("npz files have no string metadata"));
@@ -716,7 +726,7 @@ fn create(cli: &Cli) -> Result<()> {
         #[cfg(format_pytorch)]
         FormatName::Pytorch => {
             if incoming.is_empty() {
-                return Err(msg("a pytorch checkpoint needs at least one tensor"));
+                return Err(msg("writing a pytorch checkpoint with no tensors is not supported"));
             }
             if !metadata.is_empty() {
                 return Err(msg(
@@ -727,7 +737,7 @@ fn create(cli: &Cli) -> Result<()> {
         #[cfg(format_onnx)]
         FormatName::Onnx => {
             if incoming.is_empty() {
-                return Err(msg("an ONNX file needs at least one initializer"));
+                return Err(msg("writing an ONNX file with no initializers is not supported"));
             }
         }
         #[cfg(format_gguf)]
@@ -739,21 +749,6 @@ fn create(cli: &Cli) -> Result<()> {
             "{} exists; pass --force to overwrite",
             dest.display()
         )));
-    }
-    #[cfg(format_raw_sidecar)]
-    if format == FormatName::Raw {
-        if let Ok(data_name) = crate::formats::rawtensor::data_file_name(dest) {
-            let data_path = dest
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(data_name);
-            if data_path.exists() && !cli.force {
-                return Err(msg(format!(
-                    "{} exists; pass --force to overwrite",
-                    data_path.display()
-                )));
-            }
-        }
     }
     if cli.dry_run {
         println!("dry-run: create {}", dest.display());
@@ -881,7 +876,7 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     }
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if planned.is_empty() {
-        return Err(msg("an npz archive needs at least one array"));
+        return Err(msg("writing an npz archive with no arrays is not supported"));
     }
     if cli.dry_run {
         println!("dry-run: write {}", dest.display());
@@ -932,7 +927,7 @@ fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Resu
     }
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if planned.is_empty() {
-        return Err(msg("a pytorch checkpoint needs at least one tensor"));
+        return Err(msg("writing a pytorch checkpoint with no tensors is not supported"));
     }
     if cli.dry_run {
         println!("dry-run: write {}", dest.display());
@@ -950,7 +945,7 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     let metadata = merge_strings(&archive.metadata, &updates);
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if planned.is_empty() {
-        return Err(msg("an ONNX file needs at least one initializer"));
+        return Err(msg("writing an ONNX file with no initializers is not supported"));
     }
     if cli.dry_run {
         println!("dry-run: write {}", dest.display());
@@ -990,7 +985,8 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if cli.dry_run {
         println!("dry-run: write {}", dest.display());
-        print_plan(&planned, &archive.metadata);
+        let shown = crate::formats::rawtensor::display_metadata(&metadata);
+        print_plan(&planned, &shown);
         return Ok(());
     }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
@@ -1166,6 +1162,14 @@ fn edit_index(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result
         return Ok(());
     }
 
+    // The shards are shared by every index in the directory. Rewriting them
+    // for a new index name would leave the original index listing tensors
+    // its shards no longer hold, so only a metadata change may go to -o.
+    if !rewritten.is_empty() && !same_path(dest, &archive.path) {
+        return Err(msg(
+            "-o with a tensor change on a shard index would rewrite the shards the original index lists; edit the index in place, or copy the directory first",
+        ));
+    }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     ensure_parent(dest)?;
     // Shards first, then the index, then unreferenced shard files. A crash can
@@ -1558,15 +1562,6 @@ fn resolve_source(text: &str) -> Result<Source> {
 fn load_file(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Vec<Planned>> {
     match detect::sniff(path, cli.max_header) {
         Ok(kind) => {
-            // A `.bin` that is not a pickle opcode can be a raw tensor when
-            // the dtype and shape are explicit. The opcode itself is refused.
-            if kind == Detected::Pickle
-                && cli.dtype.is_some()
-                && cli.shape.is_some()
-                && !detect::has_pickle_magic(path)?
-            {
-                return Ok(vec![load_raw(path, key, cli)?]);
-            }
             detect::refuse_unsafe(kind, path)?;
             match kind {
                 Detected::Npy => Ok(vec![load_npy(path, key, cli)?]),
@@ -1626,19 +1621,23 @@ fn load_npy(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Planned> {
     Ok(Planned {
         name,
         dtype: dtype.name.to_string(),
-        shape: info.shape,
-        payload: Payload::Range {
+        payload: info.canonical_payload(Payload::Range {
             path: path.to_path_buf(),
             offset: info.data_offset,
             len: info.nbytes,
-        },
-        npy_file: Some(path.to_path_buf()),
+        })?,
+        // A big-endian file is not copied whole; its swapped bytes are.
+        npy_file: (!info.big_endian).then(|| path.to_path_buf()),
+        shape: info.shape,
         fortran: false,
     })
 }
 
 fn load_npz_all(path: &Path, cli: &Cli) -> Result<Vec<Planned>> {
-    let entries = npz::read_entries(path)?;
+    let (entries, notes) = npz::read_entries(path)?;
+    for note in notes {
+        eprintln!("tenspile: {}: {note}", path.display());
+    }
     let mut planned = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry.info.fortran_order {
@@ -1660,13 +1659,13 @@ fn load_npz_all(path: &Path, cli: &Cli) -> Result<Vec<Planned>> {
         planned.push(Planned {
             name: entry.key,
             dtype: dtype.name.to_string(),
-            shape: entry.info.shape,
-            payload: Payload::Zip {
+            payload: entry.info.canonical_payload(Payload::Zip {
                 path: path.to_path_buf(),
-                entry: entry.zip_name,
+                entry: entry.zip_name.clone(),
                 skip: entry.info.data_offset,
                 len: entry.info.nbytes,
-            },
+            })?,
+            shape: entry.info.shape,
             npy_file: None,
             fortran: false,
         });
@@ -1948,17 +1947,14 @@ fn npz_member(item: &Planned) -> Result<NpzMember> {
     })
 }
 
+/// Refuse to replace an existing path without --force. A rawtensor manifest
+/// also writes its `.bin`, so that file is checked too. A dangling symlink
+/// counts as existing.
 fn refuse_overwrite(dest: &Path, source: Option<&Path>, force: bool) -> Result<()> {
     if source.is_some_and(|source| same_path(dest, source)) {
         return Ok(());
     }
-    if dest.exists() && !force {
-        return Err(msg(format!(
-            "{} exists; pass --force to overwrite",
-            dest.display()
-        )));
-    }
-    Ok(())
+    crate::io_util::refuse_existing(dest, force)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

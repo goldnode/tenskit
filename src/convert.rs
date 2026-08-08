@@ -35,12 +35,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
     if request.names_only && !request.rename {
         return Err(msg("--names-only applies to --rename"));
     }
-    if request.output.exists() && !request.force {
-        return Err(msg(format!(
-            "{} exists; pass --force to overwrite",
-            request.output.display()
-        )));
-    }
+    crate::io_util::refuse_existing(&request.output, request.force)?;
     let resolved = archive::resolve_user_path(&request.source, request.force_single)?;
     let archive = archive::open(&resolved.path, None, DEFAULT_MAX_HEADER, None, None)?;
     let target = output_format(&request.output, request.format)?;
@@ -70,7 +65,6 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 warnings.extend(metadata_notes(map));
             }
         }
-        let _ = arch;
     }
     for tensor in &mut tensors {
         fit_dtype(tensor, target, &mut warnings)?;
@@ -82,6 +76,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         &archive,
         hparams.as_ref(),
         request.rename,
+        &mut warnings,
     )?;
     Ok(warnings)
 }
@@ -135,21 +130,15 @@ fn load_tensors(archive: &Archive) -> Result<Vec<Tensor>> {
             )));
         }
         let mut shape = member.shape.clone();
-        let mut len = member.nbytes;
         #[cfg(format_gguf)]
         if matches!(archive.inner, Inner::Gguf(_)) {
             shape.reverse();
-            if let Inner::Gguf(file) = &archive.inner {
-                if let Some(tensor) = file.tensors.iter().find(|item| item.name == member.name) {
-                    len = dtype::ggml_payload_bytes(tensor.ggml_type, &tensor.shape)?;
-                }
-            }
         }
         out.push(Tensor {
             name: member.name.clone(),
             canonical: canonical.to_string(),
             shape,
-            bytes: member.payload.clipped(len)?,
+            bytes: member.payload.clone(),
         });
     }
     Ok(out)
@@ -175,13 +164,32 @@ fn choose_architecture(archive: &Archive, config: Option<&Value>) -> Result<Stri
     })
 }
 
+/// The converter's HF class: `architectures[0]`, or
+/// `text_config.architectures[0]` when present, except for the top-level
+/// names llama.cpp keeps as they are (conversion-considerations.md section 6,
+/// "Choosing the converter class").
 fn hf_class(config: &Value) -> Option<String> {
-    config
-        .get("architectures")
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    const KEEP_TOP_LEVEL: &[&str] = &[
+        "NEOChatModel",
+        "StepVLForConditionalGeneration",
+        "Sarashina2VisionForCausalLM",
+        "Exaone4_5_ForConditionalGeneration",
+        "Step3p7ForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+    ];
+    let first = |value: &Value| {
+        value
+            .get("architectures")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let top = first(config);
+    if top.as_deref().is_some_and(|name| KEEP_TOP_LEVEL.contains(&name)) {
+        return top;
+    }
+    config.get("text_config").and_then(first).or(top)
 }
 
 fn select_converter(arch: &str, class: Option<&str>) -> Result<ConverterRecord> {
@@ -197,24 +205,15 @@ fn select_converter(arch: &str, class: Option<&str>) -> Result<ConverterRecord> 
             return Ok(found.clone());
         }
     }
-    let preferred = match arch {
-        "qwen35" => Some("Qwen3_5TextModel"),
-        "llama" => Some("LlamaModel"),
-        "gemma" => Some("GemmaModel"),
-        "gemma2" => Some("Gemma2Model"),
-        _ => None,
-    };
-    if let Some(name) = preferred {
-        if let Some(found) = records.iter().find(|record| record.class == name) {
-            return Ok(found.clone());
-        }
-    }
+    // There is no preference order between converter classes: without the
+    // HF class from config.json, only an architecture with one converter is
+    // decided (conversion-considerations.md section 6).
     if records.len() == 1 {
         return Ok(records.into_iter().next().unwrap());
     }
     let names: Vec<_> = records.iter().map(|record| record.class.as_str()).collect();
     Err(msg(format!(
-        "architecture {arch} has more than one converter ({}); name it with config.json architectures",
+        "architecture {arch} has more than one converter ({}); put config.json with its architectures beside the weights",
         names.join(", ")
     )))
 }
@@ -261,9 +260,12 @@ fn llama_permute(tensors: &mut [Tensor], hparams: Option<&Map<String, Value>>) -
         .ok_or_else(|| msg("LLaMA permute needs num_attention_heads"))?;
     let n_kv = hparam_u64(hparams, &["num_key_value_heads", "n_kv_heads"]).unwrap_or(n_head);
     for tensor in tensors {
-        let heads = if tensor.name.contains("k_proj") {
+        // Exactly these suffixes (section 6); packed GPTQ/AWQ siblings such
+        // as q_proj.qweight are not weight rows and are never permuted.
+        let name = tensor.name.as_str();
+        let heads = if name.ends_with("k_proj.weight") || name.ends_with("k_proj.bias") {
             n_kv
-        } else if tensor.name.contains("q_proj") {
+        } else if name.ends_with("q_proj.weight") || name.ends_with("q_proj.bias") {
             n_head
         } else {
             continue;
@@ -797,24 +799,10 @@ fn widen_to(tensor: &mut Tensor, target: FormatName) -> Result<String> {
     let raw = tensor.bytes.read_vec()?;
     let widened = match tensor.canonical.as_str() {
         "bfloat16" => bf16_to_f32(&raw)?,
-        "float8_e4m3fn" => fp8_to_f16(&raw, Fp8::E4M3)?,
-        "float8_e5m2" => fp8_to_f16(&raw, Fp8::E5M2)?,
-        "float8_e4m3fnuz" => fp8_to_f16(&raw, Fp8::E4M3FNUZ)?,
-        "float8_e5m2fnuz" => fp8_to_f16(&raw, Fp8::E5M2FNUZ)?,
-        "float4_e2m1fn" => f4_to_f16(&raw)?,
-        "float8_e8m0fnu" => e8m0_to_f32(&raw)?,
-        _ => unreachable!(),
+        other => minifloat_widen(&raw, other, next)?,
     };
     tensor.bytes = Payload::Bytes(widened);
     Ok(next.to_string())
-}
-
-#[derive(Clone, Copy)]
-enum Fp8 {
-    E4M3,
-    E5M2,
-    E4M3FNUZ,
-    E5M2FNUZ,
 }
 
 fn bf16_to_f32(raw: &[u8]) -> Result<Vec<u8>> {
@@ -826,81 +814,26 @@ fn bf16_to_f32(raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn e8m0_to_f32(raw: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len() * 4);
-    for byte in raw {
-        let bits = if *byte < 2 {
-            0x0020_0000u32 << *byte
+/// Widen fp8, fp4, or E8M0 codes to float16 or float32. Every value is
+/// exact in the target (conversion-considerations.md section 2). fp4 holds
+/// two codes per byte, low nibble first.
+fn minifloat_widen(raw: &[u8], dtype: &str, target: &str) -> Result<Vec<u8>> {
+    let format = dtype::MiniFloat::for_dtype(dtype)?;
+    let codes: Vec<u8> = if dtype::canon_bits(dtype) == Some(4) {
+        raw.iter().flat_map(|byte| [byte & 0x0f, byte >> 4]).collect()
+    } else {
+        raw.to_vec()
+    };
+    let mut out = Vec::with_capacity(codes.len() * 4);
+    for code in codes {
+        let value = format.decode(code);
+        if target == "float32" {
+            out.extend_from_slice(&value.to_le_bytes());
         } else {
-            (u32::from(*byte) - 1) << 23
-        };
-        out.extend_from_slice(&bits.to_le_bytes());
-    }
-    Ok(out)
-}
-
-fn f4_to_f16(raw: &[u8]) -> Result<Vec<u8>> {
-    let values = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let mut out = Vec::with_capacity(raw.len() * 4);
-    for byte in raw {
-        for nibble in [byte & 0x0f, byte >> 4] {
-            let sign = nibble & 0x08 != 0;
-            let mag = values[(nibble & 0x07) as usize];
-            let value = if sign { -mag } else { mag };
             out.extend_from_slice(&crate::ggml_dequant::f32_to_f16(value).to_le_bytes());
         }
     }
     Ok(out)
-}
-
-fn fp8_to_f16(raw: &[u8], kind: Fp8) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(raw.len() * 2);
-    for byte in raw {
-        let value = fp8_to_f32(*byte, kind);
-        out.extend_from_slice(&crate::ggml_dequant::f32_to_f16(value).to_le_bytes());
-    }
-    Ok(out)
-}
-
-fn fp8_to_f32(byte: u8, kind: Fp8) -> f32 {
-    match kind {
-        Fp8::E4M3 => decode_fp8(byte, 4, 3, 7, true, false),
-        Fp8::E5M2 => decode_fp8(byte, 5, 2, 15, false, false),
-        Fp8::E4M3FNUZ => decode_fp8(byte, 4, 3, 8, true, true),
-        Fp8::E5M2FNUZ => decode_fp8(byte, 5, 2, 16, false, true),
-    }
-}
-
-fn decode_fp8(byte: u8, exp_bits: u32, man_bits: u32, bias: i32, no_inf: bool, fnuz: bool) -> f32 {
-    if fnuz && byte == 0x80 {
-        return f32::NAN;
-    }
-    let sign = (byte >> 7) & 1;
-    let exp_mask = (1u8 << exp_bits) - 1;
-    let man_mask = (1u8 << man_bits) - 1;
-    let exp = (byte >> man_bits) & exp_mask;
-    let man = byte & man_mask;
-    let mag = if exp == 0 {
-        (man as f32) * 2f32.powi(1 - bias - man_bits as i32)
-    } else if u32::from(exp) == (1u32 << exp_bits) - 1 && !no_inf {
-        if man == 0 {
-            return if sign == 0 {
-                f32::INFINITY
-            } else {
-                f32::NEG_INFINITY
-            };
-        }
-        return f32::NAN;
-    } else if no_inf && u32::from(exp) == (1u32 << exp_bits) - 1 {
-        return f32::NAN;
-    } else {
-        (1.0 + (man as f32) / ((1u32 << man_bits) as f32)) * 2f32.powi(i32::from(exp) - bias)
-    };
-    if sign == 1 {
-        -mag
-    } else {
-        mag
-    }
 }
 
 fn write_target(
@@ -910,21 +843,35 @@ fn write_target(
     archive: &Archive,
     hparams: Option<&Map<String, Value>>,
     rename: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
     if tensors.is_empty() {
         return Err(msg("the source has no tensors"));
     }
+    let source = source_metadata(archive);
+    // Targets without metadata say what they leave behind (metadata-mapping
+    // generic_rules: never drop metadata silently).
+    let dropped = |warnings: &mut Vec<String>, target: &str| {
+        if !source.is_empty() {
+            warnings.push(format!(
+                "{} metadata keys were not written: {target} has no metadata",
+                source.len()
+            ));
+        }
+    };
     match target {
         #[cfg(format_safetensors)]
         FormatName::Safetensors => {
             let converted = safe_out(tensors)?;
-            crate::formats::safetensors::write_file(path, &archive.metadata, &converted)
+            let metadata = string_metadata(archive, &source, warnings);
+            crate::formats::safetensors::write_file(path, &metadata, &converted)
         }
         #[cfg(format_npy)]
         FormatName::Npy => {
             if tensors.len() != 1 {
                 return Err(msg("an npy file holds one tensor"));
             }
+            dropped(warnings, "npy");
             let tensor = &tensors[0];
             let descr = numpy_descr(&tensor.canonical)?;
             crate::formats::npy::write_file(path, descr, &tensor.shape, |file| {
@@ -933,31 +880,100 @@ fn write_target(
         }
         #[cfg(format_npz)]
         FormatName::Npz => {
+            dropped(warnings, "npz");
             let members = npz_out(tensors)?;
             crate::formats::npz::write_archive(path, &members)
         }
         #[cfg(format_gguf)]
         FormatName::Gguf => {
-            let (metadata, dense) = gguf_out(tensors, hparams, rename)?;
+            let (mut metadata, dense) = gguf_out(tensors, hparams, rename)?;
+            let gguf_source = matches!(archive.inner, Inner::Gguf(_));
+            let prefix = format!("{}.metadata.", archive.format.as_str());
+            for (key, value) in source {
+                // A GGUF source keeps its typed keys. Other sources keep
+                // their string map under a private prefix (metadata-mapping
+                // safetensors_metadata_to_gguf).
+                let key = if gguf_source { key } else { format!("{prefix}{key}") };
+                if !metadata.iter().any(|(existing, _)| *existing == key) {
+                    metadata.push((key, value));
+                }
+            }
             write_dense(path, &metadata, &dense)
         }
         #[cfg(format_pytorch)]
         FormatName::Pytorch => {
+            dropped(warnings, "the PyTorch writer");
             let converted = pytorch_out(tensors)?;
             crate::formats::pytorch::write_archive(path, &converted)
         }
         #[cfg(format_onnx)]
         FormatName::Onnx => {
             let converted = onnx_out(tensors)?;
-            crate::formats::onnx::write_archive(path, &archive.metadata, &converted)
+            let metadata = string_metadata(archive, &source, warnings);
+            crate::formats::onnx::write_archive(path, &metadata, &converted)
         }
         #[cfg(format_raw_sidecar)]
         FormatName::Raw => {
             let converted = raw_out(tensors)?;
-            let meta = Map::new();
+            // raw-sidecar keeps every key with its type (metadata: "Converters
+            // SHOULD copy source metadata keys verbatim").
+            let meta: Map<String, Value> = source
+                .iter()
+                .map(|(key, value)| (key.clone(), value.typed_value()))
+                .collect();
             crate::formats::rawtensor::write_archive(path, &meta, &converted)
         }
     }
+}
+
+/// Source metadata with types: GGUF keys keep theirs, other formats are
+/// string maps. `general.alignment` describes the source file's layout and
+/// is not carried over.
+fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
+    #[cfg(format_gguf)]
+    if let Inner::Gguf(file) = &archive.inner {
+        return file
+            .metadata
+            .iter()
+            .filter(|field| field.key != "general.alignment")
+            .map(|field| (field.key.clone(), field.value.clone()))
+            .collect();
+    }
+    archive
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), MetaValue::String(value.clone())))
+        .collect()
+}
+
+/// Metadata for a string map (safetensors `__metadata__`, ONNX
+/// `metadata_props`). A GGUF key becomes `gguf.<key>` with its type tagged
+/// in JSON (metadata-mapping safetensors_metadata_to_gguf, reverse
+/// direction). Tokenizer arrays belong in tokenizer.json, not a header, so
+/// they are left out and named in a warning.
+fn string_metadata(
+    archive: &Archive,
+    source: &[(String, MetaValue)],
+    warnings: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    if !matches!(archive.format, FormatName::Gguf) {
+        return archive.metadata.clone();
+    }
+    let mut out = Vec::new();
+    for (key, value) in source {
+        if key.starts_with("tokenizer.ggml.") && matches!(value, MetaValue::Array { .. }) {
+            warnings.push(format!(
+                "{key} was not written; a tokenizer array belongs in tokenizer.json"
+            ));
+            continue;
+        }
+        let tagged = serde_json::json!({
+            "type": crate::formats::gguf::gguf_type_name(value.type_id()).to_ascii_uppercase(),
+            "value": value.json(),
+        });
+        out.push((format!("gguf.{key}"), tagged.to_string()));
+    }
+    out
 }
 
 #[cfg(format_safetensors)]
@@ -1007,8 +1023,8 @@ fn gguf_out(
         metadata.push(("general.quantization_version".into(), MetaValue::U32(2)));
     }
     let mut dense = Vec::new();
-    let mut f32 = 0;
     let mut f16 = 0;
+    let mut bf16 = 0;
     let mut other = 0;
     for tensor in tensors {
         let code = element_ggml_code(&tensor.canonical).ok_or_else(|| {
@@ -1018,11 +1034,21 @@ fn gguf_out(
             ))
         })?;
         match tensor.canonical.as_str() {
-            "float32" => f32 += 1,
+            "float32" => {}
             "float16" => f16 += 1,
+            "bfloat16" => bf16 += 1,
             _ => other += 1,
         }
         let ne = if tensor.shape.is_empty() {
+            // GGUF-018 / GGUF-023: a scalar is stored as [1], and its
+            // canonical shape [] is kept in `<name>.orig_shape`.
+            metadata.push((
+                format!("{}.orig_shape", tensor.name),
+                MetaValue::Array {
+                    elem: crate::formats::gguf::TYPE_ARRAY_U64,
+                    values: Vec::new(),
+                },
+            ));
             vec![1]
         } else {
             let mut ne = tensor.shape.clone();
@@ -1036,15 +1062,17 @@ fn gguf_out(
             payload: tensor.bytes.clone(),
         });
     }
-    if other == 0 {
-        let file_type = if f16 > 0 { 1 } else { 0 };
-        let _ = (f32, file_type);
-        if rename {
-            metadata.push((
-                "general.file_type".into(),
-                MetaValue::U32(if f16 > 0 { 1 } else { 0 }),
-            ));
-        }
+    // llama_ftype names the dominant type (gguf.yaml): ALL_F32 0,
+    // MOSTLY_F16 1, MOSTLY_BF16 32. f32 norms beside f16 weights are still
+    // MOSTLY_F16. Other mixes are not written.
+    let file_type = match (f16, bf16) {
+        (0, 0) => Some(0),
+        (_, 0) => Some(1),
+        (0, _) => Some(32),
+        _ => None,
+    };
+    if let (true, 0, Some(file_type)) = (rename, other, file_type) {
+        metadata.push(("general.file_type".into(), MetaValue::U32(file_type)));
     }
     Ok((metadata, dense))
 }
@@ -1387,7 +1415,7 @@ fn map_floats(canonical: &str, data: &[u8], op: impl Fn(f32) -> f32) -> Result<V
             for chunk in data.chunks_exact(2) {
                 let bits = u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16;
                 let value = op(f32::from_bits(bits));
-                let stored = (value.to_bits() >> 16) as u16;
+                let stored = crate::ggml_dequant::f32_to_bf16(value);
                 out.extend_from_slice(&stored.to_le_bytes());
             }
             Ok(out)
@@ -1473,7 +1501,7 @@ pub fn convert_main(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         ConvertCommand::Version => {
-            println!("tensconv {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", crate::version_line("tensconv"));
             Ok(0)
         }
         ConvertCommand::Run(request) => {

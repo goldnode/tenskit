@@ -2,24 +2,60 @@
 .SH NAME
 tenspile \- inspect and edit tensor containers
 .SH SYNOPSIS
-.nf
-.B tenspile \-c
-[\fB\-f\fR] \fIarchive\fR [\fIkey=file\fR ...]
-.B tenspile \-t
-[\fB\-v\fR] [\fB\-\-columns\fR] [\fB\-\-fold\fR] [\fB\-f\fR] \fIarchive\fR [\fIkey\fR ...]
-.B tenspile \-x
-[\fB\-f\fR] \fIarchive\fR [\fIkey\fR ...]
-.B tenspile \-r
-[\fB\-f\fR] \fIarchive\fR \fIkey=file\fR ...
-.B tenspile \-u
-[\fB\-f\fR] \fIarchive\fR \fIkey=file\fR ...
-.B tenspile \-\-delete
-[\fB\-f\fR] \fIarchive\fR \fIkey\fR ...
-.B tenspile \-i
-[\fB\-f\fR] \fIarchive\fR
-.B tenspile
-[\fB\-h\fR | \fB\-\-version\fR]
-.fi
+.SY tenspile
+.B \-c
+.RB [ \-f ]
+.I archive
+.RI [ key=file
+\&.\|.\|.]
+.YS
+.SY tenspile
+.B \-t
+.RB [ \-v ]
+.RB [ \-\-columns ]
+.RB [ \-\-fold ]
+.RB [ \-f ]
+.I archive
+.RI [ key
+\&.\|.\|.]
+.YS
+.SY tenspile
+.B \-x
+.RB [ \-f ]
+.I archive
+.RI [ key
+\&.\|.\|.]
+.YS
+.SY tenspile
+.B \-r
+.RB [ \-f ]
+.I archive
+.I key=file
+\&.\|.\|.
+.YS
+.SY tenspile
+.B \-u
+.RB [ \-f ]
+.I archive
+.I key=file
+\&.\|.\|.
+.YS
+.SY tenspile
+.B \-\-delete
+.RB [ \-f ]
+.I archive
+.I key
+\&.\|.\|.
+.YS
+.SY tenspile
+.B \-i
+.RB [ \-f ]
+.I archive
+.YS
+.SY tenspile
+.RB [ \-h ]
+.RB [ \-\-version ]
+.YS
 .SH DESCRIPTION
 .B tenspile
 creates, lists, extracts, and edits files that store tensors.
@@ -41,15 +77,18 @@ is refused unless
 is written immediately before that path.
 .PP
 List and info read the header.
-They do not load weight bytes.
+They do not load weight bytes, except where the format needs them:
+a rawtensor manifest with
+.I sha256
+is verified, and big-endian or compressed data is decoded.
 A rewrite streams unchanged tensor bytes into the new file.
 .PP
 Comparison is
-.BR tensdiff (1).
+.BR \%tensdiff (1).
 Renaming tensors into GGUF names is
-.BR tensconv (1).
+.BR \%tensconv (1).
 Dequantizing a pack is
-.BR tensquant (1).
+.BR \%tensquant (1).
 .SH OPTIONS
 Exactly one operation is required.
 .TP
@@ -85,7 +124,7 @@ and any notes.
 On a directory, a sibling
 .I config.json
 with
-.I quantization_config.quant_method
+.I \%quantization_config.quant_method
 or an MLX
 .I quantization
 object adds one note of method, bits, and group size.
@@ -133,10 +172,10 @@ Does not apply to list or info.
 Container to read or write.
 This build's names are printed when the name is unknown.
 Which formats are compiled in is
-.IR local/supported-formats.txt .
+.IR \%local/supported\-formats.txt .
 .I raw
 is rawtensor/1, a
-.I .rawtensor.json
+.I \%.rawtensor.json
 manifest plus a
 .IR .bin .
 .TP
@@ -170,7 +209,12 @@ Safetensors header cap.
 The default is 100M.
 .TP
 .B \-\-force
-Overwrite an existing file on create or extract.
+Overwrite an existing file on create or extract, or an existing
+.B \-o
+file on update, append, or delete.
+A rawtensor output also checks its
+.I .bin
+file.
 .TP
 .BI \-\-force\-single\-file " path"
 Read this
@@ -211,7 +255,7 @@ The operation finished.
 .B 1
 An error.
 The message is written to stderr and starts with
-.BR "tenspile: " .
+.BR "\%tenspile: " .
 .SH EXAMPLES
 .nf
 .B tenspile \-tvf model.safetensors
@@ -222,7 +266,9 @@ The message is written to stderr and starts with
 .B tenspile \-uf model.safetensors norm=new_norm.npy
 .B tenspile \-\-delete \-f model.safetensors optimizer.step
 .fi
+.SH AUTHOR
+Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
-.BR tensdiff (1),
-.BR tensconv (1),
-.BR tensquant (1)
+.BR \%tensdiff (1),
+.BR \%tensconv (1),
+.BR \%tensquant (1)

@@ -41,6 +41,6 @@ tenspile -u -f model.safetensors.index.json --metadata note=hi
 tenspile --delete -f model.safetensors.index.json b
 ```
 
-A shard that no longer has tensors is deleted when the index is rewritten onto itself. `total_size` is recomputed from the tensors. A shard's own `__metadata__` is kept. `-o` has to stay in the index directory. An `-o` of another name in that directory writes the new index and leaves every shard file on disk.
+A shard that no longer has tensors is deleted when the index is rewritten onto itself. `total_size` is recomputed from the tensors. A shard's own `__metadata__` is kept. `-o` has to stay in the index directory. An `-o` of another name in that directory may change metadata only: a tensor change would rewrite shards that the original index still lists, so it stops. Edit the index in place, or copy the directory first.
 
 `-n` prints the rewrite plan and does not change the files.

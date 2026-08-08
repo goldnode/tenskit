@@ -2,24 +2,43 @@
 .SH NAME
 tensconv \- copy tensors into another container
 .SH SYNOPSIS
-.nf
-.B tensconv \-o
-\fIout\fR [\fB\-\-format\fR \fIname\fR] [\fB\-\-rename\fR] [\fB\-\-names\-only\fR]
-[\fB\-\-force\fR] [\fB\-\-force\-single\-file\fR] \fIsource\fR
-.fi
+.SY tensconv
+.B \-o
+.I out
+.RB [ \-\-format
+.IR name ]
+.RB [ \-\-rename ]
+.RB [ \-\-names\-only ]
+.RB [ \-\-force ]
+.RB [ \-\-force\-single\-file ]
+.I source
+.YS
 .SH DESCRIPTION
 .B tensconv
 reads one container and writes one container.
 A directory is the safetensors weight set, the same rule as
-.BR tenspile (1).
+.BR \%tenspile (1).
 Shapes are stored outermost-first.
 A GGUF
 .I ne[]
 axis is reversed on the way in and on the way out.
-One tensor is converted at a time.
+A tensor whose bytes change (a widened dtype or a value change) is held in
+memory until the output is written.
 A GGUF name of 64 bytes or more, or a rank outside 1 to 4, stops the write.
 A rank-0 tensor is stored as
-.IR ne=[1] .
+.I ne=[1]
+and its shape is kept in the key
+.IR <name>.orig_shape .
+.PP
+Metadata is carried over.
+GGUF keys keep their types in GGUF and rawtensor output, and become
+.I gguf.<key>
+JSON strings in safetensors and ONNX.
+Tokenizer arrays are left out of those string maps.
+String metadata becomes
+.I <format>.metadata.<key>
+in GGUF.
+npy, npz, and PyTorch output have no metadata, and a warning says so.
 .PP
 A dtype is copied when the target has it.
 BF16 widens to F32.
@@ -28,7 +47,7 @@ E8M0 widens to F32.
 A type the target cannot store stops the command.
 Narrowing is not done.
 Quantized blocks are not written here.
-.BR tensquant (1)
+.BR \%tensquant (1)
 dequantizes them.
 .PP
 An existing output file is left in place unless
@@ -50,18 +69,17 @@ Container to write.
 .B \-\-rename
 Map names through the GGUF role table.
 The architecture is
-.I general.architecture
+.I \%general.architecture
 or
 .I config.json
-.IR architectures[0] .
+.IR \%architectures[0] .
 Hyperparameters written into GGUF follow
-.IR hf_config_to_gguf :
+.IR \%hf_config_to_gguf :
 .I text_config
 is merged over the root object first, then the first listed key is used.
 A sibling
 .I config.json
 is read only for those keys.
-.PP
 Value changes run unless
 .B \-\-names\-only
 is set.
@@ -81,7 +99,7 @@ Qwen3.5 applies the V-head reorder,
 as
 .IR \-exp ,
 norms other than
-.I linear_attn.norm.weight
+.I \%linear_attn.norm.weight
 as
 .IR "weight + 1" ,
 and the
@@ -123,13 +141,15 @@ The output file was written.
 .B 1
 An error.
 The message is written to stderr and starts with
-.BR "tensconv: " .
+.BR "\%tensconv: " .
 .SH EXAMPLES
 .nf
 .B tensconv \-o model.gguf model.safetensors
 .B tensconv \-\-rename \-o model.gguf model/
 .fi
+.SH AUTHOR
+Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
-.BR tenspile (1),
+.BR \%tenspile (1),
 .BR tensdiff (1),
-.BR tensquant (1)
+.BR \%tensquant (1)

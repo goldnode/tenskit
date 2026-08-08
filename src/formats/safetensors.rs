@@ -51,7 +51,7 @@ pub fn read_file(path: &Path, max_header: u64) -> Result<SafeFile> {
             path.display()
         )));
     }
-    if file_len < 8 + header_len {
+    if file_len.saturating_sub(8) < header_len {
         return Err(msg(format!(
             "{}: safetensors header length {header_len} runs past the end of the file",
             path.display()
@@ -123,7 +123,8 @@ fn parse_object(
 ) -> Result<SafeFile> {
     let mut metadata = Vec::new();
     let mut tensors = Vec::new();
-    if let Some(meta) = object.get(METADATA_KEY) {
+    // ST-009i: `"__metadata__": null` is read as no metadata.
+    if let Some(meta) = object.get(METADATA_KEY).filter(|meta| !meta.is_null()) {
         let meta_object = meta
             .as_object()
             .ok_or_else(|| msg(format!("{}: __metadata__ is not an object", path.display())))?;
@@ -285,6 +286,10 @@ pub struct OutTensor {
 }
 
 pub fn write_file(path: &Path, metadata: &[(String, String)], tensors: &[OutTensor]) -> Result<()> {
+    crate::io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
+    if tensors.iter().any(|tensor| tensor.name == METADATA_KEY) {
+        return Err(msg("a tensor cannot be named __metadata__"));
+    }
     let mut cursor = 0u64;
     let mut header = Map::new();
     if !metadata.is_empty() {
@@ -305,10 +310,12 @@ pub fn write_file(path: &Path, metadata: &[(String, String)], tensors: &[OutTens
                 tensor.dtype
             )));
         }
-        let end = cursor + tensor.bytes.len();
-        if end > MAX_OFFSET {
+        let end = cursor
+            .checked_add(tensor.bytes.len())
+            .filter(|end| *end <= MAX_OFFSET);
+        let Some(end) = end else {
             return Err(msg("safetensors data offset exceeds 48 bits"));
-        }
+        };
         let mut entry = Map::new();
         entry.insert("dtype".to_string(), Value::String(tensor.dtype.clone()));
         entry.insert(
@@ -334,6 +341,11 @@ pub fn write_file(path: &Path, metadata: &[(String, String)], tensors: &[OutTens
     let pad = (8 - (padded.len() % 8)) % 8;
     padded.extend(std::iter::repeat(b' ').take(pad));
     let header_len = padded.len() as u64;
+    if header_len > crate::cli::DEFAULT_MAX_HEADER {
+        return Err(msg(format!(
+            "safetensors header would be {header_len} bytes, over the 100,000,000 byte limit (ST-002)"
+        )));
+    }
     atomic_write(path, |file| {
         file.write_all(&header_len.to_le_bytes())?;
         file.write_all(&padded)?;
@@ -344,42 +356,106 @@ pub fn write_file(path: &Path, metadata: &[(String, String)], tensors: &[OutTens
     })
 }
 
+/// ST-007: no JSON object in the header repeats a key, at any depth.
+/// serde_json keeps the last of two equal keys, so this scan runs first.
+/// It walks the text with an explicit stack, so a deeply nested header is
+/// refused instead of exhausting the call stack.
 fn check_duplicate_keys(text: &str) -> Result<()> {
+    const MAX_DEPTH: usize = 128;
+    enum Frame {
+        Object(HashSet<String>),
+        Array,
+    }
     let bytes = text.as_bytes();
     let mut index = 0;
+    let mut stack: Vec<Frame> = Vec::new();
     skip_ws(bytes, &mut index);
     if bytes.get(index) != Some(&b'{') {
         return Err(msg("safetensors header does not start with '{'"));
     }
-    index += 1;
-    let mut seen = HashSet::new();
+    // Each pass reads one value, then the separator that follows it.
     loop {
         skip_ws(bytes, &mut index);
-        if bytes.get(index) == Some(&b'}') {
-            return Ok(());
-        }
-        let key = parse_json_string(bytes, &mut index)?;
-        if !seen.insert(key.clone()) {
-            return Err(msg(format!("duplicate safetensors key {key}")));
-        }
-        skip_ws(bytes, &mut index);
-        if bytes.get(index) != Some(&b':') {
-            return Err(msg(format!("safetensors key {key} is missing ':'")));
-        }
-        index += 1;
-        skip_value(bytes, &mut index)?;
-        skip_ws(bytes, &mut index);
-        match bytes.get(index) {
-            Some(b',') => {
+        match bytes.get(index).copied() {
+            Some(b'{') => {
                 index += 1;
+                if stack.len() == MAX_DEPTH {
+                    return Err(msg("safetensors header nests deeper than 128 levels"));
+                }
+                stack.push(Frame::Object(HashSet::new()));
                 skip_ws(bytes, &mut index);
                 if bytes.get(index) == Some(&b'}') {
-                    return Err(msg("safetensors header has a trailing comma"));
+                    index += 1;
+                    stack.pop();
+                } else {
+                    read_key(bytes, &mut index, &mut stack)?;
+                    continue;
                 }
             }
-            Some(b'}') => return Ok(()),
+            Some(b'[') => {
+                index += 1;
+                if stack.len() == MAX_DEPTH {
+                    return Err(msg("safetensors header nests deeper than 128 levels"));
+                }
+                stack.push(Frame::Array);
+                skip_ws(bytes, &mut index);
+                if bytes.get(index) == Some(&b']') {
+                    index += 1;
+                    stack.pop();
+                } else {
+                    continue;
+                }
+            }
+            Some(b'"') => {
+                parse_json_string(bytes, &mut index)?;
+            }
+            Some(b't') => eat(bytes, &mut index, b"true")?,
+            Some(b'f') => eat(bytes, &mut index, b"false")?,
+            Some(b'n') => eat(bytes, &mut index, b"null")?,
+            Some(b'-' | b'0'..=b'9') => skip_number(bytes, &mut index),
             _ => return Err(msg("safetensors header is not valid json")),
         }
+        // After a value: close containers or move to the next item.
+        loop {
+            skip_ws(bytes, &mut index);
+            let Some(top) = stack.last() else {
+                return Ok(());
+            };
+            let close = match top {
+                Frame::Object(_) => b'}',
+                Frame::Array => b']',
+            };
+            match bytes.get(index).copied() {
+                Some(b',') => {
+                    index += 1;
+                    if matches!(top, Frame::Object(_)) {
+                        read_key(bytes, &mut index, &mut stack)?;
+                    }
+                    break;
+                }
+                Some(ch) if ch == close => {
+                    index += 1;
+                    stack.pop();
+                }
+                _ => return Err(msg("safetensors header is not valid json")),
+            }
+        }
+    }
+
+    fn read_key(bytes: &[u8], index: &mut usize, stack: &mut [Frame]) -> Result<()> {
+        skip_ws(bytes, index);
+        let key = parse_json_string(bytes, index)?;
+        if let Some(Frame::Object(seen)) = stack.last_mut() {
+            if !seen.insert(key.clone()) {
+                return Err(msg(format!("duplicate safetensors key {key} (ST-007)")));
+            }
+        }
+        skip_ws(bytes, index);
+        if bytes.get(*index) != Some(&b':') {
+            return Err(msg(format!("safetensors key {key} is missing ':'")));
+        }
+        *index += 1;
+        Ok(())
     }
 }
 
@@ -387,6 +463,16 @@ fn skip_ws(bytes: &[u8], index: &mut usize) {
     while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
         *index += 1;
     }
+}
+
+fn parse_hex4(bytes: &[u8], index: &mut usize) -> Result<u32> {
+    let hex = bytes
+        .get(*index..*index + 4)
+        .and_then(|hex| std::str::from_utf8(hex).ok())
+        .ok_or_else(|| msg("short unicode escape"))?;
+    let code = u32::from_str_radix(hex, 16).map_err(|_| msg("bad unicode escape"))?;
+    *index += 4;
+    Ok(code)
 }
 
 fn parse_json_string(bytes: &[u8], index: &mut usize) -> Result<String> {
@@ -413,14 +499,19 @@ fn parse_json_string(bytes: &[u8], index: &mut usize) -> Result<String> {
                     b'r' => out.push(b'\r'),
                     b't' => out.push(b'\t'),
                     b'u' => {
-                        if *index + 4 > bytes.len() {
-                            return Err(msg("short unicode escape"));
+                        let mut code = parse_hex4(bytes, index)?;
+                        // A high surrogate pairs with the next \uDC00..\uDFFF.
+                        if (0xD800..0xDC00).contains(&code) {
+                            if bytes.get(*index..*index + 2) != Some(b"\\u") {
+                                return Err(msg("unpaired surrogate in json string"));
+                            }
+                            *index += 2;
+                            let low = parse_hex4(bytes, index)?;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return Err(msg("unpaired surrogate in json string"));
+                            }
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
                         }
-                        let hex = std::str::from_utf8(&bytes[*index..*index + 4])
-                            .map_err(|_| msg("bad unicode escape"))?;
-                        let code =
-                            u32::from_str_radix(hex, 16).map_err(|_| msg("bad unicode escape"))?;
-                        *index += 4;
                         let ch = char::from_u32(code).ok_or_else(|| msg("bad unicode escape"))?;
                         let mut buf = [0u8; 4];
                         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -434,87 +525,27 @@ fn parse_json_string(bytes: &[u8], index: &mut usize) -> Result<String> {
     Err(msg("unterminated json string"))
 }
 
-fn skip_value(bytes: &[u8], index: &mut usize) -> Result<()> {
-    skip_ws(bytes, index);
-    match bytes.get(*index).copied() {
-        Some(b'"') => {
-            parse_json_string(bytes, index)?;
-            Ok(())
-        }
-        Some(b'{') => {
+fn skip_number(bytes: &[u8], index: &mut usize) {
+    if bytes.get(*index) == Some(&b'-') {
+        *index += 1;
+    }
+    while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
+        *index += 1;
+    }
+    if bytes.get(*index) == Some(&b'.') {
+        *index += 1;
+        while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
             *index += 1;
-            loop {
-                skip_ws(bytes, index);
-                if bytes.get(*index) == Some(&b'}') {
-                    *index += 1;
-                    return Ok(());
-                }
-                parse_json_string(bytes, index)?;
-                skip_ws(bytes, index);
-                if bytes.get(*index) != Some(&b':') {
-                    return Err(msg("json object is missing ':'"));
-                }
-                *index += 1;
-                skip_value(bytes, index)?;
-                skip_ws(bytes, index);
-                match bytes.get(*index) {
-                    Some(b',') => *index += 1,
-                    Some(b'}') => {
-                        *index += 1;
-                        return Ok(());
-                    }
-                    _ => return Err(msg("json object is not closed")),
-                }
-            }
         }
-        Some(b'[') => {
+    }
+    if matches!(bytes.get(*index), Some(b'e' | b'E')) {
+        *index += 1;
+        if matches!(bytes.get(*index), Some(b'+' | b'-')) {
             *index += 1;
-            loop {
-                skip_ws(bytes, index);
-                if bytes.get(*index) == Some(&b']') {
-                    *index += 1;
-                    return Ok(());
-                }
-                skip_value(bytes, index)?;
-                skip_ws(bytes, index);
-                match bytes.get(*index) {
-                    Some(b',') => *index += 1,
-                    Some(b']') => {
-                        *index += 1;
-                        return Ok(());
-                    }
-                    _ => return Err(msg("json array is not closed")),
-                }
-            }
         }
-        Some(b't') => eat(bytes, index, b"true"),
-        Some(b'f') => eat(bytes, index, b"false"),
-        Some(b'n') => eat(bytes, index, b"null"),
-        Some(b'-') | Some(b'0'..=b'9') => {
-            if bytes.get(*index) == Some(&b'-') {
-                *index += 1;
-            }
-            while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
-                *index += 1;
-            }
-            if bytes.get(*index) == Some(&b'.') {
-                *index += 1;
-                while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
-                    *index += 1;
-                }
-            }
-            if matches!(bytes.get(*index), Some(b'e' | b'E')) {
-                *index += 1;
-                if matches!(bytes.get(*index), Some(b'+' | b'-')) {
-                    *index += 1;
-                }
-                while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
-                    *index += 1;
-                }
-            }
-            Ok(())
+        while bytes.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
+            *index += 1;
         }
-        _ => Err(msg("safetensors header is not valid json")),
     }
 }
 

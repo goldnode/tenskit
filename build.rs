@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    install_man_pages(&manifest);
     let specs = manifest.join("tensdataspecs_readonly/specs");
     println!("cargo:rerun-if-changed={}", specs.display());
 
@@ -44,6 +45,58 @@ fn main() {
         render_enabled(&manifest.join("src/formats"), &enabled),
     )
     .unwrap();
+}
+
+/// Copy `man/*.1` to `share/man/man1` beside this profile's binaries.
+/// `MANPATH=target/debug/share/man man tenspile` then finds the page.
+fn install_man_pages(manifest: &Path) {
+    let source = manifest.join("man");
+    println!("cargo:rerun-if-changed={}", source.display());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // OUT_DIR is target/<profile>/build/<pkg>/out, or the same under a target triple.
+    let profile_dir = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("OUT_DIR is not inside target/<profile>/build"));
+    let dest = profile_dir.join("share").join("man").join("man1");
+    fs::create_dir_all(&dest)
+        .unwrap_or_else(|err| panic!("create {}: {err}", dest.display()));
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&source)
+        .unwrap_or_else(|err| panic!("read {}: {err}", source.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|err| panic!("read {}: {err}", source.display()))
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("1") {
+            continue;
+        }
+        println!("cargo:rerun-if-changed={}", path.display());
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| panic!("{} has no file name", path.display()));
+        let target = dest.join(name);
+        fs::copy(&path, &target).unwrap_or_else(|err| {
+            panic!("copy {} to {}: {err}", path.display(), target.display())
+        });
+        names.push(name.to_os_string());
+    }
+    if names.is_empty() {
+        panic!("{} has no section 1 pages", source.display());
+    }
+    let installed = fs::read_dir(&dest)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dest.display()));
+    for entry in installed {
+        let path = entry
+            .unwrap_or_else(|err| panic!("read {}: {err}", dest.display()))
+            .path();
+        let name = path.file_name().unwrap().to_os_string();
+        if !names.iter().any(|kept| kept == &name) {
+            fs::remove_file(&path).ok();
+        }
+    }
+    println!("cargo:rustc-env=TENSPILE_MAN_DIR={}", dest.display());
 }
 
 /// Ids turned on by `local/supported-formats.txt`. Each one must be a spec id
@@ -131,6 +184,12 @@ struct Canon {
     bits_den: u32,
     block_elements: u32,
     block_bytes: u32,
+    swap_bits: u32,
+    /// Sign, exponent and mantissa widths from `layout`, or empty.
+    layout: Vec<u32>,
+    bias: i32,
+    finite_only: bool,
+    nan: String,
 }
 
 #[derive(Clone)]
@@ -190,6 +249,21 @@ fn parse_dtype_registry(path: &Path) -> Vec<Canon> {
         let block_bytes = get("block_bytes")
             .map(|value| value.parse().unwrap())
             .unwrap_or(0);
+        let swap_bits = get("swap_bits")
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(if bits_den == 1 { bits_num } else { 0 });
+        let layout = get("layout")
+            .map(|value| {
+                value
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|part| part.trim().parse().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bias = get("bias").map(|value| value.parse().unwrap()).unwrap_or(0);
+        let finite_only = get("finite_only").as_deref() == Some("true");
+        let nan = get("nan").unwrap_or_default();
         rows.push(Canon {
             id,
             kind,
@@ -197,6 +271,11 @@ fn parse_dtype_registry(path: &Path) -> Vec<Canon> {
             bits_den,
             block_elements,
             block_bytes,
+            swap_bits,
+            layout,
+            bias,
+            finite_only,
+            nan,
         });
     }
     if rows.is_empty() {
@@ -598,17 +677,22 @@ fn render(
 ) -> String {
     let mut out = String::from("// Generated from tensdataspecs_readonly. Do not edit.\n\n");
     out.push_str(&format!("pub const GGML_TYPE_COUNT: u32 = {};\n\n", ggml.0));
-    out.push_str("pub struct CanonRow {\n    pub id: &'static str,\n    pub kind: &'static str,\n    pub bits_num: u32,\n    pub bits_den: u32,\n    pub block_elements: u32,\n    pub block_bytes: u32,\n}\n\n");
+    out.push_str("#[allow(dead_code)]\npub struct CanonRow {\n    pub id: &'static str,\n    pub kind: &'static str,\n    pub bits_num: u32,\n    pub bits_den: u32,\n    pub block_elements: u32,\n    pub block_bytes: u32,\n    pub swap_bits: u32,\n    pub layout: &'static [u32],\n    pub bias: i32,\n    pub finite_only: bool,\n    pub nan: &'static str,\n}\n\n");
     out.push_str("pub static CANON: &[CanonRow] = &[\n");
     for row in canon {
         out.push_str(&format!(
-            "    CanonRow {{ id: {}, kind: {}, bits_num: {}, bits_den: {}, block_elements: {}, block_bytes: {} }},\n",
+            "    CanonRow {{ id: {}, kind: {}, bits_num: {}, bits_den: {}, block_elements: {}, block_bytes: {}, swap_bits: {}, layout: &{:?}, bias: {}, finite_only: {}, nan: {} }},\n",
             rust_str(&row.id),
             rust_str(&row.kind),
             row.bits_num,
             row.bits_den,
             row.block_elements,
-            row.block_bytes
+            row.block_bytes,
+            row.swap_bits,
+            row.layout,
+            row.bias,
+            row.finite_only,
+            rust_str(&row.nan)
         ));
     }
     out.push_str("];\n\n");

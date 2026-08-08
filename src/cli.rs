@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crate::error::{msg, Result};
 
-pub const DEFAULT_MAX_HEADER: u64 = 100 * 1024 * 1024;
+/// safetensors MAX_HEADER_SIZE (ST-002). `--max-header-size` may raise it (ST-019).
+pub const DEFAULT_MAX_HEADER: u64 = 100_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -456,7 +457,7 @@ Options:
   --metadata KEY=VALUE      Set a text metadata entry.
   --metadata-file FILE      JSON object of metadata. GGUF values are typed.
   --max-header-size SIZE    Safetensors header cap (default 100M).
-  --force                   Overwrite an existing file on create or extract.
+  --force                   Overwrite an existing output file.
   --force-single-file PATH  Read this .safetensors file even when config.json
                             is in the same directory. It applies only to the
                             path written immediately after it.
@@ -483,7 +484,7 @@ Examples:
 }
 
 pub fn version_text() -> String {
-    format!("tenspile {}", env!("CARGO_PKG_VERSION"))
+    crate::version_line("tenspile")
 }
 
 #[cfg(test)]

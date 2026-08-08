@@ -13,6 +13,7 @@ mod gguf_names;
 mod io_util;
 mod listing;
 mod ops;
+mod pattern;
 mod payload;
 mod quant;
 mod sha256;
@@ -24,6 +25,14 @@ mod man_pages;
 mod spec_audit;
 
 pub use error::{Error, Result};
+
+/// First line is the command and version. Second line is the author.
+pub fn version_line(command: &str) -> String {
+    format!(
+        "{command} {}\nNick Reynolds (GitHub and X: goldnode)",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 pub fn run(args: &[String]) -> Result<i32> {
     match cli::parse(args)? {

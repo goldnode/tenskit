@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::cli::FormatName;
 use crate::detect::{self, Detected};
-use crate::dtype::{self, ggml_dense};
+use crate::dtype;
 use crate::error::{io_err, msg, Result};
 use crate::io_util::relative_child;
 use crate::payload::Payload;
@@ -280,32 +280,27 @@ fn open_gguf(path: &Path) -> Result<Archive> {
         .tensors
         .iter()
         .map(|tensor| {
-            let dense = ggml_dense(tensor.ggml_type);
-            let detail = if dtype::is_quant_ggml(tensor.ggml_type) {
-                Some("quantized span includes alignment padding".to_string())
-            } else if dense.is_some()
-                && crate::formats::gguf::logical_dense_bytes(tensor)
-                    .is_some_and(|logical| logical != tensor.span)
-            {
-                Some(format!(
-                    "stored span {} includes padding; dense payload is {} bytes",
-                    tensor.span,
-                    crate::formats::gguf::logical_dense_bytes(tensor).unwrap_or(0)
-                ))
-            } else {
-                None
+            let padding = tensor.span - tensor.nbytes;
+            let detail = (padding > 0).then(|| {
+                format!("{padding} bytes of alignment padding follow the tensor")
+            });
+            // Member shapes for GGUF are ne order. A GGUF-023 orig_shape is
+            // canonical order, so it is reversed into the same convention.
+            let shape = match &tensor.orig_shape {
+                Some(orig) => orig.iter().rev().copied().collect(),
+                None => tensor.shape.clone(),
             };
             Member {
                 name: tensor.name.clone(),
                 dtype: crate::formats::gguf::type_label(tensor),
-                shape: tensor.shape.clone(),
+                shape,
                 file_offset: tensor.file_offset,
-                nbytes: tensor.span,
+                nbytes: tensor.nbytes,
                 numel: dtype::numel(&tensor.shape),
                 payload: Payload::Range {
                     path: path.to_path_buf(),
                     offset: tensor.file_offset,
-                    len: tensor.span,
+                    len: tensor.nbytes,
                 },
                 shard: None,
                 detail,
@@ -317,8 +312,9 @@ fn open_gguf(path: &Path) -> Result<Archive> {
     let metadata = file
         .metadata
         .iter()
-        .map(|field| (field.key.clone(), field.display.clone()))
+        .map(|field| (field.key.clone(), field.value.text()))
         .collect();
+    let gguf_warnings = file.warnings.clone();
     let data_bytes = file.data_len;
     let alignment = file.alignment;
     let version = file.version.to_string();
@@ -329,11 +325,14 @@ fn open_gguf(path: &Path) -> Result<Archive> {
         members,
         metadata,
         data_bytes,
-        notes: vec![
+        notes: [
             format!("alignment {alignment}"),
             format!("data starts at {}", file.data_start),
             "shapes are ggml ne[] (innermost first); a conversion reverses them".into(),
-        ],
+        ]
+        .into_iter()
+        .chain(gguf_warnings)
+        .collect(),
         inner: Inner::Gguf(file),
     })
 }
@@ -372,11 +371,11 @@ fn open_npy(path: &Path) -> Result<Archive> {
             file_offset: info.data_offset,
             nbytes: info.nbytes,
             numel: dtype::numel(&info.shape),
-            payload: Payload::Range {
+            payload: info.canonical_payload(Payload::Range {
                 path: path.to_path_buf(),
                 offset: info.data_offset,
                 len: info.nbytes,
-            },
+            })?,
             shard: None,
             detail: info.fortran_order.then(|| "fortran_order".into()),
             fortran: info.fortran_order,
@@ -386,7 +385,7 @@ fn open_npy(path: &Path) -> Result<Archive> {
 
 #[cfg(format_npz)]
 fn open_npz(path: &Path) -> Result<Archive> {
-    let entries = crate::formats::npz::read_entries(path)?;
+    let (entries, mut notes) = crate::formats::npz::read_entries(path)?;
     let mut data_bytes = 0u64;
     let mut members = Vec::with_capacity(entries.len());
     let mut any_compressed = false;
@@ -402,15 +401,17 @@ fn open_npz(path: &Path) -> Result<Archive> {
             name: entry.key.clone(),
             dtype: dtype_name,
             shape: entry.info.shape.clone(),
-            file_offset: entry.info.data_offset,
+            file_offset: entry
+                .data_start
+                .map_or(0, |start| start + entry.info.data_offset),
             nbytes: entry.info.nbytes,
             numel: dtype::numel(&entry.info.shape),
-            payload: Payload::Zip {
+            payload: entry.info.canonical_payload(Payload::Zip {
                 path: path.to_path_buf(),
                 entry: entry.zip_name.clone(),
                 skip: entry.info.data_offset,
                 len: entry.info.nbytes,
-            },
+            })?,
             shard: None,
             detail: if entry.compressed {
                 Some("zip deflate".into())
@@ -422,7 +423,6 @@ fn open_npz(path: &Path) -> Result<Archive> {
             fortran: entry.info.fortran_order,
         });
     }
-    let mut notes = Vec::new();
     if any_compressed {
         notes.push("some arrays are deflate-compressed inside the zip".into());
     }

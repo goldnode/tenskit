@@ -5,6 +5,7 @@
 //! and the old tar container are recognized and refused. Remove this file and
 //! the `pytorch` line in `local/supported-formats.txt` to drop the format.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -24,7 +25,9 @@ struct TensorRef {
     shape: Vec<u64>,
     strides: Vec<u64>,
     storage_key: String,
-    storage_numel: u64,
+    /// Storage size in bytes. A typed storage counts elements and an
+    /// UntypedStorage counts bytes (PT-003).
+    storage_bytes: u64,
     offset_elems: u64,
     itemsize: u64,
 }
@@ -34,8 +37,11 @@ enum Obj {
     None,
     Bool(bool),
     Int(i64),
+    Float(f64),
     Str(String),
     Tuple(Vec<Obj>),
+    List(Vec<Obj>),
+    Set,
     Dict(Vec<(Obj, Obj)>),
     Global { module: String, name: String },
     Storage { type_name: String, key: String, numel: u64 },
@@ -55,14 +61,18 @@ pub fn is_torch_zip(path: &Path) -> Result<bool> {
         let entry = archive
             .by_index(index)
             .map_err(|err| msg(format!("{}: {err}", path.display())))?;
-        let name = entry.name();
-        if name.ends_with("/data.pkl") || name == "data.pkl" {
+        if is_data_pkl(entry.name()) {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
+/// `<prefix>/data.pkl` with a non-empty top-level prefix (PT-001).
+fn is_data_pkl(name: &str) -> bool {
+    name.strip_suffix("/data.pkl")
+        .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('/'))
+}
 
 fn record_text(zip: &mut ZipArchive<File>, name: &str) -> Option<String> {
     let mut entry = zip.by_name(name).ok()?;
@@ -92,15 +102,6 @@ fn is_c_order(shape: &[u64], strides: &[u64]) -> bool {
         expect = expect.saturating_mul(shape[index].max(1));
     }
     true
-}
-
-fn swap_elements(bytes: &mut [u8], width: usize) {
-    if width <= 1 {
-        return;
-    }
-    for chunk in bytes.chunks_exact_mut(width) {
-        chunk.reverse();
-    }
 }
 
 struct NamedTensor {
@@ -137,6 +138,7 @@ fn flatten(
             Obj::Dict(_) => flatten(value, &name, out, meta, notes),
             Obj::Str(text) => meta.push((name, text.clone())),
             Obj::Int(number) => meta.push((name, number.to_string())),
+            Obj::Float(number) => meta.push((name, number.to_string())),
             Obj::Bool(flag) => meta.push((name, flag.to_string())),
             Obj::None => {}
             _ => notes.push(format!("{name} is not a tensor and was skipped")),
@@ -150,9 +152,31 @@ fn unpickle(bytes: &[u8]) -> Result<Obj> {
         index: 0,
         stack: Vec::new(),
         marks: Vec::new(),
-        memo: Vec::new(),
+        memo: HashMap::new(),
+        budget: bytes.len().saturating_mul(64).saturating_add(1 << 20),
     };
     machine.load()
+}
+
+impl Obj {
+    /// Node count, stopping once it passes `limit`.
+    fn weight(&self, limit: usize) -> usize {
+        let mut total = 1;
+        let mut visit = |items: &mut dyn Iterator<Item = &Obj>| {
+            for item in items {
+                if total > limit {
+                    break;
+                }
+                total += item.weight(limit - total.min(limit));
+            }
+        };
+        match self {
+            Obj::Tuple(items) | Obj::List(items) => visit(&mut items.iter()),
+            Obj::Dict(pairs) => visit(&mut pairs.iter().flat_map(|(k, v)| [k, v])),
+            _ => {}
+        }
+        total
+    }
 }
 
 struct Machine<'a> {
@@ -160,7 +184,10 @@ struct Machine<'a> {
     index: usize,
     stack: Vec<Obj>,
     marks: Vec<usize>,
-    memo: Vec<Obj>,
+    memo: HashMap<u32, Obj>,
+    /// Nodes that BINGET may still copy. A memo copy is a deep clone, so a
+    /// small pickle that fetches one object many times is refused here.
+    budget: usize,
 }
 
 impl Machine<'_> {
@@ -179,35 +206,43 @@ impl Machine<'_> {
                 0x4e => self.stack.push(Obj::None),
                 0x89 => self.stack.push(Obj::Bool(false)),
                 0x88 => self.stack.push(Obj::Bool(true)),
+                0x5d => self.stack.push(Obj::List(Vec::new())),
+                0x8f => self.stack.push(Obj::Set),
                 0x71 => {
-                    let index = self.byte()? as usize;
+                    let index = u32::from(self.byte()?);
                     self.memo_set(index)?;
                 }
                 0x72 => {
-                    let index = self.u32()? as usize;
+                    let index = self.u32()?;
                     self.memo_set(index)?;
                 }
                 0x68 => {
-                    let index = self.byte()? as usize;
+                    let index = u32::from(self.byte()?);
                     self.memo_get(index)?;
                 }
                 0x6a => {
-                    let index = self.u32()? as usize;
+                    let index = self.u32()?;
                     self.memo_get(index)?;
-                }
-                0x94 => {
-                    let index = self.memo.len();
-                    self.memo_set(index)?;
                 }
                 0x58 => {
                     let len = self.u32()? as usize;
                     let text = self.utf8(len)?;
                     self.stack.push(Obj::Str(text));
                 }
-                0x8c => {
+                0x55 => {
                     let len = self.byte()? as usize;
                     let text = self.utf8(len)?;
                     self.stack.push(Obj::Str(text));
+                }
+                0x8a => {
+                    let len = self.byte()? as usize;
+                    let value = self.long(len)?;
+                    self.stack.push(Obj::Int(value));
+                }
+                0x47 => {
+                    let bytes = self.raw(8)?;
+                    let value = f64::from_be_bytes(bytes.try_into().unwrap());
+                    self.stack.push(Obj::Float(value));
                 }
                 0x63 => {
                     let module = self.line()?;
@@ -238,23 +273,36 @@ impl Machine<'_> {
                     let pid = self.pop()?;
                     self.stack.push(persistent(&pid)?);
                 }
-                0x52 => {
+                0x52 | 0x81 => {
                     let args = self.pop()?;
                     let callable = self.pop()?;
                     self.stack.push(reduce(callable, args)?);
+                }
+                0x62 => {
+                    let _state = self.pop()?;
+                    match self.stack.last() {
+                        // OrderedDict carries _metadata here; tensors carry
+                        // flags. Neither changes the tensor bytes.
+                        Some(Obj::Dict(_) | Obj::Tensor(_)) => {}
+                        _ => return Err(msg("pytorch pickle BUILD target is not a dict or tensor")),
+                    }
+                }
+                0x73 => {
+                    let value = self.pop()?;
+                    let key = self.pop()?;
+                    self.set_items(vec![key, value])?;
                 }
                 0x75 => {
                     let items = self.pop_mark()?;
                     self.set_items(items)?;
                 }
-                0x95 => {
-                    self.index = self
-                        .index
-                        .checked_add(8)
-                        .ok_or_else(|| msg("pytorch pickle frame is truncated"))?;
-                    if self.index > self.data.len() {
-                        return Err(msg("pytorch pickle frame is truncated"));
-                    }
+                0x61 => {
+                    let item = self.pop()?;
+                    self.append(vec![item])?;
+                }
+                0x65 => {
+                    let items = self.pop_mark()?;
+                    self.append(items)?;
                 }
                 other => {
                     return Err(msg(format!(
@@ -307,27 +355,50 @@ impl Machine<'_> {
         }
     }
 
-    fn memo_set(&mut self, index: usize) -> Result<()> {
+    fn memo_set(&mut self, index: u32) -> Result<()> {
         let top = self
             .stack
             .last()
             .cloned()
             .ok_or_else(|| msg("pytorch pickle memo has no value"))?;
-        if self.memo.len() <= index {
-            self.memo.resize(index + 1, Obj::None);
-        }
-        self.memo[index] = top;
+        self.memo.insert(index, top);
         Ok(())
     }
 
-    fn memo_get(&mut self, index: usize) -> Result<()> {
+    fn memo_get(&mut self, index: u32) -> Result<()> {
         let value = self
             .memo
-            .get(index)
-            .cloned()
+            .get(&index)
             .ok_or_else(|| msg("pytorch pickle memo index is missing"))?;
-        self.stack.push(value);
+        let weight = value.weight(self.budget);
+        if weight > self.budget {
+            return Err(msg("pytorch pickle repeats memo objects past the reader's limit"));
+        }
+        self.budget -= weight;
+        self.stack.push(value.clone());
         Ok(())
+    }
+
+    fn append(&mut self, items: Vec<Obj>) -> Result<()> {
+        let Some(Obj::List(list)) = self.stack.last_mut() else {
+            return Err(msg("pytorch pickle APPEND target is not a list"));
+        };
+        list.extend(items);
+        Ok(())
+    }
+
+    /// LONG1: little-endian two's complement in `len` bytes.
+    fn long(&mut self, len: usize) -> Result<i64> {
+        if len > 8 {
+            return Err(msg("pytorch pickle integer does not fit in 64 bits"));
+        }
+        let bytes = self.raw(len)?;
+        let Some(last) = bytes.last() else {
+            return Ok(0);
+        };
+        let mut buf = if last & 0x80 != 0 { [0xffu8; 8] } else { [0u8; 8] };
+        buf[..len].copy_from_slice(bytes);
+        Ok(i64::from_le_bytes(buf))
     }
 
     fn push_tuple(&mut self, count: usize) -> Result<()> {
@@ -499,6 +570,13 @@ fn rebuild(args: &[Obj]) -> Result<Obj> {
         return Err(msg("pytorch tensor storage is not a persistent id"));
     };
     let (mut dtype, mut itemsize) = storage_layout(type_name)?;
+    let storage_bytes = if type_name == "UntypedStorage" {
+        *numel
+    } else {
+        numel
+            .checked_mul(itemsize)
+            .ok_or_else(|| msg("pytorch storage is too large"))?
+    };
     if let Some(Obj::Global { name, .. }) = args.iter().find(|arg| {
         matches!(arg, Obj::Global { module, name } if module == "torch" && !name.ends_with("Storage"))
     }) {
@@ -512,7 +590,7 @@ fn rebuild(args: &[Obj]) -> Result<Obj> {
         shape: as_shape(&args[2])?,
         strides: as_shape(&args[3])?,
         storage_key: key.clone(),
-        storage_numel: *numel,
+        storage_bytes,
         offset_elems: as_u64(&args[1])?,
         itemsize,
     }))
@@ -590,7 +668,7 @@ pub struct OutTensor {
 
 pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
     if tensors.is_empty() {
-        return Err(msg("a pytorch checkpoint needs at least one tensor"));
+        return Err(msg("writing a pytorch checkpoint with no tensors is not supported"));
     }
     let stem = path
         .file_stem()
@@ -638,9 +716,13 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
     pickle.push(0x2e);
 
     crate::io_util::with_temp_file(path, |tmp| {
-        let file = File::create(tmp).map_err(|err| io_err(tmp, err))?;
+        let file = crate::io_util::create_new(tmp)?;
         let mut writer = ZipWriter::new(file);
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(true);
+        // data/ records start on a 64-byte boundary, as .storage_alignment says.
+        let aligned = options.with_alignment(64);
         let put = |writer: &mut ZipWriter<File>, name: &str, bytes: &[u8]| -> Result<()> {
             writer
                 .start_file(name, options)
@@ -654,7 +736,7 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
         put(&mut writer, &format!("{stem}/byteorder"), b"little")?;
         for (index, tensor) in tensors.iter().enumerate() {
             writer
-                .start_file(format!("{stem}/data/{index}"), options)
+                .start_file(format!("{stem}/data/{index}"), aligned)
                 .map_err(|err| msg(format!("pytorch: {err}")))?;
             tensor.payload.copy_to(&mut writer)?;
         }
@@ -718,9 +800,18 @@ fn put_int(out: &mut Vec<u8>, value: u64) {
     } else if value <= 0xffff {
         out.push(0x4d);
         out.extend_from_slice(&(value as u16).to_le_bytes());
-    } else {
+    } else if value <= i32::MAX as u64 {
         out.push(0x4a);
         out.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        // LONG1 with a trailing zero byte so the value stays positive.
+        let bytes = value.to_le_bytes();
+        let used = 8 - (value.leading_zeros() / 8) as usize;
+        let len = if bytes[used - 1] & 0x80 != 0 { used + 1 } else { used };
+        out.push(0x8a);
+        out.push(len as u8);
+        out.extend_from_slice(&bytes[..used]);
+        out.resize(out.len() + (len - used), 0);
     }
 }
 
@@ -752,43 +843,54 @@ fn put_shape(out: &mut Vec<u8>, shape: &[u64]) {
     }
 }
 
-// The open() above is unfinished: names are produced by flatten, then members
-// are built. The stub at the end of open is replaced by this complete builder,
-// which is the function archive::open calls.
 pub fn open(path: &Path) -> Result<Archive> {
     let file = File::open(path).map_err(|err| io_err(path, err))?;
     let mut zip = ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
+    // PT-001 / PT-001i: the first record names the archive folder, every
+    // record sits under it, and data.pkl is directly inside it.
+    let mut prefix: Option<String> = None;
     let mut pkl_name = None;
-    let mut names = Vec::new();
     for index in 0..zip.len() {
         let entry = zip
             .by_index(index)
             .map_err(|err| msg(format!("{}: {err}", path.display())))?;
         let name = entry.name().to_string();
-        if name.ends_with("/data.pkl") || name == "data.pkl" {
+        let top = match name.split_once('/') {
+            Some((top, _)) if !top.is_empty() => top.to_string(),
+            _ => {
+                return Err(msg(format!(
+                    "{} record {name} is not in a subdirectory (PT-001)",
+                    path.display()
+                )))
+            }
+        };
+        match &prefix {
+            None => prefix = Some(top),
+            Some(first) if *first != top => {
+                return Err(msg(format!(
+                    "{} mixes zip prefixes (PT-001)",
+                    path.display()
+                )))
+            }
+            _ => {}
+        }
+        if is_data_pkl(&name) {
             if pkl_name.is_some() {
                 return Err(msg(format!(
                     "{} has more than one data.pkl (PT-001)",
                     path.display()
                 )));
             }
-            pkl_name = Some(name.clone());
+            pkl_name = Some(name);
         }
-        names.push(name);
     }
     let pkl_name = pkl_name.ok_or_else(|| {
         msg(format!(
-            "{} is not a pytorch zip; it has no data.pkl",
+            "{} is not a pytorch zip; it has no <prefix>/data.pkl",
             path.display()
         ))
     })?;
     let prefix = pkl_name.trim_end_matches("data.pkl").to_string();
-    if names.iter().any(|name| !name.starts_with(&prefix)) {
-        return Err(msg(format!(
-            "{} mixes zip prefixes (PT-001)",
-            path.display()
-        )));
-    }
     let pickle = read_entry(&mut zip, &pkl_name, path)?;
     let obj = unpickle(&pickle)?;
     let mut found = Vec::new();
@@ -823,19 +925,22 @@ pub fn open(path: &Path) -> Result<Archive> {
             )));
         }
         let count = numel(&tensor.shape).ok_or_else(|| msg("shape is too large to count"))?;
-        let end = tensor
+        let nbytes = count
+            .checked_mul(tensor.itemsize)
+            .ok_or_else(|| msg("pytorch tensor is too large"))?;
+        let byte_off = tensor
             .offset_elems
-            .checked_add(count)
+            .checked_mul(tensor.itemsize)
             .ok_or_else(|| msg("pytorch storage offset overflows"))?;
-        if tensor.storage_numel < end {
+        let end = byte_off
+            .checked_add(nbytes)
+            .ok_or_else(|| msg("pytorch storage offset overflows"))?;
+        if count > 0 && tensor.storage_bytes < end {
             return Err(msg(format!(
                 "pytorch tensor {} storage is smaller than its view (PT-004)",
                 named.name
             )));
         }
-        let nbytes = count
-            .checked_mul(tensor.itemsize)
-            .ok_or_else(|| msg("pytorch tensor is too large"))?;
         let entry_name = format!("{prefix}data/{}", tensor.storage_key);
         let stored = zip.by_name(&entry_name).map_err(|_| {
             msg(format!(
@@ -844,11 +949,7 @@ pub fn open(path: &Path) -> Result<Archive> {
                 tensor.storage_key
             ))
         })?;
-        let need = tensor
-            .storage_numel
-            .checked_mul(tensor.itemsize)
-            .ok_or_else(|| msg("pytorch storage is too large"))?;
-        if stored.size() < need {
+        if stored.size() < tensor.storage_bytes {
             return Err(msg(format!(
                 "pytorch storage {} is shorter than its numel (PT-003)",
                 tensor.storage_key
@@ -858,18 +959,24 @@ pub fn open(path: &Path) -> Result<Archive> {
         if compressed {
             notes.push(format!("storage {} is compressed (PT-005)", tensor.storage_key));
         }
-        let byte_off = tensor.offset_elems * tensor.itemsize;
         let payload = if compressed || byteorder == "big" {
-            let mut raw = Vec::new();
+            // Read only up to the end of this view, not the whole storage.
             let mut stored = stored;
-            stored.read_to_end(&mut raw).map_err(|err| io_err(path, err))?;
-            let end_byte = (byte_off + nbytes) as usize;
-            let slice = raw.get(byte_off as usize..end_byte).ok_or_else(|| {
-                msg(format!("pytorch storage {} slice is out of range", tensor.storage_key))
-            })?;
-            let mut bytes = slice.to_vec();
-            if byteorder == "big" && tensor.itemsize > 1 {
-                swap_elements(&mut bytes, tensor.itemsize as usize);
+            std::io::copy(&mut (&mut stored).take(byte_off), &mut std::io::sink())
+                .map_err(|err| io_err(path, err))?;
+            let mut bytes = Vec::new();
+            (&mut stored)
+                .take(nbytes)
+                .read_to_end(&mut bytes)
+                .map_err(|err| io_err(path, err))?;
+            if bytes.len() as u64 != nbytes {
+                return Err(msg(format!(
+                    "pytorch storage {} slice is out of range",
+                    tensor.storage_key
+                )));
+            }
+            if byteorder == "big" {
+                dtype::byteswap(&mut bytes, &tensor.dtype)?;
             }
             Payload::Bytes(bytes)
         } else {

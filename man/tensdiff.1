@@ -2,11 +2,14 @@
 .SH NAME
 tensdiff \- compare two tensor containers
 .SH SYNOPSIS
-.nf
-.B tensdiff
-[\fB\-\-json\fR] [\fB\-\-match\-names\fR] [\fB\-\-fold\fR]
-[\fB\-\-force\-single\-file\fR] \fIleft\fR \fIright\fR
-.fi
+.SY tensdiff
+.RB [ \-\-json ]
+.RB [ \-\-match\-names ]
+.RB [ \-\-fold ]
+.RB [ \-\-force\-single\-file ]
+.I left
+.I right
+.YS
 .SH DESCRIPTION
 .B tensdiff
 compares two containers.
@@ -42,7 +45,7 @@ GGUF alignment padding is dropped, and a quantized tensor is the block bytes,
 not a dequantized float.
 .PP
 A directory is the safetensors weight set, the same rule as
-.BR tenspile (1).
+.BR \%tenspile (1).
 A
 .I .safetensors
 file beside
@@ -61,7 +64,7 @@ does not apply to
 .B \-\-match\-names
 Pair names that differ through the GGUF role table.
 A GGUF
-.I general.architecture
+.I \%general.architecture
 value selects that architecture.
 Otherwise every architecture is tried, and the smallest role set that
 explains every remaining name wins.
@@ -76,7 +79,7 @@ Qwen3.5
 and
 .I mtp.*
 names use the rewrites in
-.IR qwen35_tensor_names_to_gguf .
+.IR \%qwen35_tensor_names_to_gguf .
 If nothing covers the names, the report says
 .I names: no table matched
 and falls back to exact names.
@@ -115,16 +118,18 @@ The names, types, shapes, values, and metadata match.
 A difference was printed.
 .TP
 .B 2
-A file could not be read.
+A file could not be read, or the command line was not valid.
 The message is written to stderr and starts with
-.BR "tensdiff: " .
+.BR "\%tensdiff: " .
 .SH EXAMPLES
 .nf
 .B tensdiff left.safetensors right.gguf
 .B tensdiff \-\-match\-names model.safetensors model.gguf
 .B tensdiff \-\-fold left.gguf right.safetensors
 .fi
+.SH AUTHOR
+Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
-.BR tenspile (1),
-.BR tensconv (1),
-.BR tensquant (1)
+.BR \%tenspile (1),
+.BR \%tensconv (1),
+.BR \%tensquant (1)

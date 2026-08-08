@@ -1,4 +1,13 @@
 #[test]
+fn the_build_copies_pages_into_man1() {
+    let dir = std::path::Path::new(env!("TENSPILE_MAN_DIR"));
+    for name in ["tenspile.1", "tensdiff.1", "tensconv.1", "tensquant.1"] {
+        let page = dir.join(name);
+        assert!(page.is_file(), "missing {}", page.display());
+    }
+}
+
+#[test]
 fn man_pages_list_every_long_option_from_help() {
     check(crate::cli::help_text(), include_str!("../man/tenspile.1"));
     check(crate::diff::diff_help(), include_str!("../man/tensdiff.1"));

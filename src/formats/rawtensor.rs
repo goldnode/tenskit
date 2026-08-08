@@ -190,11 +190,18 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
                 "tensor {name} offset {offset} is not aligned to {alignment}"
             ));
         }
-        let fortran = tensor
+        // RAW-009: the bytes are C order and `native` is informational only.
+        let fortran = false;
+        if tensor
             .get("native")
             .and_then(|native| native.get("fortran_order"))
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            == Some(true)
+        {
+            notes.push(format!(
+                "tensor {name} has native.fortran_order; rawtensor bytes are read as C order (RAW-009)"
+            ));
+        }
         let mut payload = Payload::Range {
             path: data_path,
             offset,
@@ -311,21 +318,23 @@ pub fn write_archive(
             manifest.display()
         )));
     }
+    let data_path = data_path_for(manifest)?;
     let data_name = data_file_name(manifest)?;
-    let data_path = manifest
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(&data_name);
+    io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
+    if let Some(key) = metadata.keys().find(|key| key.starts_with("rawtensor.")) {
+        return Err(msg(format!("metadata key {key} is reserved")));
+    }
     let mut entries = Vec::with_capacity(tensors.len());
     let mut offset = 0u64;
-    let mut blob = Vec::new();
     for tensor in tensors {
-        let pad = (ALIGNMENT - (offset % ALIGNMENT)) % ALIGNMENT;
-        blob.extend(std::iter::repeat(0u8).take(pad as usize));
-        offset += pad;
-        let start = blob.len();
-        tensor.payload.copy_to(&mut blob)?;
-        let nbytes = (blob.len() - start) as u64;
+        if tensor.fortran {
+            return Err(msg(format!(
+                "tensor {} is fortran-order; rawtensor bytes are C order (RAW-009) and tenspile does not transpose",
+                tensor.name
+            )));
+        }
+        offset += (ALIGNMENT - (offset % ALIGNMENT)) % ALIGNMENT;
+        let nbytes = tensor.payload.len();
         let expected = canonical_nbytes(&tensor.canonical, &tensor.shape)?;
         if nbytes != expected {
             return Err(msg(format!(
@@ -333,18 +342,14 @@ pub fn write_archive(
                 tensor.name, tensor.canonical
             )));
         }
-        let mut entry = json!({
+        entries.push(json!({
             "name": tensor.name,
             "dtype": tensor.canonical,
             "shape": tensor.shape,
             "file": data_name,
             "offset": offset,
             "nbytes": nbytes,
-        });
-        if tensor.fortran {
-            entry["native"] = json!({"fortran_order": true});
-        }
-        entries.push(entry);
+        }));
         offset += nbytes;
     }
     let mut document = Map::new();
@@ -358,24 +363,33 @@ pub fn write_archive(
     }
     let mut body = serde_json::to_vec_pretty(&Value::Object(document))?;
     body.push(b'\n');
-    let tmp_data = io_util::temp_beside(&data_path);
-    let write_data = fs::write(&tmp_data, &blob).map_err(|err| io_err(&tmp_data, err));
-    if let Err(err) = write_data {
-        let _ = fs::remove_file(&tmp_data);
-        return Err(err);
-    }
-    fs::rename(&tmp_data, &data_path).map_err(|err| {
-        let _ = fs::remove_file(&tmp_data);
-        io_err(&data_path, err)
+    // The data file is streamed to a temp name and renamed before the
+    // manifest, so the manifest never names bytes that were not written.
+    atomic_write(&data_path, |file| {
+        use std::io::Write;
+        let mut written = 0u64;
+        for tensor in tensors {
+            let pad = (ALIGNMENT - (written % ALIGNMENT)) % ALIGNMENT;
+            file.write_all(&vec![0u8; pad as usize])?;
+            written += pad;
+            tensor.payload.copy_to(file)?;
+            written += tensor.payload.len();
+        }
+        Ok(())
     })?;
-    if let Err(err) = atomic_write(manifest, |file| {
+    atomic_write(manifest, |file| {
         use std::io::Write;
         file.write_all(&body)?;
         Ok(())
-    }) {
-        return Err(err);
-    }
-    Ok(())
+    })
+}
+
+/// The data file written beside `<stem>.rawtensor.json`.
+pub fn data_path_for(manifest: &Path) -> Result<PathBuf> {
+    Ok(manifest
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(data_file_name(manifest)?))
 }
 
 pub fn to_out(
@@ -395,29 +409,17 @@ pub fn to_out(
     })
 }
 
+/// Big-endian data to canonical little-endian bytes, per swap unit
+/// (SCHEMA.md section 7: complex types swap each part).
 fn byteswap_if_needed(path: &Path, name: &str, dtype: &str, payload: Payload) -> Result<Payload> {
     let kind = canon_kind(dtype).unwrap_or("");
     let bits = canon_bits(dtype).unwrap_or(0);
     if kind == "block" || bits <= 8 {
         return Ok(payload);
     }
-    if bits % 8 != 0 {
-        return Err(msg(format!(
-            "{}: tensor {name} cannot be byteswapped",
-            path.display()
-        )));
-    }
-    let width = (bits / 8) as usize;
     let mut bytes = payload.read_vec()?;
-    if bytes.len() % width != 0 {
-        return Err(msg(format!(
-            "{}: tensor {name} length is not a multiple of {width}",
-            path.display()
-        )));
-    }
-    for chunk in bytes.chunks_exact_mut(width) {
-        chunk.reverse();
-    }
+    crate::dtype::byteswap(&mut bytes, dtype)
+        .map_err(|err| msg(format!("{}: tensor {name}: {err}", path.display())))?;
     Ok(Payload::Bytes(bytes))
 }
 

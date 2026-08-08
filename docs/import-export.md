@@ -112,7 +112,9 @@ tensdiff --match-names model.safetensors model.gguf
 
 ## Converting a container
 
-`tensconv` reads one container and writes one container. A directory is the safetensors weight set, the same rule `tenspile` uses. Shapes are outermost-first. A GGUF `ne[]` axis is reversed on the way in and on the way out. One tensor is converted at a time. A GGUF name of 64 bytes or more, or a rank outside 1..=4, stops the write. A rank-0 tensor is stored as `ne = [1]`.
+`tensconv` reads one container and writes one container. A directory is the safetensors weight set, the same rule `tenspile` uses. Shapes are outermost-first. A GGUF `ne[]` axis is reversed on the way in and on the way out. A tensor whose bytes change, by a widened dtype or a value change, is held in memory until the output is written. A GGUF name of 64 bytes or more, or a rank outside 1..=4, stops the write. A rank-0 tensor is stored as `ne = [1]`, and `<name>.orig_shape` records its shape `[]` (GGUF-023). Reading that key back restores the shape.
+
+Metadata is carried over. GGUF keys keep their types when the target is GGUF or rawtensor, and become `gguf.<key>` JSON strings tagged with the type in safetensors and ONNX. Tokenizer arrays are left out of those string maps with a warning. String metadata from other formats is written to GGUF as `<format>.metadata.<key>`. npy, npz, and PyTorch output carry no metadata, and a warning names how many keys were dropped.
 
 A dtype is copied when the target has it. BF16 widens to F32, and the FP8 and FP4 types that fit in F16 widen to F16. E8M0 widens to F32. Anything else the target cannot store stops the command. Narrowing is not implemented. Quantized blocks are not written here; `tensquant` does that.
 
@@ -121,9 +123,9 @@ tensconv -o model.gguf model.safetensors
 tensconv --rename -o model.gguf model/
 ```
 
-`--rename` takes the architecture from `general.architecture`, or from `config.json` `architectures[0]`. Names come from `tables/gguf-tensor-roles.json`. Hyperparameters written into GGUF follow `hf_config_to_gguf`: `text_config` is merged over the root object first, then the first listed key is used. A sibling `config.json` is read only for those keys.
+`--rename` takes the architecture from `general.architecture`, or from `config.json` `architectures[0]` (`text_config.architectures[0]` when it is present). The converter class is the one registered for that HF class. Without `config.json`, an architecture with more than one converter class stops: there is no preference order. Names come from `tables/gguf-tensor-roles.json`. Hyperparameters written into GGUF follow `hf_config_to_gguf`: `text_config` is merged over the root object first, then the first listed key is used. A sibling `config.json` is read only for those keys.
 
-Value changes run with `--rename` unless `--names-only` is set. A converter record with `complete: true` applies the listed branch (`+ 1`, unsqueeze, squeeze, the clip `view`/`permute`, `-exp`, and the recorded renames). The expression text is not evaluated. Any other expression stops the conversion and prints that expression. LLaMA `q_proj` and `k_proj` rows are permuted when that converter has `undo_permute`. Qwen3.5 applies the V-head reorder, `A_log` as `-exp`, norms other than `linear_attn.norm.weight` as `weight + 1`, and the `conv1d` squeeze. Full-attention Q and K are not permuted, and the reorder is skipped when the linear head counts match. An architecture whose record is `complete: false`, and that is not the LLaMA or Qwen3.5 case, stops and names `unexpanded`. Warnings go to stderr.
+Value changes run with `--rename` unless `--names-only` is set. A converter record with `complete: true` applies the listed branch (`+ 1`, unsqueeze, squeeze, the clip `view`/`permute`, `-exp`, and the recorded renames). The expression text is not evaluated. Any other expression stops the conversion and prints that expression. LLaMA rows of tensors ending in `q_proj.weight`, `q_proj.bias`, `k_proj.weight`, or `k_proj.bias` are permuted when that converter has `undo_permute`. Qwen3.5 applies the V-head reorder, `A_log` as `-exp`, norms other than `linear_attn.norm.weight` as `weight + 1`, and the `conv1d` squeeze. Full-attention Q and K are not permuted, and the reorder is skipped when the linear head counts match. An architecture whose record is `complete: false`, and that is not the LLaMA or Qwen3.5 case, stops and names `unexpanded`. Warnings go to stderr.
 
 ## Dequantizing and the reference quantizers
 
@@ -134,10 +136,18 @@ tensquant --dequant -o model.safetensors model.gguf
 tensquant --quantize q8_0 -o model.gguf weights.safetensors
 ```
 
-GGML blocks use the `dequantize` snippets. Q8_1 is refused. GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored exllama layout. Zeros are incremented before the scale, and `g_idx` selects the row. AWQ uses the gemm nibble order. bitsandbytes uses the NF4 or FP4 codebook. compressed-tensors unpacks pack-quantized codes and keeps the scale tensors. MLX uses `quantization` in `config.json`.
+GGML blocks use the `dequantize` snippets. Q8_1 is refused. A pack is read only with `config.json` `quantization_config`, because bits, group size, and the zero convention are not in the tensors; tensor names that only look like a pack stop with a message that names the guess. bitsandbytes is the exception when each weight has its own `quant_state`.
+
+- GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored exllama layout. `bits` or `w_bit` gives the width. Zeros are incremented before the scale for `checkpoint_format` `gptq`, and used as stored for `gptq_v2`. `g_idx` selects the row.
+- AWQ uses the gemm nibble order. `version` is read without case and defaults to gemm.
+- bitsandbytes reads `<m>.weight`, `<m>.weight.absmax`, and `<m>.weight.quant_state.bitsandbytes__nf4` (or `__fp4`), and takes the shape from that quant_state. A nested absmax is decoded with `nested_quant_map`, `nested_absmax`, and `nested_offset`. A file without quant_state needs the config's quant type and blocksize.
+- compressed-tensors picks each module's scheme from `config_groups` (exact names, then `re:` patterns, then class names), unpacks the codes, and applies `(q - zero) * (scale / global_scale)` for the tensor, channel, group, and block strategies, rounding each step to the scale's dtype. The checkpoint does not record module classes, so a class target such as `Linear` is assumed to match and a warning says so.
+- MLX uses `quantization` in `config.json`, with per-module entries replacing the defaults, and a per-expert nvfp4 `global_scale`.
+
+Pack outputs are named `<module>.weight` and shaped `[out_features, in_features]`.
 
 GPTQ 3-bit, the marlin tile inverse, EXL2 (`EXL2-Q1`), and ModelOpt NVFP4 (`CT-Q1`) stop, because those formulas are not written out. `--quantize` accepts `q4_0` and `q8_0` only.
 
 ## Files that are refused
 
-A PyTorch zip checkpoint is read with a restricted unpickler. A pickle that is not that zip — a bare `.pt` or `.pth` without `data.pkl`, or bytes that start with a pickle opcode — stops with a message that names pickle, and no code from the file runs. A global outside the tensor allowlist is rejected. A `.bin` whose bytes are ordinary tensor data can be imported when `--dtype` and `--shape` are set. Legacy `ggml`, `ggmf`, and `ggjt` stop with `is legacy GGML/GGMF/GGJT; tenspile reads GGUF`. Removed ggml type codes are rejected. GGUF version 1 and big-endian GGUF are refused. A strided PyTorch tensor is refused rather than gathered.
+A PyTorch zip checkpoint is read with a restricted unpickler that handles the opcode set of PT-007 and no other. Detection follows the order in conversion-considerations section 14: a safetensors header is tested before any pickle test, a legacy `torch.save` pickle is recognized by its 14-byte prefix and a tar checkpoint by `ustar`, and both stop with a message that names pickle. A file name alone never makes a file a pickle. A ZIP whose `data.pkl` is not inside a folder is refused (PT-001). No code from the file runs. A global outside the tensor allowlist is rejected. A `.bin` whose bytes are ordinary tensor data can be imported when `--dtype` and `--shape` are set. Legacy `ggml`, `ggmf`, and `ggjt` stop with `is legacy GGML/GGMF/GGJT; tenspile reads GGUF`. Removed ggml type codes are rejected. GGUF version 1 and big-endian GGUF are refused. A strided PyTorch tensor is refused rather than gathered.

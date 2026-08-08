@@ -1,10 +1,10 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::dtype::{ggml_dense, ggml_type_name, numel, require_ggml};
+use crate::dtype::{ggml_type_name, numel, require_ggml};
 use crate::error::{io_err, msg, Result};
 use crate::io_util::{atomic_write, copy_range};
 use crate::payload::Payload;
@@ -15,10 +15,16 @@ pub const VERSION: u32 = 3;
 /// Oldest little-endian version this reader accepts. Version 2 uses the same field widths.
 const MIN_VERSION: u32 = 2;
 pub const DEFAULT_ALIGNMENT: u64 = 32;
+/// GGUF-022: a reader may accept up to 8 dims and 1024-byte names, with a
+/// warning. ggml itself stops at 4 dims and 63 bytes (GGUF-009, GGUF-010).
 const MAX_DIMS: u32 = 8;
-const MAX_STRING: u64 = 16 * 1024 * 1024;
-const MAX_ARRAY: u64 = 50_000_000;
-const DISPLAY_STRING: usize = 120;
+const MAX_NAME: u64 = 1024;
+const GGML_MAX_DIMS: usize = 4;
+const GGML_MAX_NAME: usize = 63;
+/// Smallest KV entry (key length, type, one byte) and tensor info (name
+/// length, n_dims, type, offset), for the GGUF-019 count bounds.
+const MIN_KV: u64 = 12;
+const MIN_TENSOR_INFO: u64 = 24;
 
 const TYPE_U8: u32 = 0;
 const TYPE_I8: u32 = 1;
@@ -31,6 +37,8 @@ const TYPE_BOOL: u32 = 7;
 const TYPE_STRING: u32 = 8;
 const TYPE_ARRAY: u32 = 9;
 const TYPE_U64: u32 = 10;
+/// Element type of a `.orig_shape` array (GGUF-023).
+pub const TYPE_ARRAY_U64: u32 = TYPE_U64;
 const TYPE_I64: u32 = 11;
 const TYPE_F64: u32 = 12;
 
@@ -38,11 +46,17 @@ const TYPE_F64: u32 = 12;
 pub struct GgufTensor {
     pub name: String,
     pub ggml_type: u32,
+    /// ggml `ne[]`, innermost first.
     pub shape: Vec<u64>,
+    /// Canonical shape from `<name>.orig_shape` (GGUF-023), when present
+    /// and its element count matches.
+    pub orig_shape: Option<Vec<u64>>,
     /// Offset within the tensor blob.
     pub offset: u64,
     /// Bytes from this offset to the next tensor, including alignment padding.
     pub span: u64,
+    /// Bytes the type and shape need, without padding.
+    pub nbytes: u64,
     /// File offset of the first stored byte.
     pub file_offset: u64,
 }
@@ -50,12 +64,10 @@ pub struct GgufTensor {
 #[derive(Debug, Clone)]
 pub struct MetaField {
     pub key: String,
-    #[allow(dead_code)]
-    pub value_type: u32,
+    pub value: MetaValue,
     /// File offset of the whole entry: key, type, and value.
     pub entry_offset: u64,
     pub entry_len: u64,
-    pub display: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +79,7 @@ pub struct GgufFile {
     pub data_len: u64,
     pub metadata: Vec<MetaField>,
     pub tensors: Vec<GgufTensor>,
+    pub warnings: Vec<String>,
 }
 
 struct In {
@@ -106,23 +119,24 @@ impl In {
         Ok(u64::from_le_bytes(buf))
     }
 
+    fn remaining(&self) -> u64 {
+        self.len.saturating_sub(self.pos)
+    }
+
+    /// GGUF-003: a length is bounded by the bytes left in the file.
     fn read_string(&mut self, limit: u64) -> Result<String> {
         let len = self.read_u64()?;
         if len > limit {
-            return Err(msg(format!("gguf string is {len} bytes")));
+            return Err(msg(format!("gguf string is {len} bytes, over the {limit} byte limit")));
+        }
+        if len > self.remaining() {
+            return Err(msg(format!(
+                "gguf string of {len} bytes runs past the end of the file (GGUF-003)"
+            )));
         }
         let mut buf = vec![0u8; len as usize];
         self.read_exact(&mut buf)?;
         String::from_utf8(buf).map_err(|_| msg("gguf string is not utf-8"))
-    }
-
-    fn skip(&mut self, n: u64) -> Result<()> {
-        if self.pos.checked_add(n).is_none_or(|end| end > self.len) {
-            return Err(msg("gguf read runs past the end of the file"));
-        }
-        self.file.seek(SeekFrom::Current(n as i64))?;
-        self.pos += n;
-        Ok(())
     }
 }
 
@@ -134,56 +148,129 @@ pub fn read_file(path: &Path) -> Result<GgufFile> {
         return Err(msg(format!("{} is not a GGUF file", path.display())));
     }
     let version = input.read_u32()?;
-    // Versions 2 and 3 share little-endian field widths. A big-endian version
-    // word is larger than 65536 when those bytes are read as little-endian.
     if !(MIN_VERSION..=VERSION).contains(&version) {
         return Err(unsupported_version(path, version));
     }
     let tensor_count = input.read_u64()?;
     let kv_count = input.read_u64()?;
-    if tensor_count > 10_000_000 || kv_count > 10_000_000 {
-        return Err(msg("gguf counts are unreasonably large"));
+    // GGUF-019: each count is bounded by the smallest record that fits.
+    if kv_count > input.remaining() / MIN_KV
+        || tensor_count > input.remaining() / MIN_TENSOR_INFO
+    {
+        return Err(msg(format!(
+            "{}: gguf counts ({tensor_count} tensors, {kv_count} keys) do not fit in the file (GGUF-003)",
+            path.display()
+        )));
     }
-    let mut metadata = Vec::with_capacity(kv_count as usize);
+    let mut warnings = Vec::new();
+    let mut metadata: Vec<MetaField> = Vec::with_capacity(kv_count as usize);
+    let mut keys = std::collections::HashSet::new();
     for _ in 0..kv_count {
         let entry_offset = input.pos;
         let key = input.read_string(65_535)?;
+        if !keys.insert(key.clone()) {
+            return Err(msg(format!("gguf metadata key {key} appears twice (GGUF-006)")));
+        }
         let value_type = input.read_u32()?;
-        let display = read_value_display(&mut input, value_type, 0)?;
+        let value = read_value(&mut input, value_type, true)?;
         let entry_len = input.pos - entry_offset;
         metadata.push(MetaField {
             key,
-            value_type,
+            value,
             entry_offset,
             entry_len,
-            display,
         });
     }
-    let alignment = alignment_of(&metadata);
+    let alignment = alignment_of(&metadata, &mut warnings)?;
     let mut tensors_raw = Vec::with_capacity(tensor_count as usize);
+    let mut names = std::collections::HashSet::new();
     for _ in 0..tensor_count {
-        let name = input.read_string(1024)?;
+        let name = input.read_string(MAX_NAME)?;
+        if !names.insert(name.clone()) {
+            return Err(msg(format!("gguf tensor {name} appears twice (GGUF-006)")));
+        }
+        if name.len() > GGML_MAX_NAME {
+            warnings.push(format!(
+                "tensor {name} has a name of {} bytes; ggml loads names of at most 63 (GGUF-022)",
+                name.len()
+            ));
+        }
         let n_dims = input.read_u32()?;
         if n_dims > MAX_DIMS {
             return Err(msg(format!("gguf tensor {name} has {n_dims} dimensions")));
+        }
+        if n_dims as usize > GGML_MAX_DIMS {
+            warnings.push(format!(
+                "tensor {name} has {n_dims} dimensions; ggml loads at most 4 (GGUF-022)"
+            ));
         }
         let mut shape = Vec::with_capacity(n_dims as usize);
         for _ in 0..n_dims {
             shape.push(input.read_u64()?);
         }
+        if numel(&shape).is_none_or(|count| count > i64::MAX as u64) {
+            return Err(msg(format!("gguf tensor {name} has too many elements (GGUF-010)")));
+        }
         let ggml_type = input.read_u32()?;
-        require_ggml(ggml_type).map_err(|err| {
+        let row = require_ggml(ggml_type).map_err(|err| {
             msg(format!("{}: tensor {name}: {err}", path.display()))
         })?;
+        let block = u64::from(row.block_elements.max(1));
+        if shape.first().is_some_and(|ne0| ne0 % block != 0) {
+            return Err(msg(format!(
+                "gguf tensor {name} ne[0] is not a multiple of the {} block of {block} (GGUF-012)",
+                ggml_type_name(ggml_type)
+            )));
+        }
         let offset = input.read_u64()?;
+        if offset % alignment != 0 {
+            return Err(msg(format!(
+                "gguf tensor {name} offset {offset} is not aligned to {alignment} (GGUF-013)"
+            )));
+        }
         tensors_raw.push((name, ggml_type, shape, offset));
     }
-    let data_start = align_up(input.pos, alignment);
+    // GGUF-021: ggml seeks to the aligned data section only when there are
+    // tensors, so a file without tensors may end right after its last KV.
+    let data_start = if tensor_count == 0 {
+        input.pos.min(input.len)
+    } else {
+        align_up(input.pos, alignment)
+    };
     if data_start > input.len {
         return Err(msg("gguf tensor data starts past the end of the file"));
     }
     let data_len = input.len - data_start;
-    let tensors = spans(tensors_raw, data_start, data_len)?;
+    let mut tensors = spans(tensors_raw, data_start, data_len)?;
+    // GGUF-023: `<name>.orig_shape` restores the canonical shape and is not
+    // reported as model metadata.
+    let mut hidden = std::collections::HashSet::new();
+    for tensor in &mut tensors {
+        let key = format!("{}.orig_shape", tensor.name);
+        let Some(field) = metadata.iter().find(|field| field.key == key) else {
+            continue;
+        };
+        let orig = match &field.value {
+            MetaValue::Array { elem: TYPE_U64, values } => values
+                .iter()
+                .map(|value| match value {
+                    MetaValue::U64(dim) => Some(*dim),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u64>>>(),
+            _ => None,
+        };
+        match orig {
+            Some(orig) if numel(&orig) == numel(&tensor.shape) => {
+                tensor.orig_shape = Some(orig);
+                hidden.insert(key);
+            }
+            _ => warnings.push(format!(
+                "{key} is not an ARRAY of UINT64 with the stored element count; the stored shape is kept (GGUF-023)"
+            )),
+        }
+    }
+    metadata.retain(|field| !hidden.contains(&field.key));
     Ok(GgufFile {
         path: path.to_path_buf(),
         version,
@@ -192,24 +279,34 @@ pub fn read_file(path: &Path) -> Result<GgufFile> {
         data_len,
         metadata,
         tensors,
+        warnings,
     })
 }
 
-fn alignment_of(metadata: &[MetaField]) -> u64 {
-    for field in metadata {
-        if field.key == "general.alignment" {
-            if let Some(value) = parse_alignment_display(&field.display) {
-                if value >= 8 && value.is_power_of_two() {
-                    return value;
-                }
-            }
-        }
+/// GGUF-008: `general.alignment`, when present, is a UINT32 non-zero power
+/// of two. GGUF-020: a multiple of 8 is expected; 1, 2, and 4 are read with
+/// a warning.
+fn alignment_of(metadata: &[MetaField], warnings: &mut Vec<String>) -> Result<u64> {
+    let Some(field) = metadata.iter().find(|field| field.key == "general.alignment") else {
+        return Ok(DEFAULT_ALIGNMENT);
+    };
+    let MetaValue::U32(value) = field.value else {
+        return Err(msg(format!(
+            "general.alignment is {}, not uint32 (GGUF-008)",
+            gguf_type_name(field.value.type_id())
+        )));
+    };
+    if value == 0 || !value.is_power_of_two() {
+        return Err(msg(format!(
+            "general.alignment {value} is not a non-zero power of two (GGUF-008)"
+        )));
     }
-    DEFAULT_ALIGNMENT
-}
-
-fn parse_alignment_display(text: &str) -> Option<u64> {
-    text.parse().ok()
+    if value % 8 != 0 {
+        warnings.push(format!(
+            "general.alignment {value} is not a multiple of 8 (GGUF-020)"
+        ));
+    }
+    Ok(u64::from(value))
 }
 
 fn spans(
@@ -238,18 +335,30 @@ fn spans(
         }
         span_of[index] = end - offset;
     }
-    Ok(raw
-        .drain(..)
+    raw.drain(..)
         .enumerate()
-        .map(|(index, (name, ggml_type, shape, offset))| GgufTensor {
-            name,
-            ggml_type,
-            shape,
-            offset,
-            span: span_of[index],
-            file_offset: data_start + offset,
+        .map(|(index, (name, ggml_type, shape, offset))| {
+            let nbytes = crate::dtype::ggml_payload_bytes(ggml_type, &shape)?;
+            // GGUF-015: the tensor's bytes lie before the next tensor and the
+            // end of the file.
+            if nbytes > span_of[index] {
+                return Err(msg(format!(
+                    "gguf tensor {name} needs {nbytes} bytes and has {} before the next tensor or the end of the file (GGUF-015)",
+                    span_of[index]
+                )));
+            }
+            Ok(GgufTensor {
+                name,
+                ggml_type,
+                shape,
+                orig_shape: None,
+                offset,
+                span: span_of[index],
+                nbytes,
+                file_offset: data_start + offset,
+            })
         })
-        .collect())
+        .collect()
 }
 
 pub fn align_up(offset: u64, alignment: u64) -> u64 {
@@ -257,108 +366,66 @@ pub fn align_up(offset: u64, alignment: u64) -> u64 {
     offset.saturating_add(alignment - 1) / alignment * alignment
 }
 
-fn read_value_display(input: &mut In, value_type: u32, depth: u32) -> Result<String> {
-    if depth > 8 {
-        return Err(msg("gguf array nesting is too deep"));
-    }
-    match value_type {
-        TYPE_U8 => Ok(input.read_u8()?.to_string()),
-        TYPE_I8 => Ok((input.read_u8()? as i8).to_string()),
+/// Read one value. `top` is false inside an array: ggml rejects nested
+/// arrays (GGUF-005), so an ARRAY element type is refused.
+fn read_value(input: &mut In, value_type: u32, top: bool) -> Result<MetaValue> {
+    Ok(match value_type {
+        TYPE_U8 => MetaValue::U8(input.read_u8()?),
+        TYPE_I8 => MetaValue::I8(input.read_u8()? as i8),
         TYPE_U16 => {
             let mut buf = [0u8; 2];
             input.read_exact(&mut buf)?;
-            Ok(u16::from_le_bytes(buf).to_string())
+            MetaValue::U16(u16::from_le_bytes(buf))
         }
         TYPE_I16 => {
             let mut buf = [0u8; 2];
             input.read_exact(&mut buf)?;
-            Ok(i16::from_le_bytes(buf).to_string())
+            MetaValue::I16(i16::from_le_bytes(buf))
         }
-        TYPE_U32 => Ok(input.read_u32()?.to_string()),
-        TYPE_I32 => Ok((input.read_u32()? as i32).to_string()),
-        TYPE_F32 => {
-            let mut buf = [0u8; 4];
-            input.read_exact(&mut buf)?;
-            Ok(f32::from_le_bytes(buf).to_string())
-        }
-        TYPE_BOOL => {
-            let value = input.read_u8()?;
-            match value {
-                0 => Ok("false".to_string()),
-                1 => Ok("true".to_string()),
-                _ => Err(msg(format!("gguf bool value {value} is invalid"))),
-            }
-        }
-        TYPE_STRING => {
-            let text = input.read_string(MAX_STRING)?;
-            if text.chars().count() > DISPLAY_STRING {
-                let prefix: String = text.chars().take(DISPLAY_STRING).collect();
-                Ok(format!("{prefix}… ({} bytes)", text.len()))
-            } else {
-                Ok(text)
-            }
-        }
-        TYPE_ARRAY => {
+        TYPE_U32 => MetaValue::U32(input.read_u32()?),
+        TYPE_I32 => MetaValue::I32(input.read_u32()? as i32),
+        TYPE_F32 => MetaValue::F32(f32::from_bits(input.read_u32()?)),
+        TYPE_BOOL => match input.read_u8()? {
+            0 => MetaValue::Bool(false),
+            1 => MetaValue::Bool(true),
+            value => return Err(msg(format!("gguf bool value {value} is invalid (GGUF-007)"))),
+        },
+        TYPE_STRING => MetaValue::String(input.read_string(u64::MAX)?),
+        TYPE_ARRAY if top => {
             let elem = input.read_u32()?;
+            if elem == TYPE_ARRAY {
+                return Err(msg("gguf metadata holds a nested array (GGUF-005)"));
+            }
+            let size = elem_min_size(elem)?;
             let count = input.read_u64()?;
-            if count > MAX_ARRAY {
-                return Err(msg(format!("gguf array has {count} elements")));
+            if count > input.remaining() / size {
+                return Err(msg(format!(
+                    "gguf array of {count} elements runs past the end of the file (GGUF-003)"
+                )));
             }
-            if count > 8 {
-                for _ in 0..count {
-                    skip_value(input, elem, depth + 1)?;
-                }
-                Ok(format!("array<{}>[{count}]", gguf_type_name(elem)))
-            } else {
-                let mut items = Vec::with_capacity(count as usize);
-                for _ in 0..count {
-                    items.push(read_value_display(input, elem, depth + 1)?);
-                }
-                Ok(format!("[{}]", items.join(", ")))
+            let mut values = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                values.push(read_value(input, elem, false)?);
             }
+            MetaValue::Array { elem, values }
         }
-        TYPE_U64 => Ok(input.read_u64()?.to_string()),
-        TYPE_I64 => Ok((input.read_u64()? as i64).to_string()),
-        TYPE_F64 => {
-            let mut buf = [0u8; 8];
-            input.read_exact(&mut buf)?;
-            Ok(f64::from_le_bytes(buf).to_string())
-        }
-        other => Err(msg(format!("unknown gguf value type {other}"))),
-    }
+        TYPE_ARRAY => return Err(msg("gguf metadata holds a nested array (GGUF-005)")),
+        TYPE_U64 => MetaValue::U64(input.read_u64()?),
+        TYPE_I64 => MetaValue::I64(input.read_u64()? as i64),
+        TYPE_F64 => MetaValue::F64(f64::from_bits(input.read_u64()?)),
+        other => return Err(msg(format!("unknown gguf value type {other} (GGUF-004)"))),
+    })
 }
 
-fn skip_value(input: &mut In, value_type: u32, depth: u32) -> Result<()> {
-    if depth > 8 {
-        return Err(msg("gguf array nesting is too deep"));
-    }
-    match value_type {
-        TYPE_U8 | TYPE_I8 | TYPE_BOOL => {
-            input.skip(1)?;
-        }
-        TYPE_U16 | TYPE_I16 => input.skip(2)?,
-        TYPE_U32 | TYPE_I32 | TYPE_F32 => input.skip(4)?,
-        TYPE_U64 | TYPE_I64 | TYPE_F64 => input.skip(8)?,
-        TYPE_STRING => {
-            let len = input.read_u64()?;
-            if len > MAX_STRING {
-                return Err(msg(format!("gguf string is {len} bytes")));
-            }
-            input.skip(len)?;
-        }
-        TYPE_ARRAY => {
-            let elem = input.read_u32()?;
-            let count = input.read_u64()?;
-            if count > MAX_ARRAY {
-                return Err(msg(format!("gguf array has {count} elements")));
-            }
-            for _ in 0..count {
-                skip_value(input, elem, depth + 1)?;
-            }
-        }
-        other => return Err(msg(format!("unknown gguf value type {other}"))),
-    }
-    Ok(())
+/// Smallest encoded size of one array element (GGUF-019).
+fn elem_min_size(elem: u32) -> Result<u64> {
+    Ok(match elem {
+        TYPE_U8 | TYPE_I8 | TYPE_BOOL => 1,
+        TYPE_U16 | TYPE_I16 => 2,
+        TYPE_U32 | TYPE_I32 | TYPE_F32 => 4,
+        TYPE_U64 | TYPE_I64 | TYPE_F64 | TYPE_STRING => 8,
+        other => return Err(msg(format!("unknown gguf array element type {other} (GGUF-004)"))),
+    })
 }
 
 pub fn gguf_type_name(id: u32) -> &'static str {
@@ -416,6 +483,71 @@ impl MetaValue {
         }
     }
 
+    /// The value as metadata text: a string as itself, any other value as
+    /// JSON (safetensors.yaml interop: "JSON-encode non-string values").
+    pub fn text(&self) -> String {
+        match self {
+            Self::String(v) => v.clone(),
+            other => other.json().to_string(),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        match self {
+            Self::U8(v) => Value::from(*v),
+            Self::I8(v) => Value::from(*v),
+            Self::U16(v) => Value::from(*v),
+            Self::I16(v) => Value::from(*v),
+            Self::U32(v) => Value::from(*v),
+            Self::I32(v) => Value::from(*v),
+            Self::F32(v) => Value::from(*v),
+            Self::Bool(v) => Value::from(*v),
+            Self::String(v) => Value::from(v.clone()),
+            Self::U64(v) => Value::from(*v),
+            Self::I64(v) => Value::from(*v),
+            Self::F64(v) => Value::from(*v),
+            Self::Array { values, .. } => Value::Array(values.iter().map(MetaValue::json).collect()),
+        }
+    }
+
+    /// raw-sidecar TypedValue: `{"type": T, "value": V}`, arrays with
+    /// `elem`, 64-bit integers above 2^53 as decimal strings, and non-finite
+    /// floats as "nan", "inf", "-inf".
+    pub fn typed_value(&self) -> Value {
+        fn plain(value: &MetaValue) -> Value {
+            const EXACT: u64 = 1 << 53;
+            let float = |v: f64| {
+                if v.is_nan() {
+                    Value::from("nan")
+                } else if v.is_infinite() {
+                    Value::from(if v > 0.0 { "inf" } else { "-inf" })
+                } else {
+                    Value::from(v)
+                }
+            };
+            match value {
+                MetaValue::U64(v) if *v > EXACT => Value::from(v.to_string()),
+                MetaValue::I64(v) if v.unsigned_abs() > EXACT => Value::from(v.to_string()),
+                MetaValue::F32(v) => float(f64::from(*v)),
+                MetaValue::F64(v) => float(*v),
+                MetaValue::Array { values, .. } => Value::Array(values.iter().map(plain).collect()),
+                other => other.json(),
+            }
+        }
+        match self {
+            Self::Array { elem, .. } => serde_json::json!({
+                "type": "array",
+                "elem": gguf_type_name(*elem),
+                "value": plain(self),
+            }),
+            other => serde_json::json!({
+                "type": gguf_type_name(other.type_id()),
+                "value": plain(other),
+            }),
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn display(&self) -> String {
         match self {
             Self::U8(v) => v.to_string(),
@@ -471,12 +603,12 @@ fn parse_meta_value(value: &Value) -> Result<MetaValue> {
         .get("value")
         .ok_or_else(|| msg("GGUF metadata entry is missing value"))?;
     match type_name {
-        "uint8" => Ok(MetaValue::U8(json_u64(raw)? as u8)),
-        "int8" => Ok(MetaValue::I8(json_i64(raw)? as i8)),
-        "uint16" => Ok(MetaValue::U16(json_u64(raw)? as u16)),
-        "int16" => Ok(MetaValue::I16(json_i64(raw)? as i16)),
-        "uint32" => Ok(MetaValue::U32(json_u64(raw)? as u32)),
-        "int32" => Ok(MetaValue::I32(json_i64(raw)? as i32)),
+        "uint8" => Ok(MetaValue::U8(narrow(json_u64(raw)?)?)),
+        "int8" => Ok(MetaValue::I8(narrow(json_i64(raw)?)?)),
+        "uint16" => Ok(MetaValue::U16(narrow(json_u64(raw)?)?)),
+        "int16" => Ok(MetaValue::I16(narrow(json_i64(raw)?)?)),
+        "uint32" => Ok(MetaValue::U32(narrow(json_u64(raw)?)?)),
+        "int32" => Ok(MetaValue::I32(narrow(json_i64(raw)?)?)),
         "float32" => Ok(MetaValue::F32(json_f64(raw)? as f32)),
         "bool" => Ok(MetaValue::Bool(
             raw.as_bool()
@@ -517,12 +649,12 @@ fn parse_plain_elem(elem: u32, value: &Value) -> Result<MetaValue> {
                 .ok_or_else(|| msg("array string is not a string"))?
                 .to_string(),
         )),
-        TYPE_U8 => Ok(MetaValue::U8(json_u64(value)? as u8)),
-        TYPE_I8 => Ok(MetaValue::I8(json_i64(value)? as i8)),
-        TYPE_U16 => Ok(MetaValue::U16(json_u64(value)? as u16)),
-        TYPE_I16 => Ok(MetaValue::I16(json_i64(value)? as i16)),
-        TYPE_U32 => Ok(MetaValue::U32(json_u64(value)? as u32)),
-        TYPE_I32 => Ok(MetaValue::I32(json_i64(value)? as i32)),
+        TYPE_U8 => Ok(MetaValue::U8(narrow(json_u64(value)?)?)),
+        TYPE_I8 => Ok(MetaValue::I8(narrow(json_i64(value)?)?)),
+        TYPE_U16 => Ok(MetaValue::U16(narrow(json_u64(value)?)?)),
+        TYPE_I16 => Ok(MetaValue::I16(narrow(json_i64(value)?)?)),
+        TYPE_U32 => Ok(MetaValue::U32(narrow(json_u64(value)?)?)),
+        TYPE_I32 => Ok(MetaValue::I32(narrow(json_i64(value)?)?)),
         TYPE_U64 => Ok(MetaValue::U64(json_u64(value)?)),
         TYPE_I64 => Ok(MetaValue::I64(json_i64(value)?)),
         TYPE_F32 => Ok(MetaValue::F32(json_f64(value)? as f32)),
@@ -554,6 +686,10 @@ fn type_id_from_name(name: &str) -> Result<u32> {
         "float64" => TYPE_F64,
         _ => return Err(msg(format!("unknown GGUF element type {name}"))),
     })
+}
+
+fn narrow<T: TryFrom<S>, S: std::fmt::Display + Copy>(value: S) -> Result<T> {
+    T::try_from(value).map_err(|_| msg(format!("metadata value {value} does not fit its type")))
 }
 
 fn json_u64(value: &Value) -> Result<u64> {
@@ -593,13 +729,15 @@ pub fn rewrite_metadata(
         )));
     }
     let mut alignment = src.alignment;
+    let mut update_keys = std::collections::HashSet::new();
     for (key, value) in updates {
+        if !update_keys.insert(key.as_str()) {
+            return Err(msg(format!("metadata key {key} is given twice")));
+        }
         if key == "general.alignment" {
             alignment = match value {
                 MetaValue::U32(v) => u64::from(*v),
-                MetaValue::U64(v) => *v,
-                MetaValue::I32(v) if *v > 0 => *v as u64,
-                _ => return Err(msg("general.alignment must be an unsigned integer")),
+                _ => return Err(msg("general.alignment must be uint32 (GGUF-008)")),
             };
             if alignment < 8 || !alignment.is_power_of_two() {
                 return Err(msg(
@@ -742,14 +880,27 @@ pub fn write_dense(
     metadata: &[(String, MetaValue)],
     tensors: &[DenseTensor],
 ) -> Result<()> {
-    if tensors.is_empty() {
-        return Err(msg("a GGUF file needs at least one tensor"));
+    crate::io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
+    let mut keys = std::collections::HashSet::new();
+    for (key, _) in metadata {
+        if !keys.insert(key.as_str()) {
+            return Err(msg(format!("gguf metadata key {key} is given twice (GGUF-006)")));
+        }
     }
-    let alignment = DEFAULT_ALIGNMENT;
-    let mut metadata = metadata.to_vec();
-    if !metadata.iter().any(|(key, _)| key == "general.alignment") {
-        metadata.push(("general.alignment".into(), MetaValue::U32(alignment as u32)));
-    }
+    // The data follows the alignment the metadata names; without the key it
+    // is 32, and the key is not written (gguf.yaml write algorithm).
+    let alignment = match metadata.iter().find(|(key, _)| key == "general.alignment") {
+        None => DEFAULT_ALIGNMENT,
+        Some((_, MetaValue::U32(value))) if *value >= 8 && value.is_power_of_two() => {
+            u64::from(*value)
+        }
+        Some(_) => {
+            return Err(msg(
+                "general.alignment must be a uint32 power of two of at least 8 (GGUF-008, GGUF-020)",
+            ))
+        }
+    };
+    let metadata = metadata.to_vec();
     let mut offsets = Vec::with_capacity(tensors.len());
     let mut cursor = 0u64;
     for tensor in tensors {
@@ -885,7 +1036,8 @@ pub fn write_fixture(path: &Path, name: &str, tensor_name: &str, f32_values: &[f
 }
 
 fn unsupported_version(path: &Path, version: u32) -> crate::error::Error {
-    if version > 65_536 {
+    // GGUF-002i: a version word whose low 16 bits are zero is byte-swapped.
+    if version & 0xFFFF == 0 {
         return msg(format!(
             "{} looks like big-endian GGUF, which tenspile does not read",
             path.display()
@@ -901,12 +1053,6 @@ fn unsupported_version(path: &Path, version: u32) -> crate::error::Error {
         "{}: GGUF version {version} is not supported; tenspile reads little-endian versions {MIN_VERSION} and {VERSION}",
         path.display()
     ))
-}
-
-pub fn logical_dense_bytes(tensor: &GgufTensor) -> Option<u64> {
-    let dtype = ggml_dense(tensor.ggml_type)?;
-    let elements = numel(&tensor.shape)?;
-    elements.checked_mul(u64::from(dtype.bits / 8))
 }
 
 pub fn type_label(tensor: &GgufTensor) -> String {
@@ -938,7 +1084,7 @@ mod tests {
             .iter()
             .find(|field| field.key == "general.name")
             .unwrap();
-        assert_eq!(name.display, "new");
+        assert_eq!(name.value.text(), "new");
         let bytes = crate::io_util::read_range(&updated, after.tensors[0].file_offset, 16).unwrap();
         assert_eq!(bytes, before);
         assert_eq!(after.tensors[0].name, "weight");
@@ -957,7 +1103,7 @@ mod tests {
         let original = read_file(&path).unwrap();
         assert_eq!(original.version, 2);
         assert_eq!(original.tensors[0].name, "weight");
-        assert_eq!(original.metadata[2].display, "old");
+        assert_eq!(original.metadata[2].value.text(), "old");
         let before = crate::io_util::read_range(&path, original.tensors[0].file_offset, 8).unwrap();
         let updated = dir.path().join("updated.gguf");
         rewrite_metadata(
@@ -973,7 +1119,7 @@ mod tests {
             .iter()
             .find(|field| field.key == "general.name")
             .unwrap();
-        assert_eq!(name.display, "kept");
+        assert_eq!(name.value.text(), "kept");
         let bytes = crate::io_util::read_range(&updated, after.tensors[0].file_offset, 8).unwrap();
         assert_eq!(bytes, before);
         let header = std::fs::read(&updated).unwrap();

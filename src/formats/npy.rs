@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::dtype::{numpy_descr_to_safe, packed_bytes, SafeDtype};
 use crate::error::{io_err, msg, Result};
+use crate::payload::Payload;
 
 const MAGIC: &[u8] = b"\x93NUMPY";
 const ALIGN: usize = 64;
@@ -19,6 +20,23 @@ pub struct NpyInfo {
     pub data_offset: u64,
     pub nbytes: u64,
     pub dtype: Option<SafeDtype>,
+    /// `>` descr of a multi-byte type: the bytes are byteswapped into the
+    /// canonical little-endian order when read (npy.yaml to_canonical).
+    pub big_endian: bool,
+}
+
+impl NpyInfo {
+    /// The stored bytes as canonical little-endian bytes.
+    pub fn canonical_payload(&self, stored: Payload) -> Result<Payload> {
+        match (self.big_endian, self.dtype) {
+            (true, Some(dtype)) => {
+                let mut bytes = stored.read_vec()?;
+                crate::dtype::byteswap(&mut bytes, dtype.canonical)?;
+                Ok(Payload::Bytes(bytes))
+            }
+            _ => Ok(stored),
+        }
+    }
 }
 
 pub fn read_info(path: &Path) -> Result<NpyInfo> {
@@ -70,7 +88,14 @@ pub fn read_info_from(path: &Path, file: &mut (impl Read + Seek)) -> Result<NpyI
     };
     let (descr, fortran_order, shape) = parse_header_dict(&header_text)?;
     let data_offset = file.stream_position()?;
-    let dtype = match numpy_descr_to_safe(&descr) {
+    // A big-endian descr names the same dtype as its little-endian twin.
+    let big_endian = descr.starts_with('>') && descr_itemsize(&descr).is_some_and(|size| size > 1);
+    let lookup = if big_endian {
+        format!("<{}", &descr[1..])
+    } else {
+        descr.clone()
+    };
+    let dtype = match numpy_descr_to_safe(&lookup) {
         Ok(dtype) => Some(dtype),
         Err(err) => {
             // Structured arrays and object arrays still list. Object arrays
@@ -86,8 +111,8 @@ pub fn read_info_from(path: &Path, file: &mut (impl Read + Seek)) -> Result<NpyI
     } else {
         // Unknown but non-object descr: size from the trailing digits, if present.
         descr_itemsize(&descr)
-            .unwrap_or(0)
-            .saturating_mul(crate::dtype::numel(&shape).unwrap_or(0))
+            .and_then(|size| size.checked_mul(crate::dtype::numel(&shape)?))
+            .ok_or_else(|| msg(format!("{}: npy descr {descr} has no known size", path.display())))?
     };
     Ok(NpyInfo {
         major,
@@ -98,6 +123,7 @@ pub fn read_info_from(path: &Path, file: &mut (impl Read + Seek)) -> Result<NpyI
         data_offset,
         nbytes,
         dtype,
+        big_endian: big_endian && dtype.is_some(),
     })
 }
 
@@ -106,16 +132,14 @@ fn descr_is_object(descr: &str) -> bool {
     rest.starts_with('O')
 }
 
+/// Bytes per element of a simple descr: `<f4` is 4, `<U10` is 40 (UCS-4),
+/// and `<M8[ns]` is 8.
 fn descr_itemsize(descr: &str) -> Option<u64> {
-    let digits: String = descr
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-    digits.parse().ok()
+    let rest = descr.strip_prefix(['<', '>', '|', '=']).unwrap_or(descr);
+    let rest = rest.split('[').next().unwrap_or(rest);
+    let kind_end = rest.find(|ch: char| ch.is_ascii_digit())?;
+    let size: u64 = rest[kind_end..].parse().ok()?;
+    Some(if &rest[..kind_end] == "U" { size.checked_mul(4)? } else { size })
 }
 
 pub fn write_header(descr: &str, shape: &[u64]) -> Result<Vec<u8>> {

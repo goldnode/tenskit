@@ -237,43 +237,59 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(out)
 }
 
+/// f32 to IEEE binary16 bits: round to nearest, ties to even, on the exact
+/// f32 value (CONV-001). Subnormal results are kept, overflow becomes inf,
+/// and a NaN stays a quiet NaN.
 pub fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
     let man = bits & 0x7f_ffff;
     if exp == 0xff {
-        return sign | 0x7c00 | if man == 0 { 0 } else { 0x200 };
+        return sign | 0x7c00 | if man == 0 { 0 } else { 0x200 | (man >> 13) as u16 };
     }
     let exp = exp - 127 + 15;
     if exp >= 31 {
         return sign | 0x7c00;
     }
     if exp <= 0 {
-        if exp < -10 {
+        // Subnormal result in units of 2^-24.
+        let full = man | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        if shift > 24 {
             return sign;
         }
-        let man = man | 0x80_0000;
-        let shift = (1 - exp) as u32;
-        let half = 1u32 << (shift - 1);
-        let rounded = (man + half) >> shift;
-        let rounded = if (man & ((half << 1) - 1)) == half && rounded & 1 == 1 {
-            rounded - 1
-        } else {
-            rounded
-        };
-        return sign | (rounded >> 13) as u16;
+        return sign | round_shift(full, shift) as u16;
     }
-    let mut man = man + 0x1000;
-    let mut exp = exp;
-    if man & 0x80_0000 != 0 {
-        man = 0;
-        exp += 1;
-        if exp >= 31 {
-            return sign | 0x7c00;
-        }
+    let packed = ((exp as u32) << 10) | (man >> 13);
+    // A carry out of the mantissa raises the exponent, up to inf.
+    sign | round_tail(packed, man & 0x1fff, 13) as u16
+}
+
+/// f32 to bfloat16 bits with the same rounding (CONV-001). A NaN is quieted
+/// so that dropping the low bits cannot turn it into inf.
+pub fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() {
+        return ((bits >> 16) as u16) | 0x40;
     }
-    sign | ((exp as u16) << 10) | ((man >> 13) as u16)
+    round_tail(bits >> 16, bits & 0xffff, 16) as u16
+}
+
+/// `value >> shift`, rounded to nearest with ties to even.
+fn round_shift(value: u32, shift: u32) -> u32 {
+    round_tail(value >> shift, value & ((1 << shift) - 1), shift)
+}
+
+/// Round `kept` up when the dropped `tail` (of `width` bits) is above half,
+/// or exactly half and `kept` is odd.
+fn round_tail(kept: u32, tail: u32, width: u32) -> u32 {
+    let half = 1u32 << (width - 1);
+    if tail > half || (tail == half && kept & 1 == 1) {
+        kept + 1
+    } else {
+        kept
+    }
 }
 
 fn e8m0_half(x: u8) -> f32 {
@@ -899,7 +915,8 @@ fn quant_q8_0_row(x: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(34);
     out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
     for value in x {
-        let code = round_half_away(value * idd);
+        // CONV-002: roundf of the f32 product, ties away from zero.
+        let code = (value * idd).round() as i32;
         out.push(code as u8);
     }
     out
@@ -908,14 +925,6 @@ fn quant_q8_0_row(x: &[f32]) -> Vec<u8> {
 fn nibble(value: f32) -> u8 {
     let truncated = value.trunc() as i32;
     truncated.clamp(0, 15) as u8
-}
-
-fn round_half_away(value: f32) -> i32 {
-    if value >= 0.0 {
-        (value + 0.5).floor() as i32
-    } else {
-        (value - 0.5).ceil() as i32
-    }
 }
 
 #[cfg(test)]

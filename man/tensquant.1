@@ -2,21 +2,32 @@
 .SH NAME
 tensquant \- dequantize a pack, or quantize with Q4_0 or Q8_0
 .SH SYNOPSIS
-.nf
-.B tensquant \-\-dequant \-o
-\fIout\fR [\fB\-\-format\fR \fIname\fR] [\fB\-\-force\fR]
-[\fB\-\-force\-single\-file\fR] \fIsource\fR
-.B tensquant \-\-quantize
-q4_0|q8_0 \fB\-o\fR \fIout.gguf\fR [\fB\-\-force\fR]
-[\fB\-\-force\-single\-file\fR] \fIsource\fR
-.fi
+.SY tensquant
+.B \-\-dequant
+.B \-o
+.I out
+.RB [ \-\-format
+.IR name ]
+.RB [ \-\-force ]
+.RB [ \-\-force\-single\-file ]
+.I source
+.YS
+.SY tensquant
+.B \-\-quantize
+.I q4_0|q8_0
+.B \-o
+.I out.gguf
+.RB [ \-\-force ]
+.RB [ \-\-force\-single\-file ]
+.I source
+.YS
 .SH DESCRIPTION
 .B tensquant
 reads a container and writes float32, or the reverse for the two
 reference quantizers.
 Dequant does not recover the original pre-quant floats.
 A directory is the safetensors weight set, the same rule as
-.BR tenspile (1).
+.BR \%tenspile (1).
 An existing output file is left in place unless
 .B \-\-force
 is set.
@@ -34,7 +45,7 @@ AWQ uses the gemm nibble order.
 bitsandbytes uses the NF4 or FP4 codebook.
 compressed-tensors unpacks pack-quantized codes and keeps the scale tensors.
 MLX uses
-.I quantization
+.I \%quantization
 in
 .IR config.json .
 .PP
@@ -65,13 +76,14 @@ Write float32 from a transcribed pack.
 .BI \-\-quantize " q4_0|q8_0"
 Quantize float weights with the named reference quantizer.
 The output is GGUF.
+Matrices are quantized; 1-D tensors stay F32, and integer tensors are copied.
 .TP
 .BR \-o ", " \-\-output " \fIfile\fR"
 Output path.
 Required.
 For
 .BR \-\-dequant ,
-the container is safetensors, npy, npz, or float32 GGUF,
+the container is safetensors, npy, or npz,
 from
 .B \-\-format
 or from the file name.
@@ -104,13 +116,15 @@ The output file was written.
 .B 1
 An error.
 The message is written to stderr and starts with
-.BR "tensquant: " .
+.BR "\%tensquant: " .
 .SH EXAMPLES
 .nf
 .B tensquant \-\-dequant \-o model.safetensors model.gguf
 .B tensquant \-\-quantize q8_0 \-o model.gguf weights.safetensors
 .fi
+.SH AUTHOR
+Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
-.BR tenspile (1),
-.BR tensdiff (1),
-.BR tensconv (1)
+.BR \%tenspile (1),
+.BR \%tensdiff (1),
+.BR \%tensconv (1)

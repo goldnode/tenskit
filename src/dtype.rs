@@ -212,14 +212,6 @@ pub fn ggml_type_name(id: u32) -> String {
 }
 
 /// Element GGML types that map onto a safetensors dtype.
-pub fn ggml_dense(id: u32) -> Option<SafeDtype> {
-    let row = ggml_row(id)?;
-    if !row.element || row.removed {
-        return None;
-    }
-    safe_dtype(row.name).ok()
-}
-
 pub fn is_quant_ggml(id: u32) -> bool {
     ggml_row(id).is_some_and(|row| !row.element && !row.removed)
 }
@@ -296,5 +288,102 @@ mod tests {
         assert!(require_ggml(4).is_err());
         assert_eq!(canonical_nbytes("float32", &[4, 64]).unwrap(), 1024);
         assert_eq!(canonical_nbytes("ggml_q8_0", &[4, 64]).unwrap(), 8 * 34);
+    }
+}
+
+/// Reverse the bytes of each swap unit of a canonical dtype, in place
+/// (SCHEMA.md section 7 `byteswap`). complex types swap each part on its
+/// own; 8-bit, packed, and block dtypes are left as they are.
+pub fn byteswap(data: &mut [u8], dtype: &str) -> Result<()> {
+    let id = canonical_id(dtype)?;
+    let row = CANON
+        .iter()
+        .find(|row| row.id == id)
+        .ok_or_else(|| msg(format!("unknown canonical dtype {id}")))?;
+    let unit = (row.swap_bits / 8) as usize;
+    if row.kind == "block" || row.bits_den != 1 || unit <= 1 {
+        return Ok(());
+    }
+    if data.len() % unit != 0 {
+        return Err(msg(format!(
+            "{} bytes are not whole {id} swap units",
+            data.len()
+        )));
+    }
+    for chunk in data.chunks_exact_mut(unit) {
+        chunk.reverse();
+    }
+    Ok(())
+}
+
+/// Decoder for a float dtype of 8 bits or fewer, built from its
+/// `dtypes.yaml` row: `layout`, `bias`, `finite_only`, and `nan`.
+#[derive(Debug, Clone, Copy)]
+pub struct MiniFloat {
+    sign_bits: u32,
+    exp_bits: u32,
+    man_bits: u32,
+    bias: i32,
+    finite_only: bool,
+    nan: &'static str,
+}
+
+impl MiniFloat {
+    pub fn for_dtype(dtype: &str) -> Result<MiniFloat> {
+        let id = canonical_id(dtype)?;
+        let row = CANON
+            .iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| msg(format!("unknown canonical dtype {id}")))?;
+        if row.kind != "float" || row.layout.len() != 3 || row.bits_num > 8 {
+            return Err(msg(format!("{id} is not a float of 8 bits or fewer")));
+        }
+        Ok(MiniFloat {
+            sign_bits: row.layout[0],
+            exp_bits: row.layout[1],
+            man_bits: row.layout[2],
+            bias: row.bias,
+            finite_only: row.finite_only,
+            nan: row.nan,
+        })
+    }
+
+    pub fn decode(&self, code: u8) -> f32 {
+        let width = self.sign_bits + self.exp_bits + self.man_bits;
+        let code = u32::from(code) & ((1u32 << width) - 1);
+        let man_mask = (1u32 << self.man_bits) - 1;
+        let exp_mask = (1u32 << self.exp_bits) - 1;
+        let man = code & man_mask;
+        let exp = (code >> self.man_bits) & exp_mask;
+        let negative = self.sign_bits == 1 && (code >> (width - 1)) & 1 == 1;
+        // `nan` is a byte ("0x80"), or S.<exp>.<man> with every bit set.
+        if let Some(hex) = self.nan.strip_prefix("0x") {
+            if u32::from_str_radix(hex, 16) == Ok(code) {
+                return f32::NAN;
+            }
+        } else if self.nan.starts_with("S.") && exp == exp_mask && man == man_mask {
+            return f32::NAN;
+        }
+        if !self.finite_only && exp == exp_mask {
+            if man == 0 {
+                return if negative { f32::NEG_INFINITY } else { f32::INFINITY };
+            }
+            return f32::NAN;
+        }
+        let magnitude = if self.man_bits == 0 {
+            // E8M0: 2^(e - bias), no zero and no subnormals.
+            2f64.powi(exp as i32 - self.bias)
+        } else if exp == 0 {
+            f64::from(man) * 2f64.powi(1 - self.bias - self.man_bits as i32)
+        } else {
+            (1.0 + f64::from(man) / f64::from(1u32 << self.man_bits))
+                * 2f64.powi(exp as i32 - self.bias)
+        };
+        let value = magnitude as f32;
+        if negative {
+            -value
+        } else {
+            value
+        }
     }
 }

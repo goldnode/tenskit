@@ -18,7 +18,7 @@ tenspile -u -f embed.npy --dtype F32 --shape 2 norm.bin
 
 `version:` on `-i` is the file's major.minor. `descr` is the NumPy header field.
 
-Fortran order can be listed. Import into safetensors stops with `is fortran-order; tenspile does not transpose it`. Extract to `.npy`, `.npz`, or safetensors stops the same way. `--format raw` stores the bytes in rawtensor and records `fortran_order` on the tensor; it does not transpose them. An object dtype (`|O`) is refused on open.
+Fortran order can be listed. Import into safetensors stops with `is fortran-order; tenspile does not transpose it`. Extract to `.npy`, `.npz`, or safetensors stops the same way. `--format raw` stops as well, because rawtensor bytes are C order (RAW-009). A big-endian descr such as `>f4` or `>c8` is read as its little-endian dtype and the bytes are swapped on the way in; a complex value swaps each part. An object dtype (`|O`) is refused on open.
 
 A big-endian or structured descr is listed as that descr text. Import into safetensors stops because the descr has no safetensors dtype. bfloat16 saved by NumPy is a void descr such as `<V2`. The spec treats that as ambiguous, so tenspile does not guess that it is `bfloat16`. The bytes can still be listed.
 
@@ -34,9 +34,9 @@ tenspile -u -f pack.npz embed=embed.npy
 tenspile --delete -f pack.npz norm
 ```
 
-`version: zip` is tenspile's label. Each entry is written as `{key}.npy` with zip method stored. A deflate entry still lists, and `-v` puts `zip deflate` in `detail`. A zip whose members are pickle is refused. The last array cannot be removed. `--metadata` stops with `npz files have no string metadata`.
+`version: zip` is tenspile's label. Each entry is written as `{key}.npy` with zip method stored. A deflate entry still lists, and `-v` puts `zip deflate` in `detail`. A member is an array when it starts with the npy magic; any other member is skipped with a note (NPZ-007). The key is the member name with one `.npy` removed, and a `/` in it is kept. Two members with the same key are refused (NPZ-006). An empty archive lists with no arrays (NPZ-005). A ZIP with neither `.npy` members nor a PyTorch `data.pkl` is not a tensor file. The last array cannot be removed. `--metadata` stops with `npz files have no string metadata`.
 
-`offset` on `-v` is inside each `.npy` entry. `data_bytes` is the sum of the arrays.
+`offset` on `-v` is the file offset of a stored entry's array data, and 0 for a deflated entry. `data_bytes` is the sum of the arrays.
 
 ```
 tenspile -xf pack.npz -C out

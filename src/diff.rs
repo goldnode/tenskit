@@ -771,7 +771,7 @@ pub fn diff_main(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         DiffCommand::Version => {
-            println!("tensdiff {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", crate::version_line("tensdiff"));
             Ok(0)
         }
         DiffCommand::Run {

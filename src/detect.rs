@@ -22,6 +22,47 @@ pub enum Detected {
     Onnx,
 }
 
+/// `_legacy_save` with pickle protocol 2: PROTO 2, then LONG1 of the
+/// magic number 0x1950a86a20f9469cfc6c (pytorch.yaml `magic`).
+const LEGACY_PICKLE: [u8; 14] = [
+    0x80, 0x02, 0x8a, 0x0a, 0x6c, 0xfc, 0x9c, 0x46, 0xf9, 0x20, 0x6a, 0xa8, 0x50, 0x19,
+];
+
+/// The older PyTorch tar container: `ustar` at offset 257.
+fn is_tar(path: &Path, file: &mut File, len: u64) -> Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    if len < 262 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(257))
+        .map_err(|err| io_err(path, err))?;
+    let mut magic = [0u8; 5];
+    file.read_exact(&mut magic).map_err(|err| io_err(path, err))?;
+    Ok(&magic == b"ustar")
+}
+
+/// A ZIP that is not a PyTorch checkpoint is npz when it is empty or holds
+/// a `.npy` member (section 14). Any other ZIP is not a tensor file.
+fn classify_zip(path: &Path) -> Result<Detected> {
+    let file = File::open(path).map_err(|err| io_err(path, err))?;
+    let archive = zip::ZipArchive::new(file)
+        .map_err(|err| msg(format!("{}: {err}", path.display())))?;
+    let mut names = archive.file_names();
+    if archive.is_empty() || names.any(|name| name.ends_with(".npy")) {
+        return Ok(Detected::Zip);
+    }
+    if archive.file_names().any(|name| name == "data.pkl") {
+        return Err(msg(format!(
+            "{} has data.pkl at the root, not in a folder; it is not a PyTorch checkpoint (PT-001)",
+            path.display()
+        )));
+    }
+    Err(msg(format!(
+        "{} is a ZIP with no data.pkl and no .npy members; it is not a tensor file",
+        path.display()
+    )))
+}
+
 pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
     let mut file = File::open(path).map_err(|err| io_err(path, err))?;
     let len = file.metadata().map_err(|err| io_err(path, err))?.len();
@@ -39,28 +80,32 @@ pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
         if crate::formats::pytorch::is_torch_zip(path)? {
             return Ok(Detected::Pytorch);
         }
-        return Ok(Detected::Zip);
+        return classify_zip(path);
     }
     if head.starts_with(b"ggml") || head.starts_with(b"ggmf") || head.starts_with(b"ggjt") {
         return Ok(Detected::LegacyGgml);
     }
-    if head.first() == Some(&0x80) && matches!(head.get(1), Some(2..=5)) {
-        return Ok(Detected::Pickle);
-    }
+    // conversion-considerations.md section 14: the full safetensors test
+    // runs before any pickle test. Header lengths such as 640 start with
+    // the bytes 80 02, which a one-byte pickle check would take.
     if let Some(kind) = safetensors_or_index(path, &mut file, len, max_header)? {
         return Ok(kind);
     }
-    let ext = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if matches!(ext.as_str(), "pt" | "pth" | "bin" | "pkl" | "ckpt") {
+    if head.starts_with(&LEGACY_PICKLE) || is_tar(path, &mut file, len)? {
         return Ok(Detected::Pickle);
     }
+    // ONNX has no signature. The extension picks it, and the protobuf parse
+    // and ONNX-007 decide the rest.
     #[cfg(format_onnx)]
-    if matches!(ext.as_str(), "onnx" | "pb") {
-        return Ok(Detected::Onnx);
+    {
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(ext.as_str(), "onnx" | "pb") {
+            return Ok(Detected::Onnx);
+        }
     }
     Err(msg(format!(
         "cannot tell what kind of tensor file {} is; pass --format",
@@ -81,7 +126,7 @@ fn safetensors_or_index(
         let mut len_buf = [0u8; 8];
         if file.read_exact(&mut len_buf).is_ok() {
             let header_len = u64::from_le_bytes(len_buf);
-            if header_len <= max_header && len >= 8 + header_len && header_len > 0 {
+            if (2..=max_header).contains(&header_len) && len - 8 >= header_len {
                 let mut first = [0u8; 1];
                 if file.read_exact(&mut first).is_ok() && first[0] == b'{' {
                     return Ok(Some(Detected::Safetensors));
@@ -123,19 +168,10 @@ fn safetensors_or_index(
     }
 }
 
-/// True when the file starts with a pickle protocol opcode. Extension-only
-/// guesses are separate: those bytes can still be imported as raw.
-pub fn has_pickle_magic(path: &Path) -> Result<bool> {
-    let mut file = File::open(path).map_err(|err| io_err(path, err))?;
-    let mut head = [0u8; 2];
-    let n = file.read(&mut head).map_err(|err| io_err(path, err))?;
-    Ok(n >= 2 && head[0] == 0x80 && matches!(head.get(1), Some(2..=5)))
-}
-
 pub fn refuse_unsafe(kind: Detected, path: &Path) -> Result<()> {
     match kind {
         Detected::Pickle => Err(msg(format!(
-            "{} is a PyTorch pickle file and was not opened",
+            "{} is a legacy PyTorch pickle or tar checkpoint and was not opened",
             path.display()
         ))),
         Detected::LegacyGgml => Err(msg(format!(
