@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::dtype::{ggml_dense, ggml_type_name, numel, require_ggml};
 use crate::error::{io_err, msg, Result};
 use crate::io_util::{atomic_write, copy_range};
+use crate::payload::Payload;
 
 pub const MAGIC: &[u8] = b"GGUF";
 /// Current writer version. Little-endian version 3 is what GGUF writers emit.
@@ -725,6 +726,129 @@ fn write_string(out: &mut impl Write, text: &str) -> Result<()> {
     out.write_all(&(text.len() as u64).to_le_bytes())?;
     out.write_all(text.as_bytes())?;
     Ok(())
+}
+
+/// One dense element tensor. `ne` is ggml order, innermost first.
+pub struct DenseTensor {
+    pub name: String,
+    pub ggml_type: u32,
+    pub ne: Vec<u64>,
+    pub payload: Payload,
+}
+
+/// Write a little-endian GGUF v3 file of dense element tensors.
+pub fn write_dense(
+    path: &Path,
+    metadata: &[(String, MetaValue)],
+    tensors: &[DenseTensor],
+) -> Result<()> {
+    if tensors.is_empty() {
+        return Err(msg("a GGUF file needs at least one tensor"));
+    }
+    let alignment = DEFAULT_ALIGNMENT;
+    let mut metadata = metadata.to_vec();
+    if !metadata.iter().any(|(key, _)| key == "general.alignment") {
+        metadata.push(("general.alignment".into(), MetaValue::U32(alignment as u32)));
+    }
+    let mut offsets = Vec::with_capacity(tensors.len());
+    let mut cursor = 0u64;
+    for tensor in tensors {
+        if tensor.name.is_empty() || tensor.name.len() >= 64 {
+            return Err(msg(format!(
+                "GGUF tensor name {} must be shorter than 64 bytes",
+                tensor.name
+            )));
+        }
+        if tensor.ne.is_empty() || tensor.ne.len() > 4 {
+            return Err(msg(format!(
+                "GGUF tensor {} has rank {}; the file stores 1 to 4 dimensions",
+                tensor.name,
+                tensor.ne.len()
+            )));
+        }
+        let expect = crate::dtype::ggml_payload_bytes(tensor.ggml_type, &tensor.ne)?;
+        if tensor.payload.len() != expect {
+            return Err(msg(format!(
+                "tensor {} is {} bytes and ggml type {} needs {expect}",
+                tensor.name,
+                tensor.payload.len(),
+                ggml_type_name(tensor.ggml_type)
+            )));
+        }
+        let offset = align_up(cursor, alignment);
+        offsets.push(offset);
+        cursor = offset + tensor.payload.len();
+    }
+    let mut header = 4 + 4 + 8 + 8;
+    for (key, value) in &metadata {
+        validate_key(key)?;
+        header += kv_len(key, value)?;
+    }
+    for tensor in tensors {
+        header += string_len(&tensor.name) + 4 + 8 * tensor.ne.len() as u64 + 4 + 8;
+    }
+    let data_start = align_up(header, alignment);
+    atomic_write(path, |out| {
+        out.write_all(MAGIC)?;
+        out.write_all(&VERSION.to_le_bytes())?;
+        out.write_all(&(tensors.len() as u64).to_le_bytes())?;
+        out.write_all(&(metadata.len() as u64).to_le_bytes())?;
+        for (key, value) in &metadata {
+            write_kv(out, key, value)?;
+        }
+        for (tensor, offset) in tensors.iter().zip(offsets.iter()) {
+            write_string(out, &tensor.name)?;
+            out.write_all(&(tensor.ne.len() as u32).to_le_bytes())?;
+            for dim in &tensor.ne {
+                out.write_all(&dim.to_le_bytes())?;
+            }
+            out.write_all(&tensor.ggml_type.to_le_bytes())?;
+            out.write_all(&offset.to_le_bytes())?;
+        }
+        let written = out.stream_position()?;
+        if written != header {
+            return Err(msg(format!(
+                "GGUF header is {written} bytes and was planned as {header}"
+            )));
+        }
+        if data_start > written {
+            out.write_all(&vec![0u8; (data_start - written) as usize])?;
+        }
+        let mut place = 0u64;
+        for (tensor, offset) in tensors.iter().zip(offsets.iter()) {
+            if *offset > place {
+                out.write_all(&vec![0u8; (*offset - place) as usize])?;
+            }
+            tensor.payload.copy_to(out)?;
+            place = offset + tensor.payload.len();
+        }
+        Ok(())
+    })
+}
+
+fn string_len(text: &str) -> u64 {
+    8 + text.len() as u64
+}
+
+fn kv_len(key: &str, value: &MetaValue) -> Result<u64> {
+    Ok(string_len(key) + 4 + value_len(value)?)
+}
+
+fn value_len(value: &MetaValue) -> Result<u64> {
+    Ok(match value {
+        MetaValue::U8(_) | MetaValue::I8(_) | MetaValue::Bool(_) => 1,
+        MetaValue::U16(_) | MetaValue::I16(_) => 2,
+        MetaValue::U32(_) | MetaValue::I32(_) | MetaValue::F32(_) => 4,
+        MetaValue::U64(_) | MetaValue::I64(_) | MetaValue::F64(_) => 8,
+        MetaValue::String(text) => string_len(text),
+        MetaValue::Array { values, .. } => {
+            let mut total = 4 + 8;
+            for item in values {
+                total += value_len(item)?;
+            }
+            total
+        }
+    })
 }
 
 /// Build a small version-3 file. Used by metadata rewrites' tests and as a fixture writer.

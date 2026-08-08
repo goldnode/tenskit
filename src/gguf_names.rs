@@ -21,6 +21,8 @@ struct Catalog {
 struct Resolved {
     id: String,
     pairs: Vec<(String, String)>,
+    /// Role id to the GGUF pattern, `{bid}` still in place.
+    roles: Vec<(String, String)>,
 }
 
 pub struct NameHit {
@@ -119,11 +121,13 @@ fn load_catalog() -> Catalog {
             }
         }
         let mut pairs: HashMap<String, String> = HashMap::new();
-        record(&mut pairs, &mappings, &roles);
-        record(&mut pairs, &block, &roles);
+        let mut role_gguf: HashMap<String, String> = HashMap::new();
+        record(&mut pairs, &mut role_gguf, &mappings, &roles);
+        record(&mut pairs, &mut role_gguf, &block, &roles);
         arches.push(Resolved {
             id: id.clone(),
             pairs: pairs.into_iter().collect(),
+            roles: role_gguf.into_iter().collect(),
         });
     }
     arches.sort_by(|left, right| left.id.cmp(&right.id));
@@ -183,15 +187,146 @@ fn row_slice(items: &[Value]) -> Vec<Row> {
         .collect()
 }
 
-fn record(pairs: &mut HashMap<String, String>, rows: &[Row], roles: &HashSet<&str>) {
+fn record(
+    pairs: &mut HashMap<String, String>,
+    role_gguf: &mut HashMap<String, String>,
+    rows: &[Row],
+    roles: &HashSet<&str>,
+) {
     for row in rows {
         if !roles.contains(row.tensor.as_str()) {
             continue;
         }
+        role_gguf.insert(row.tensor.clone(), row.gguf.clone());
         for hf in &row.hf {
             pairs.insert(hf.clone(), row.gguf.clone());
         }
     }
+}
+
+/// GGUF pattern for one role of `arch`. `{bid}` is left for the caller to fill.
+pub fn role_pattern(arch: &str, role: &str) -> Option<String> {
+    catalog()
+        .arches
+        .iter()
+        .find(|item| item.id == arch)
+        .and_then(|item| {
+            item.roles
+                .iter()
+                .find(|(tensor, _)| tensor == role)
+                .map(|(_, pattern)| pattern.clone())
+        })
+}
+
+/// Hugging Face tensor name to the GGUF name for one architecture.
+pub fn map_tensor_name(arch: &str, name: &str, lang_layers: Option<u64>) -> Option<String> {
+    let catalog = catalog();
+    let resolved = catalog.arches.iter().find(|item| item.id == arch)?;
+    let prepared = prepare_name(name, arch, lang_layers);
+    lookup(&resolved.pairs, &prepared)
+}
+
+#[derive(Clone, Debug)]
+pub struct TensorBranch {
+    pub when: String,
+    pub assigns: String,
+    pub expr: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConverterRecord {
+    pub class: String,
+    pub hf_architectures: Vec<String>,
+    pub undo_permute: bool,
+    pub complete: bool,
+    pub unexpanded: Vec<String>,
+    pub branches: Vec<TensorBranch>,
+}
+
+pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
+    let value: Value = serde_json::from_str(ROLES_JSON).unwrap_or(Value::Null);
+    let Some(list) = value
+        .get("architectures")
+        .and_then(|item| item.get(arch))
+        .and_then(|item| item.get("converters"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|item| {
+            let class = item.get("class")?.as_str()?.to_string();
+            let hf_architectures = item
+                .get("hf_architectures")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let modify = item.get("modify_tensors");
+            let complete = modify
+                .and_then(|item| item.get("complete"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let unexpanded = modify
+                .and_then(|item| item.get("unexpanded"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let branches = modify
+                .and_then(|item| item.get("branches"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            Some(TensorBranch {
+                                when: item.get("when")?.as_str()?.to_string(),
+                                assigns: item.get("assigns")?.as_str()?.to_string(),
+                                expr: item.get("expr")?.as_str()?.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ConverterRecord {
+                class,
+                hf_architectures,
+                undo_permute: item.get("undo_permute").and_then(Value::as_bool).unwrap_or(false),
+                complete,
+                unexpanded,
+                branches,
+            })
+        })
+        .collect()
+}
+
+/// `architectures[0]` to the GGUF architecture id that lists that class.
+pub fn architecture_for_hf_class(class: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(ROLES_JSON).ok()?;
+    let object = value.get("architectures")?.as_object()?;
+    for (arch, entry) in object {
+        let Some(list) = entry.get("converters").and_then(Value::as_array) else {
+            continue;
+        };
+        for converter in list {
+            let hit = converter
+                .get("hf_architectures")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(class)));
+            if hit {
+                return Some(arch.clone());
+            }
+        }
+    }
+    None
 }
 
 fn detect(catalog: &Catalog, names: &[String]) -> Vec<String> {

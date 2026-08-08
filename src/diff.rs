@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::archive::{self, Archive, Inner, Member};
-use crate::cli::{Cli, DEFAULT_MAX_HEADER};
+use crate::cli::DEFAULT_MAX_HEADER;
 use crate::dtype::{self, format_shape};
 use crate::error::{msg, Result};
 use crate::payload::Payload;
@@ -86,31 +86,6 @@ struct Side {
     shape: Vec<u64>,
     fortran: bool,
     payload: Payload,
-}
-
-pub fn from_cli(cli: &Cli) -> Result<i32> {
-    let left = cli
-        .file
-        .as_deref()
-        .ok_or_else(|| msg("diff needs two archive paths"))?;
-    let right = cli
-        .operands
-        .first()
-        .ok_or_else(|| msg("diff needs two archive paths"))?;
-    if cli.operands.len() != 1 {
-        return Err(msg("diff needs two archive paths"));
-    }
-    let right_force = cli.operand_force.first().copied().unwrap_or(false);
-    let left = archive::resolve_user_path(left, cli.file_force_single)?;
-    let right = archive::resolve_user_path(Path::new(right), right_force)?;
-    compare(
-        &left.path,
-        &right.path,
-        cli.json,
-        cli.max_header,
-        cli.match_names,
-        cli.fold,
-    )
 }
 
 pub fn compare(

@@ -1,0 +1,116 @@
+.TH TENSQUANT 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.SH NAME
+tensquant \- dequantize a pack, or quantize with Q4_0 or Q8_0
+.SH SYNOPSIS
+.nf
+.B tensquant \-\-dequant \-o
+\fIout\fR [\fB\-\-format\fR \fIname\fR] [\fB\-\-force\fR]
+[\fB\-\-force\-single\-file\fR] \fIsource\fR
+.B tensquant \-\-quantize
+q4_0|q8_0 \fB\-o\fR \fIout.gguf\fR [\fB\-\-force\fR]
+[\fB\-\-force\-single\-file\fR] \fIsource\fR
+.fi
+.SH DESCRIPTION
+.B tensquant
+reads a container and writes float32, or the reverse for the two
+reference quantizers.
+Dequant does not recover the original pre-quant floats.
+A directory is the safetensors weight set, the same rule as
+.BR tenspile (1).
+An existing output file is left in place unless
+.B \-\-force
+is set.
+.PP
+.B \-\-dequant
+writes float32.
+GGML blocks use the transcribed dequantize formulas.
+Q8_1 is refused.
+GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored
+exllama layout.
+Zeros are incremented before the scale, and
+.I g_idx
+selects the row.
+AWQ uses the gemm nibble order.
+bitsandbytes uses the NF4 or FP4 codebook.
+compressed-tensors unpacks pack-quantized codes and keeps the scale tensors.
+MLX uses
+.I quantization
+in
+.IR config.json .
+.PP
+GPTQ 3-bit, the marlin tile inverse, EXL2
+.RI ( EXL2\-Q1 ),
+and ModelOpt NVFP4
+.RI ( CT\-Q1 )
+stop, because those inverses are not written out.
+.PP
+.B \-\-quantize
+accepts
+.I q4_0
+and
+.I q8_0
+and writes a GGUF file with those reference quantizers.
+K-quants and IQ types are not quantized.
+The innermost size must be a multiple of 32.
+.SH OPTIONS
+Pass
+.B \-\-dequant
+or
+.BR \-\-quantize ,
+not both.
+.TP
+.B \-\-dequant
+Write float32 from a transcribed pack.
+.TP
+.BI \-\-quantize " q4_0|q8_0"
+Quantize float weights with the named reference quantizer.
+The output is GGUF.
+.TP
+.BR \-o ", " \-\-output " \fIfile\fR"
+Output path.
+Required.
+For
+.BR \-\-dequant ,
+the container is safetensors, npy, npz, or float32 GGUF,
+from
+.B \-\-format
+or from the file name.
+.TP
+.BI \-\-format " name"
+Container to write for
+.BR \-\-dequant .
+.TP
+.B \-\-force
+Overwrite an existing output file.
+.TP
+.BI \-\-force\-single\-file " path"
+Read this
+.I .safetensors
+file even when
+.I config.json
+is in the same directory.
+It applies only to the path written immediately after it.
+.TP
+.BR \-h ", " \-\-help
+Show the short help.
+.TP
+.B \-\-version
+Show the version.
+.SH EXIT STATUS
+.TP
+.B 0
+The output file was written.
+.TP
+.B 1
+An error.
+The message is written to stderr and starts with
+.BR "tensquant: " .
+.SH EXAMPLES
+.nf
+.B tensquant \-\-dequant \-o model.safetensors model.gguf
+.B tensquant \-\-quantize q8_0 \-o model.gguf weights.safetensors
+.fi
+.SH SEE ALSO
+.BR tenspile (1),
+.BR tensdiff (1),
+.BR tensconv (1)

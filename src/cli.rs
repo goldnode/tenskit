@@ -13,7 +13,6 @@ pub enum Op {
     Update,
     Delete,
     Info,
-    Diff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +111,6 @@ pub struct Cli {
     pub output: Option<PathBuf>,
     pub format: Option<FormatName>,
     pub json: bool,
-    pub match_names: bool,
     pub dtype: Option<String>,
     pub shape: Option<Vec<u64>>,
     pub metadata: Vec<(String, String)>,
@@ -136,7 +134,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut output: Option<PathBuf> = None;
     let mut format: Option<FormatName> = None;
     let mut json = false;
-    let mut match_names = false;
     let mut dtype: Option<String> = None;
     let mut shape: Option<String> = None;
     let mut metadata = Vec::new();
@@ -214,7 +211,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     max_header = parse_size(&take("max-header-size")?)?;
                 }
                 "json" => json = true,
-                "match-names" => match_names = true,
                 "verbose" => verbose = true,
                 "columns" => columns = true,
                 "fold" => fold = true,
@@ -227,7 +223,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 "append" => set_op(&mut op, Op::Append)?,
                 "update" => set_op(&mut op, Op::Update)?,
                 "info" => set_op(&mut op, Op::Info)?,
-                "diff" => set_op(&mut op, Op::Diff)?,
                 _ => return Err(msg(format!("unknown option --{name}"))),
             }
             index += 1;
@@ -275,7 +270,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 'i' => set_op(&mut op, Op::Info)?,
                 'v' => verbose = true,
                 'n' => dry_run = true,
-                'd' => set_op(&mut op, Op::Diff)?,
                 'h' => return Ok(Parsed::Help),
                 _ => return Err(msg(format!("unknown option -{ch}"))),
             }
@@ -289,21 +283,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         ));
     }
 
-    let op =
-        op.ok_or_else(|| msg("choose one operation: -c, -t, -x, -r, -u, -i, -d, or --delete"))?;
-    if op == Op::Diff {
-        let (left, right) = if file_marked.is_none() && operands_marked.len() == 2 {
-            let right = operands_marked.pop().unwrap();
-            let left = operands_marked.pop().unwrap();
-            (left, right)
-        } else if file_marked.is_some() && operands_marked.len() == 1 {
-            (file_marked.clone().unwrap(), operands_marked[0].clone())
-        } else {
-            return Err(msg("diff needs two archive paths"));
-        };
-        file_marked = Some(left);
-        operands_marked = vec![right];
-    } else if file_marked.is_none() {
+    let op = op.ok_or_else(|| msg("choose one operation: -c, -t, -x, -r, -u, -i, or --delete"))?;
+    if file_marked.is_none() {
         if operands_marked.is_empty() {
             return Err(msg(
                 "missing archive path; pass -f FILE or the path as the first argument",
@@ -326,7 +307,6 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         output,
         format,
         json,
-        match_names,
         dtype,
         shape,
         metadata,
@@ -362,7 +342,7 @@ fn set_op(slot: &mut Option<Op>, op: Op) -> Result<()> {
     if let Some(existing) = *slot {
         if existing != op {
             return Err(msg(
-                "pass only one of -c, -t, -x, -r, -u, -i, -d, or --delete",
+                "pass only one of -c, -t, -x, -r, -u, -i, or --delete",
             ));
         }
     }
@@ -442,7 +422,6 @@ Usage:
   tenspile -u [-f] ARCHIVE KEY=FILE ...
   tenspile --delete [-f] ARCHIVE KEY ...
   tenspile -i [-f] ARCHIVE
-  tenspile -d ARCHIVE ARCHIVE
 
 Operations (exactly one):
   -c, --create     Create an archive. Refuses to overwrite unless --force.
@@ -452,8 +431,8 @@ Operations (exactly one):
   -u, --update     Replace a tensor key, or add it if it is missing.
   --delete         Remove tensor keys and write the archive again.
   -i, --info       Summarize the archive from its header.
-  -d, --diff       Compare two archives. Exit 1 when they differ.
-                   --match-names pairs tensors through the GGUF role table.
+
+Compare two archives with tensdiff.
 
 Options:
   -f, --file FILE           Archive path. If omitted, the first argument is the archive.
@@ -462,11 +441,9 @@ Options:
                             Bytes and parameter counts are scaled. Shard and
                             detail columns appear only when a member has them.
   --fold                    Merge a consecutive numeric name segment.
-                            On a listing this implies --columns, and
-                            model.layers.[3-5] is one copy per layer.
-                            On diff, lines that match except for that
-                            number become blk.[20-21].attn_norm.weight.
-                            A gap stays on its own line.
+                            Implies --columns. model.layers.[3-5] is one
+                            copy per layer. A gap stays on its own line.
+                            tensdiff --fold folds a diff the same way.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are
@@ -474,10 +451,6 @@ Options:
                             compiled in is local/supported-formats.txt.
                             raw is rawtensor/1 (a .rawtensor.json manifest plus a .bin).
   --json                    Machine-readable listing or info.
-  --match-names             On diff, pair tensors through the GGUF role
-                            table. A GGUF general.architecture selects it.
-                            Otherwise the smallest matching role set is used,
-                            and a tie is printed as \"may be A, B, or C\".
   --dtype NAME              Dtype for a headerless input file (safetensors name or canonical id).
   --shape LIST              Shape for a headerless input, for example 2,2 or [2, 2].
   --metadata KEY=VALUE      Set a text metadata entry.
@@ -505,8 +478,7 @@ Examples:
   tenspile -cf out.safetensors embed=embed.npy --metadata format=pt
   tenspile -uf model.safetensors norm=new_norm.npy
   tenspile --delete -f model.safetensors optimizer.step
-  tenspile -d left.safetensors right.gguf
-  tenspile -d --match-names model.safetensors model.gguf
+  tensdiff left.safetensors right.gguf
 "
 }
 
@@ -561,31 +533,6 @@ mod tests {
         assert!(cli.file_force_single);
         assert_eq!(cli.file.unwrap(), PathBuf::from("model.safetensors"));
         assert_eq!(cli.operand_force, vec![false]);
-        let both = parse(&args(&[
-            "-d",
-            "--force-single-file",
-            "left.safetensors",
-            "right.safetensors",
-        ]))
-        .unwrap();
-        let Parsed::Run(diff) = both else {
-            panic!("expected a command");
-        };
-        assert!(diff.file_force_single);
-        assert_eq!(diff.operand_force, vec![false]);
-        let flagged = parse(&args(&[
-            "-d",
-            "--force-single-file",
-            "-f",
-            "left.safetensors",
-            "right.safetensors",
-        ]))
-        .unwrap();
-        let Parsed::Run(diff) = flagged else {
-            panic!("expected a command");
-        };
-        assert!(diff.file_force_single);
-        assert_eq!(diff.file.unwrap(), PathBuf::from("left.safetensors"));
         let stray = parse(&args(&[
             "-t",
             "--force-single-file",

@@ -79,11 +79,11 @@ tenspile -t --columns --fold -f model.safetensors
 
 `--columns` prints the same fields aligned for a terminal, with a heading row. A shared parent is a heading, and the leaf name is indented under it. `bytes` is a power-of-two size (`64 MiB`) and `params` is a decimal count (`16.8M`). `offset` stays an integer. `shard` and `detail` are omitted when every value is empty. `--fold` implies `--columns` and merges one numeric name segment across a consecutive run when dtype, shape, stored size, shard, and detail all match. `model.layers.[3-5].self_attn.` is one copy of each leaf, not the sum, and the offset column is `-`. A tensor that differs, or a gap in the numbers, stays on its own line. A second number in the name, such as an expert id, is not folded in the same pass. `--json` stays the tab-free machine listing; `--columns` and `--fold` are refused with it.
 
-`tenspile -i` adds format, version, member count, data bytes, metadata, a dtype tally, and any spec notes. `-i --json` and `-t --json` print one document.
+`tenspile -i` adds format, version, member count, data bytes, metadata, a dtype tally, and any spec notes. On a directory, a sibling `config.json` with `quantization_config.quant_method` or an MLX `quantization` object adds one note with the method, bit width, and group size. The weights stay packed. `-i --json` and `-t --json` print one document.
 
 ## Comparing two files
 
-`tensdiff LEFT RIGHT` and `tenspile -d LEFT RIGHT` compare two containers. The report lists a format difference, member names only on one side, and one line for each tensor that differs or was paired under another name. Metadata keys stay on their own lines. Comparison continues after the first mismatch.
+`tensdiff LEFT RIGHT` compares two containers. `tenspile` does not. The report lists a format difference, member names only on one side, and one line for each tensor that differs or was paired under another name. Metadata keys stay on their own lines. Comparison continues after the first mismatch.
 
 A tensor line is `name : dtype : shape`. `=>` appears only on a field that differs, so a shared dtype or shape is written once:
 
@@ -106,8 +106,37 @@ A dtype match uses the canonical id, so `F32` and `float32` are the same type. A
 
 ```bash
 tensdiff --match-names model.safetensors model.gguf
-tenspile -d --match-names model.safetensors model.gguf
 ```
+
+`--fold` on a listing stays on `tenspile`. `--fold` on a diff stays on `tensdiff`.
+
+## Converting a container
+
+`tensconv` reads one container and writes one container. A directory is the safetensors weight set, the same rule `tenspile` uses. Shapes are outermost-first. A GGUF `ne[]` axis is reversed on the way in and on the way out. One tensor is converted at a time. A GGUF name of 64 bytes or more, or a rank outside 1..=4, stops the write. A rank-0 tensor is stored as `ne = [1]`.
+
+A dtype is copied when the target has it. BF16 widens to F32, and the FP8 and FP4 types that fit in F16 widen to F16. E8M0 widens to F32. Anything else the target cannot store stops the command. Narrowing is not implemented. Quantized blocks are not written here; `tensquant` does that.
+
+```bash
+tensconv -o model.gguf model.safetensors
+tensconv --rename -o model.gguf model/
+```
+
+`--rename` takes the architecture from `general.architecture`, or from `config.json` `architectures[0]`. Names come from `tables/gguf-tensor-roles.json`. Hyperparameters written into GGUF follow `hf_config_to_gguf`: `text_config` is merged over the root object first, then the first listed key is used. A sibling `config.json` is read only for those keys.
+
+Value changes run with `--rename` unless `--names-only` is set. A converter record with `complete: true` applies the listed branch (`+ 1`, unsqueeze, squeeze, the clip `view`/`permute`, `-exp`, and the recorded renames). The expression text is not evaluated. Any other expression stops the conversion and prints that expression. LLaMA `q_proj` and `k_proj` rows are permuted when that converter has `undo_permute`. Qwen3.5 applies the V-head reorder, `A_log` as `-exp`, norms other than `linear_attn.norm.weight` as `weight + 1`, and the `conv1d` squeeze. Full-attention Q and K are not permuted, and the reorder is skipped when the linear head counts match. An architecture whose record is `complete: false`, and that is not the LLaMA or Qwen3.5 case, stops and names `unexpanded`. Warnings go to stderr.
+
+## Dequantizing and the reference quantizers
+
+`tensquant` reads a container and writes float32, or the reverse for the two reference quantizers. Dequant does not recover the original pre-quant floats.
+
+```bash
+tensquant --dequant -o model.safetensors model.gguf
+tensquant --quantize q8_0 -o model.gguf weights.safetensors
+```
+
+GGML blocks use the `dequantize` snippets. Q8_1 is refused. GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored exllama layout. Zeros are incremented before the scale, and `g_idx` selects the row. AWQ uses the gemm nibble order. bitsandbytes uses the NF4 or FP4 codebook. compressed-tensors unpacks pack-quantized codes and keeps the scale tensors. MLX uses `quantization` in `config.json`.
+
+GPTQ 3-bit, the marlin tile inverse, EXL2 (`EXL2-Q1`), and ModelOpt NVFP4 (`CT-Q1`) stop, because those formulas are not written out. `--quantize` accepts `q4_0` and `q8_0` only.
 
 ## Files that are refused
 

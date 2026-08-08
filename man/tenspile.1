@@ -1,0 +1,228 @@
+.TH TENSPILE 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.SH NAME
+tenspile \- inspect and edit tensor containers
+.SH SYNOPSIS
+.nf
+.B tenspile \-c
+[\fB\-f\fR] \fIarchive\fR [\fIkey=file\fR ...]
+.B tenspile \-t
+[\fB\-v\fR] [\fB\-\-columns\fR] [\fB\-\-fold\fR] [\fB\-f\fR] \fIarchive\fR [\fIkey\fR ...]
+.B tenspile \-x
+[\fB\-f\fR] \fIarchive\fR [\fIkey\fR ...]
+.B tenspile \-r
+[\fB\-f\fR] \fIarchive\fR \fIkey=file\fR ...
+.B tenspile \-u
+[\fB\-f\fR] \fIarchive\fR \fIkey=file\fR ...
+.B tenspile \-\-delete
+[\fB\-f\fR] \fIarchive\fR \fIkey\fR ...
+.B tenspile \-i
+[\fB\-f\fR] \fIarchive\fR
+.B tenspile
+[\fB\-h\fR | \fB\-\-version\fR]
+.fi
+.SH DESCRIPTION
+.B tenspile
+creates, lists, extracts, and edits files that store tensors.
+One invocation does one operation.
+Short flags cluster, as in
+.BR "tenspile \-tvf model.safetensors" .
+A directory is the safetensors weight set inside it:
+one
+.I *.safetensors.index.json
+if that is the only index, otherwise one loose
+.I *.safetensors
+file.
+A lone
+.I .safetensors
+file beside
+.I config.json
+is refused unless
+.B \-\-force\-single\-file
+is written immediately before that path.
+.PP
+List and info read the header.
+They do not load weight bytes.
+A rewrite streams unchanged tensor bytes into the new file.
+.PP
+Comparison is
+.BR tensdiff (1).
+Renaming tensors into GGUF names is
+.BR tensconv (1).
+Dequantizing a pack is
+.BR tensquant (1).
+.SH OPTIONS
+Exactly one operation is required.
+.TP
+.BR \-c ", " \-\-create
+Create an archive.
+Refuses to overwrite an existing file unless
+.B \-\-force
+is set.
+.TP
+.BR \-t ", " \-\-list
+List member names.
+.B \-v
+adds dtype, shape, bytes, offset, and parameters.
+.TP
+.BR \-x ", " \-\-extract
+Extract members.
+No names means all of them.
+.TP
+.BR \-r ", " \-\-append
+Add members.
+Errors if a tensor key already exists.
+.TP
+.BR \-u ", " \-\-update
+Replace a tensor key, or add it if it is missing.
+.TP
+.B \-\-delete
+Remove tensor keys and write the archive again.
+.TP
+.BR \-i ", " \-\-info
+Summarize the archive from its header:
+format, version, member count, data bytes, metadata, a dtype tally,
+and any notes.
+On a directory, a sibling
+.I config.json
+with
+.I quantization_config.quant_method
+or an MLX
+.I quantization
+object adds one note of method, bits, and group size.
+The weights stay packed.
+.TP
+.BR \-f ", " \-\-file " \fIfile\fR"
+Archive path.
+If omitted, the first operand is the archive.
+.TP
+.BR \-v ", " \-\-verbose
+Longer listing.
+Fields are separated by tabs.
+.TP
+.B \-\-columns
+Aligned listing for the console, with a heading row.
+Implies
+.BR \-v .
+Bytes and parameter counts are scaled.
+Shard and detail columns appear only when a member has them.
+Applies to list or info.
+.TP
+.B \-\-fold
+Merge a consecutive numeric name segment when the tensors match.
+Implies
+.BR \-\-columns .
+.I model.layers.[3\-5]
+is one copy of each leaf, not the sum, and the offset is
+.IR \- .
+A gap, or a second number in the name, stays on its own line.
+Applies to list or info.
+.B tensdiff \-\-fold
+folds a diff the same way.
+.TP
+.BR \-C ", " \-\-directory " \fIdir\fR"
+Directory for extracted files.
+The default is the current directory.
+Applies to extract.
+.TP
+.BR \-o ", " \-\-output " \fIfile\fR"
+Write the new archive here instead of replacing
+.BR \-f .
+Does not apply to list or info.
+.TP
+.BI \-\-format " name"
+Container to read or write.
+This build's names are printed when the name is unknown.
+Which formats are compiled in is
+.IR local/supported-formats.txt .
+.I raw
+is rawtensor/1, a
+.I .rawtensor.json
+manifest plus a
+.IR .bin .
+.TP
+.B \-\-json
+Machine-readable listing or info on stdout.
+.B \-\-columns
+and
+.B \-\-fold
+do not apply to
+.BR \-\-json .
+.TP
+.BI \-\-dtype " name"
+Dtype for a headerless input file.
+A safetensors name or a canonical id.
+.TP
+.BI \-\-shape " list"
+Shape for a headerless input, for example
+.I 2,2
+or
+.IR [2,2] .
+.TP
+.BI \-\-metadata " key=value"
+Set a text metadata entry on create or update.
+.TP
+.BI \-\-metadata\-file " file"
+JSON object of metadata.
+GGUF values are typed.
+.TP
+.BI \-\-max\-header\-size " size"
+Safetensors header cap.
+The default is 100M.
+.TP
+.B \-\-force
+Overwrite an existing file on create or extract.
+.TP
+.BI \-\-force\-single\-file " path"
+Read this
+.I .safetensors
+file even when
+.I config.json
+is in the same directory.
+It applies only to the path written immediately after it.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print the plan and do not write.
+.TP
+.BR \-h ", " \-\-help
+Show the short help.
+.TP
+.B \-\-version
+Show the version.
+.SH MEMBERS
+A bare name selects a member for list, extract, or delete.
+.PP
+.I key=path
+adds or replaces from a file.
+A bare
+.I .npy
+uses its file stem as the key.
+.PP
+.I key=archive:member
+copies one member out of another container.
+.PP
+A bare
+.I .npz
+on create, append, or update imports every array in the archive.
+.SH EXIT STATUS
+.TP
+.B 0
+The operation finished.
+.TP
+.B 1
+An error.
+The message is written to stderr and starts with
+.BR "tenspile: " .
+.SH EXAMPLES
+.nf
+.B tenspile \-tvf model.safetensors
+.B tenspile \-t \-\-columns \-\-fold \-f model.safetensors
+.B tenspile \-i model.gguf
+.B tenspile \-xf model.safetensors \-C out embed
+.B tenspile \-cf out.safetensors embed=embed.npy \-\-metadata format=pt
+.B tenspile \-uf model.safetensors norm=new_norm.npy
+.B tenspile \-\-delete \-f model.safetensors optimizer.step
+.fi
+.SH SEE ALSO
+.BR tensdiff (1),
+.BR tensconv (1),
+.BR tensquant (1)

@@ -90,14 +90,8 @@ pub fn execute(cli: Cli) -> Result<i32> {
     if cli.columns && !matches!(cli.op, Op::List | Op::Info) {
         return Err(msg("--columns applies to list or info"));
     }
-    if cli.fold && !matches!(cli.op, Op::List | Op::Info | Op::Diff) {
-        return Err(msg("--fold applies to list, info, or diff"));
-    }
-    if cli.match_names && cli.op != Op::Diff {
-        return Err(msg("--match-names applies to diff"));
-    }
-    if cli.op == Op::Diff {
-        return crate::diff::from_cli(&cli);
+    if cli.fold && !matches!(cli.op, Op::List | Op::Info) {
+        return Err(msg("--fold applies to list or info"));
     }
     match cli.op {
         Op::List => list(&cli)?,
@@ -107,7 +101,6 @@ pub fn execute(cli: Cli) -> Result<i32> {
         Op::Append => modify(&cli, Modify::Append)?,
         Op::Update => modify(&cli, Modify::Update)?,
         Op::Delete => modify(&cli, Modify::Delete)?,
-        Op::Diff => unreachable!(),
     }
     Ok(0)
 }
@@ -124,7 +117,12 @@ fn list(cli: &Cli) -> Result<()> {
 }
 
 fn info(cli: &Cli) -> Result<()> {
-    let archive = open_source(cli)?;
+    let mut archive = open_source(cli)?;
+    if let Some(path) = cli.file.as_ref().filter(|path| path.is_dir()) {
+        if let Some(note) = quantization_note(path) {
+            archive.notes.push(note);
+        }
+    }
     let members: Vec<&Member> = archive.members.iter().collect();
     if cli.json {
         println!("{}", json_document(&archive, &members)?);
@@ -170,6 +168,45 @@ enum MemberStyle {
     Names,
     Tabs,
     Columns { fold: bool },
+}
+
+fn quantization_note(dir: &Path) -> Option<String> {
+    let bytes = fs::read(dir.join("config.json")).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    if let Some(object) = value.get("quantization_config").and_then(Value::as_object) {
+        if let Some(method) = object.get("quant_method").and_then(Value::as_str) {
+            return Some(quantization_note_text(
+                method,
+                json_u64(object, &["bits", "w_bit"]),
+                json_u64(object, &["group_size", "q_group_size"]),
+            ));
+        }
+    }
+    let object = value.get("quantization").and_then(Value::as_object)?;
+    if !object.contains_key("bits") && !object.contains_key("group_size") {
+        return None;
+    }
+    Some(quantization_note_text(
+        "mlx",
+        object.get("bits").and_then(Value::as_u64),
+        object.get("group_size").and_then(Value::as_u64),
+    ))
+}
+
+fn json_u64(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_u64))
+}
+
+fn quantization_note_text(method: &str, bits: Option<u64>, group: Option<u64>) -> String {
+    let mut text = format!("quantization {method}");
+    if let Some(bits) = bits {
+        text.push_str(&format!(" bits {bits}"));
+    }
+    if let Some(group) = group {
+        text.push_str(&format!(" group {group}"));
+    }
+    text
 }
 
 fn member_style(cli: &Cli) -> MemberStyle {

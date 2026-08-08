@@ -17,6 +17,14 @@ path = "src/main.rs"
 name = "tensdiff"
 path = "src/tensdiff.rs"
 
+[[bin]]
+name = "tensconv"
+path = "src/tensconv.rs"
+
+[[bin]]
+name = "tensquant"
+path = "src/tensquant.rs"
+
 [dependencies]
 serde_json = "1"
 sha2 = "0.10"

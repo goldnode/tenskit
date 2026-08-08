@@ -2,17 +2,23 @@
 
 mod archive;
 mod cli;
+mod convert;
 mod detect;
 mod diff;
 mod dtype;
 mod error;
 mod formats;
+mod ggml_dequant;
 mod gguf_names;
 mod io_util;
 mod listing;
 mod ops;
 mod payload;
+mod quant;
 mod sha256;
+
+#[cfg(test)]
+mod man_pages;
 
 #[cfg(test)]
 mod spec_audit;
@@ -35,6 +41,14 @@ pub fn run(args: &[String]) -> Result<i32> {
 
 pub fn diff_main(args: &[String]) -> Result<i32> {
     diff::diff_main(args)
+}
+
+pub fn convert_main(args: &[String]) -> Result<i32> {
+    convert::convert_main(args)
+}
+
+pub fn quant_main(args: &[String]) -> Result<i32> {
+    quant::quant_main(args)
 }
 
 /// Small GGUF v3 writer used by tests. Creating GGUF is not a CLI operation.

@@ -1,0 +1,130 @@
+.TH TENSDIFF 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.SH NAME
+tensdiff \- compare two tensor containers
+.SH SYNOPSIS
+.nf
+.B tensdiff
+[\fB\-\-json\fR] [\fB\-\-match\-names\fR] [\fB\-\-fold\fR]
+[\fB\-\-force\-single\-file\fR] \fIleft\fR \fIright\fR
+.fi
+.SH DESCRIPTION
+.B tensdiff
+compares two containers.
+The report lists a format difference, member names only on one side,
+and one line for each tensor that differs or was paired under another name.
+Metadata keys stay on their own lines.
+Comparison continues after the first mismatch.
+.PP
+A tensor line is
+.IR "name : dtype : shape" .
+.B =>
+appears only on a field that differs, so a shared dtype or shape is written once.
+When the dtype and shape match and the bytes do not, the line ends with
+.IR "values differ at byte N" .
+A renamed pair whose dtype, shape, and bytes match is printed and does not
+by itself make the exit status 1.
+Tensor lines and names only on one side are sorted by name.
+A run of digits compares as a number, so
+.I .10.
+follows
+.IR .9. .
+.PP
+A dtype match uses the canonical id, so
+.I F32
+and
+.I float32
+are the same type.
+A GGUF shape is reversed from
+.I ne[]
+before it is compared.
+The bytes compared are the logical tensor:
+GGUF alignment padding is dropped, and a quantized tensor is the block bytes,
+not a dequantized float.
+.PP
+A directory is the safetensors weight set, the same rule as
+.BR tenspile (1).
+A
+.I .safetensors
+file beside
+.I config.json
+is refused unless
+.B \-\-force\-single\-file
+is written immediately before that path.
+.SH OPTIONS
+.TP
+.B \-\-json
+Print the same findings as one document.
+.B \-\-fold
+does not apply to
+.BR \-\-json .
+.TP
+.B \-\-match\-names
+Pair names that differ through the GGUF role table.
+A GGUF
+.I general.architecture
+value selects that architecture.
+Otherwise every architecture is tried, and the smallest role set that
+explains every remaining name wins.
+When several architectures still fit, the report says
+.IR "names: may be A, B, or C" .
+Each pair lists both names.
+.I language_model.
+is removed before the lookup.
+Vision and audio tensors are left unpaired in a language file.
+Qwen3.5
+.I dt_bias
+and
+.I mtp.*
+names use the rewrites in
+.IR qwen35_tensor_names_to_gguf .
+If nothing covers the names, the report says
+.I names: no table matched
+and falls back to exact names.
+Paired Q and K weights stay in the order stored in the file.
+.TP
+.B \-\-fold
+Merge tensor lines that are the same except for one consecutive number.
+A number that advances on both sides is written as a range on both sides.
+A number that stays the same is written once.
+A gap is not bridged.
+.I blk.20
+and
+.I blk.21
+become
+.IR blk.[20\-21] .
+.TP
+.BI \-\-force\-single\-file " path"
+Read this
+.I .safetensors
+file even when
+.I config.json
+is in the same directory.
+It applies only to the path written immediately after it.
+.TP
+.BR \-h ", " \-\-help
+Show the short help.
+.TP
+.B \-\-version
+Show the version.
+.SH EXIT STATUS
+.TP
+.B 0
+The names, types, shapes, values, and metadata match.
+.TP
+.B 1
+A difference was printed.
+.TP
+.B 2
+A file could not be read.
+The message is written to stderr and starts with
+.BR "tensdiff: " .
+.SH EXAMPLES
+.nf
+.B tensdiff left.safetensors right.gguf
+.B tensdiff \-\-match\-names model.safetensors model.gguf
+.B tensdiff \-\-fold left.gguf right.safetensors
+.fi
+.SH SEE ALSO
+.BR tenspile (1),
+.BR tensconv (1),
+.BR tensquant (1)

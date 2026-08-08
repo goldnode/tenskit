@@ -1,0 +1,135 @@
+.TH TENSCONV 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.SH NAME
+tensconv \- copy tensors into another container
+.SH SYNOPSIS
+.nf
+.B tensconv \-o
+\fIout\fR [\fB\-\-format\fR \fIname\fR] [\fB\-\-rename\fR] [\fB\-\-names\-only\fR]
+[\fB\-\-force\fR] [\fB\-\-force\-single\-file\fR] \fIsource\fR
+.fi
+.SH DESCRIPTION
+.B tensconv
+reads one container and writes one container.
+A directory is the safetensors weight set, the same rule as
+.BR tenspile (1).
+Shapes are stored outermost-first.
+A GGUF
+.I ne[]
+axis is reversed on the way in and on the way out.
+One tensor is converted at a time.
+A GGUF name of 64 bytes or more, or a rank outside 1 to 4, stops the write.
+A rank-0 tensor is stored as
+.IR ne=[1] .
+.PP
+A dtype is copied when the target has it.
+BF16 widens to F32.
+FP8 and FP4 types that fit in F16 widen to F16.
+E8M0 widens to F32.
+A type the target cannot store stops the command.
+Narrowing is not done.
+Quantized blocks are not written here.
+.BR tensquant (1)
+dequantizes them.
+.PP
+An existing output file is left in place unless
+.B \-\-force
+is set.
+Warnings go to stderr.
+.SH OPTIONS
+.TP
+.BR \-o ", " \-\-output " \fIfile\fR"
+Output path.
+Required.
+The container is taken from
+.B \-\-format
+or from the file name.
+.TP
+.BI \-\-format " name"
+Container to write.
+.TP
+.B \-\-rename
+Map names through the GGUF role table.
+The architecture is
+.I general.architecture
+or
+.I config.json
+.IR architectures[0] .
+Hyperparameters written into GGUF follow
+.IR hf_config_to_gguf :
+.I text_config
+is merged over the root object first, then the first listed key is used.
+A sibling
+.I config.json
+is read only for those keys.
+.PP
+Value changes run unless
+.B \-\-names\-only
+is set.
+A converter record with
+.I complete: true
+applies its listed branch.
+The expression text is not evaluated.
+Any other expression stops the conversion and prints that expression.
+LLaMA
+.I q_proj
+and
+.I k_proj
+rows are permuted when that converter has
+.IR undo_permute .
+Qwen3.5 applies the V-head reorder,
+.I A_log
+as
+.IR \-exp ,
+norms other than
+.I linear_attn.norm.weight
+as
+.IR "weight + 1" ,
+and the
+.I conv1d
+squeeze.
+Full-attention Q and K are not permuted.
+The reorder is skipped when the linear head counts match.
+An architecture whose record is
+.I complete: false
+and that is not the LLaMA or Qwen3.5 case stops and names
+.IR unexpanded .
+.TP
+.B \-\-names\-only
+Rename and skip the value changes.
+Applies to
+.BR \-\-rename .
+.TP
+.B \-\-force
+Overwrite an existing output file.
+.TP
+.BI \-\-force\-single\-file " path"
+Read this
+.I .safetensors
+file even when
+.I config.json
+is in the same directory.
+It applies only to the path written immediately after it.
+.TP
+.BR \-h ", " \-\-help
+Show the short help.
+.TP
+.B \-\-version
+Show the version.
+.SH EXIT STATUS
+.TP
+.B 0
+The output file was written.
+.TP
+.B 1
+An error.
+The message is written to stderr and starts with
+.BR "tensconv: " .
+.SH EXAMPLES
+.nf
+.B tensconv \-o model.gguf model.safetensors
+.B tensconv \-\-rename \-o model.gguf model/
+.fi
+.SH SEE ALSO
+.BR tenspile (1),
+.BR tensdiff (1),
+.BR tensquant (1)

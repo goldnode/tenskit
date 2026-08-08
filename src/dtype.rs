@@ -224,6 +224,17 @@ pub fn is_quant_ggml(id: u32) -> bool {
     ggml_row(id).is_some_and(|row| !row.element && !row.removed)
 }
 
+/// GGML element-type code for a canonical dtype, when GGUF stores that dtype.
+pub fn element_ggml_code(canonical: &str) -> Option<u32> {
+    GGML_TYPES.iter().find_map(|row| {
+        if row.element && !row.removed && row.canonical == Some(canonical) {
+            Some(row.code)
+        } else {
+            None
+        }
+    })
+}
+
 /// On-disk payload size for a ggml tensor. `shape` is file order (`ne[]`).
 pub fn ggml_payload_bytes(id: u32, shape: &[u64]) -> Result<u64> {
     let row = require_ggml(id)?;

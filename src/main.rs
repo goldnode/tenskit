@@ -7,17 +7,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("tenspile: {err}");
-            std::process::exit(if diff_args(&args) { 2 } else { 1 });
+            std::process::exit(1);
         }
     }
-}
-
-fn diff_args(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        arg == "--diff"
-            || arg == "-d"
-            || (arg.starts_with('-')
-                && !arg.starts_with("--")
-                && arg.chars().skip(1).any(|ch| ch == 'd'))
-    })
 }
