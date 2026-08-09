@@ -759,21 +759,56 @@ fn dequant_compressed(
     warnings: &mut Vec<String>,
 ) -> Result<Vec<FloatTensor>> {
     let quant = quant.ok_or_else(|| msg("compressed-tensors dequant needs quantization_config"))?;
-    let schemes = CtSchemes::from_config(quant)?;
+    let modules = module_paths(archive);
+    let schemes = CtSchemes::from_config(quant, &modules, warnings)?;
     let members = index(archive);
     let mut used = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for member in &archive.members {
-        let Some(module) = member.name.strip_suffix(".weight_packed") else {
+        // CT-009: a module is quantized when its scheme parameters are
+        // stored, whatever the targets say: weight_packed for pack-quantized,
+        // or weight beside weight_scale for int- and float-quantized.
+        let (module, packed) = if let Some(module) = member.name.strip_suffix(".weight_packed") {
+            (module, true)
+        } else if let Some(module) = member.name.strip_suffix(".weight") {
+            if !members.contains_key(format!("{module}.weight_scale").as_str()) {
+                continue;
+            }
+            (module, false)
+        } else {
             continue;
         };
-        let scheme = schemes
-            .scheme_for(module, warnings)?
-            .ok_or_else(|| msg(format!("no config_groups target matches {module} (CT-008)")))?;
         let get = |suffix: &str| members.get(format!("{module}.{suffix}").as_str()).copied();
-        let shape = weight_shape(archive, &member.name)?;
-        let packed = read_i32(member)?;
-        let codes = unpack_pack_quantized(&packed.0, &packed.1, scheme.num_bits, &shape)?;
+        let (codes, shape, float_codes) = if packed {
+            let shape = weight_shape(archive, &member.name)?;
+            (Some(read_i32(member)?), shape, false)
+        } else {
+            let float_codes = dtype::canonical_id(&member.dtype)? != "int8";
+            (None, member.shape.clone(), float_codes)
+        };
+        // The stored tensors can tell schemes apart that class targets cannot
+        // (CT-009): the packed width follows num_bits, and only an asymmetric
+        // scheme has a zero point.
+        let fits = |scheme: &CtScheme| {
+            let width_fits = match &codes {
+                Some((_, packed_shape)) => {
+                    let cols = shape.last().copied().unwrap_or(0);
+                    packed_shape.last().copied() == Some((cols * u64::from(scheme.num_bits)).div_ceil(32))
+                }
+                None => scheme.float == float_codes,
+            };
+            width_fits && scheme.symmetric == get("weight_zero_point").is_none()
+        };
+        let scheme = schemes.scheme_for(module, &fits)?;
+        let codes = match codes {
+            Some((words, packed_shape)) => {
+                unpack_pack_quantized(&words, &packed_shape, scheme.num_bits, &shape)?
+                    .into_iter()
+                    .map(|code| code as f32)
+                    .collect()
+            }
+            None => stored_codes(member, &scheme)?,
+        };
         let scale_member = get("weight_scale")
             .ok_or_else(|| msg(format!("{module}.weight_scale is missing")))?;
         let scale_dtype = dtype::canonical_id(&scale_member.dtype)?;
@@ -801,7 +836,7 @@ fn dequant_compressed(
             shape,
             values,
         });
-        for suffix in ["weight_packed", "weight_shape", "weight_scale", "weight_zero_point", "weight_global_scale"] {
+        for suffix in ["weight", "weight_packed", "weight_shape", "weight_scale", "weight_zero_point", "weight_global_scale"] {
             used.insert(format!("{module}.{suffix}"));
         }
     }
@@ -813,52 +848,121 @@ fn dequant_compressed(
     Ok(out)
 }
 
-#[derive(Clone)]
-struct CtScheme {
-    num_bits: u32,
+/// Codes of an int- or float-quantized weight, stored unpacked: int8 for an
+/// int scheme, an fp8 type for a float one.
+fn stored_codes(member: &Member, scheme: &CtScheme) -> Result<Vec<f32>> {
+    let canonical = dtype::canonical_id(&member.dtype)?;
+    let raw = member.payload.read_vec()?;
+    match (canonical, scheme.float) {
+        ("int8", false) => Ok(raw.iter().map(|byte| f32::from(*byte as i8)).collect()),
+        (_, true) => {
+            let format = dtype::MiniFloat::for_dtype(canonical)
+                .map_err(|_| msg(format!("{}: {canonical} is not a float-quantized weight type", member.name)))?;
+            Ok(raw.iter().map(|byte| format.decode(*byte)).collect())
+        }
+        _ => Err(msg(format!(
+            "{}: {canonical} does not hold the codes of its int scheme",
+            member.name
+        ))),
+    }
+}
+
+/// Every module path in the checkpoint: each dotted prefix of a tensor name.
+fn module_paths(archive: &Archive) -> std::collections::BTreeSet<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for member in &archive.members {
+        let mut end = 0;
+        while let Some(dot) = member.name[end..].find('.') {
+            end += dot;
+            paths.insert(member.name[..end].to_string());
+            end += 1;
+        }
+    }
+    paths
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct CtScheme {
+    pub(crate) num_bits: u32,
+    float: bool,
     symmetric: bool,
     strategy: String,
     group_size: usize,
     block: Option<(usize, usize)>,
 }
 
-struct CtSchemes {
+pub(crate) enum CtTarget {
+    Exact(String),
+    Regex(String, regex::Regex),
+    /// A name that is neither `re:` nor a module path in the checkpoint
+    /// (CT-009).
+    Class(String),
+}
+
+impl CtTarget {
+    fn new(target: &str, modules: &std::collections::BTreeSet<String>) -> Result<CtTarget> {
+        if let Some(pattern) = target.strip_prefix("re:") {
+            // CT-011: re.match is anchored at the start only.
+            let compiled = regex::Regex::new(&format!("^(?:{pattern})")).map_err(|err| {
+                msg(format!("compressed-tensors target {target} is not a pattern this reader supports (CT-011): {err}"))
+            })?;
+            return Ok(CtTarget::Regex(target.to_string(), compiled));
+        }
+        Ok(if modules.contains(target) {
+            CtTarget::Exact(target.to_string())
+        } else {
+            CtTarget::Class(target.to_string())
+        })
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            CtTarget::Exact(text) | CtTarget::Regex(text, _) | CtTarget::Class(text) => text,
+        }
+    }
+}
+
+pub(crate) struct CtSchemes {
     /// target -> scheme, in config_groups then targets order; a later group
-    /// replaces an earlier one for the same target string.
-    targets: Vec<(String, CtScheme)>,
-    ignore: Vec<String>,
+    /// replaces an earlier one for the same target string (CT-010).
+    targets: Vec<(CtTarget, CtScheme)>,
+    ignore: Vec<CtTarget>,
 }
 
 impl CtSchemes {
-    fn from_config(quant: &Map<String, Value>) -> Result<CtSchemes> {
+    pub(crate) fn from_config(
+        quant: &Map<String, Value>,
+        modules: &std::collections::BTreeSet<String>,
+        warnings: &mut Vec<String>,
+    ) -> Result<CtSchemes> {
         let groups = quant
             .get("config_groups")
             .and_then(Value::as_object)
             .ok_or_else(|| msg("compressed-tensors quantization_config has no config_groups"))?;
-        let mut targets: Vec<(String, CtScheme)> = Vec::new();
-        // serde_json (without preserve_order) keeps object keys sorted, not
-        // in file order. compressed-tensors names groups group_0, group_1,
-        // ..., which sort in written order up to group_9; past that, or with
-        // other names, a target listed by two groups may take the wrong one.
-        if groups.len() > 1 && groups.keys().any(|name| !name.starts_with("group_") || name.len() > 7) {
-            return Err(msg(
-                "config_groups names do not show their order; CT-008 needs the order in the file",
-            ));
-        }
-        for group in groups.values() {
+        let mut targets: Vec<(CtTarget, CtScheme)> = Vec::new();
+        // serde_json keeps the file's key order (preserve_order), which is
+        // the order CT-010 asks for.
+        for (name, group) in groups {
+            if group.is_array() {
+                return Err(msg(format!(
+                    "config_groups {name} is a preset scheme name; preset_name_to_scheme is not in the spec, so it is refused (CT-010)"
+                )));
+            }
             let weights = group
                 .get("weights")
                 .and_then(Value::as_object)
-                .ok_or_else(|| msg("a config_groups entry has no weights"))?;
+                .ok_or_else(|| msg(format!("config_groups {name} has no weights")))?;
             let num_bits = weights
                 .get("num_bits")
                 .and_then(Value::as_u64)
                 .filter(|bits| (1..=8).contains(bits))
                 .ok_or_else(|| msg("compressed-tensors num_bits is not in 1..8 (CT-001)"))?
                 as u32;
-            if weights.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "int") {
-                return Err(msg("compressed-tensors pack-quantized weights are type int"));
-            }
+            let float = match weights.get("type").and_then(Value::as_str).unwrap_or("int") {
+                "int" => false,
+                "float" => true,
+                other => return Err(msg(format!("compressed-tensors weights type {other} is not int or float"))),
+            };
             let strategy = weights
                 .get("strategy")
                 .and_then(Value::as_str)
@@ -874,6 +978,7 @@ impl CtSchemes {
                 });
             let scheme = CtScheme {
                 num_bits,
+                float,
                 symmetric: weights.get("symmetric").and_then(Value::as_bool).unwrap_or(true),
                 strategy,
                 group_size,
@@ -886,68 +991,81 @@ impl CtSchemes {
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                targets.retain(|(existing, _)| existing != target);
-                targets.push((target.to_string(), scheme.clone()));
+                targets.retain(|(existing, _)| existing.text() != target);
+                targets.push((CtTarget::new(target, modules)?, scheme.clone()));
             }
         }
-        let ignore = quant
+        let mut ignore = Vec::new();
+        for entry in quant
             .get("ignore")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect();
+        {
+            let target = CtTarget::new(entry, modules)?;
+            if let CtTarget::Class(name) = &target {
+                warnings.push(format!(
+                    "ignore entry {name} is not a module in the checkpoint; modules with stored scheme parameters are dequantized whatever it says (CT-009)"
+                ));
+            }
+            ignore.push(target);
+        }
         Ok(CtSchemes { targets, ignore })
     }
 
     /// CT-008: exact module names first, then `re:` patterns (sorted), then
-    /// class names (sorted). The checkpoint does not record module classes:
-    /// a class target is taken to match every packed module, and that is
-    /// reported.
-    fn scheme_for(&self, module: &str, warnings: &mut Vec<String>) -> Result<Option<CtScheme>> {
+    /// class names (sorted). Without the model code a class target matches
+    /// every module that has scheme parameters (CT-009); when class targets
+    /// of different schemes compete, `fits` (what the stored tensors allow)
+    /// must leave one.
+    pub(crate) fn scheme_for(&self, module: &str, fits: &dyn Fn(&CtScheme) -> bool) -> Result<CtScheme> {
         for entry in &self.ignore {
-            if ct_match(entry, module)? == Some(true) {
-                return Ok(None);
+            let ignored = match entry {
+                CtTarget::Exact(name) => name == module,
+                CtTarget::Regex(_, pattern) => pattern.is_match(module),
+                CtTarget::Class(_) => false,
+            };
+            if ignored {
+                return Err(msg(format!(
+                    "{module} has quantized parameters but ignore entry {} names it (CT-009)",
+                    entry.text()
+                )));
             }
         }
         let mut exact = None;
-        let mut regex: Vec<&(String, CtScheme)> = Vec::new();
-        let mut class: Vec<&(String, CtScheme)> = Vec::new();
+        let mut regex: Vec<&(CtTarget, CtScheme)> = Vec::new();
+        let mut class: Vec<&(CtTarget, CtScheme)> = Vec::new();
         for entry in &self.targets {
-            match ct_match(&entry.0, module)? {
-                Some(true) if !entry.0.starts_with("re:") => exact = Some(entry),
-                Some(true) => regex.push(entry),
-                Some(false) => {}
-                None => class.push(entry),
+            match &entry.0 {
+                CtTarget::Exact(name) if name == module => exact = Some(entry),
+                CtTarget::Exact(_) => {}
+                CtTarget::Regex(_, pattern) if pattern.is_match(module) => regex.push(entry),
+                CtTarget::Regex(..) => {}
+                CtTarget::Class(_) => class.push(entry),
             }
         }
-        regex.sort_by(|a, b| a.0.cmp(&b.0));
-        class.sort_by(|a, b| a.0.cmp(&b.0));
+        regex.sort_by(|a, b| a.0.text().cmp(b.0.text()));
         if let Some(entry) = exact.or(regex.first().copied()) {
-            return Ok(Some(entry.1.clone()));
+            return Ok(entry.1.clone());
         }
-        Ok(class.first().map(|entry| {
-            warnings.push(format!(
-                "{module}: class target {} is assumed to match, because the checkpoint does not record module classes",
-                entry.0
-            ));
-            entry.1.clone()
-        }))
+        let mut schemes: Vec<&CtScheme> = Vec::new();
+        for (_, scheme) in &class {
+            if !schemes.contains(&scheme) {
+                schemes.push(scheme);
+            }
+        }
+        if schemes.len() > 1 {
+            schemes.retain(|scheme| fits(scheme));
+        }
+        match schemes.as_slice() {
+            [] => Err(msg(format!("no config_groups target matches {module} (CT-008)"))),
+            [scheme] => Ok((*scheme).clone()),
+            _ => Err(msg(format!(
+                "{module}: class targets of different schemes match it and its tensors do not tell them apart (CT-009)"
+            ))),
+        }
     }
-}
-
-/// Some(true/false) for a module name or `re:` target, None for a target
-/// that can only be a class name (it matches no module path syntax).
-fn ct_match(target: &str, module: &str) -> Result<Option<bool>> {
-    if let Some(pattern) = target.strip_prefix("re:") {
-        return crate::pattern::matches_prefix(pattern, module).map(Some);
-    }
-    if target == module {
-        return Ok(Some(true));
-    }
-    let class_like = target.chars().next().is_some_and(char::is_uppercase) && !target.contains('.');
-    Ok(if class_like { None } else { Some(false) })
 }
 
 /// Unpacked zero points, shaped like the scale (CT-006: asymmetric group and
@@ -993,7 +1111,7 @@ fn unpack_dim0(packed: &[i32], packed_shape: &[u64], bits: u32, rows: usize, col
 /// step is rounded to bf16 or f16 when the scale is stored that way.
 #[allow(clippy::too_many_arguments)]
 fn dequant_ct(
-    codes: &[i32],
+    codes: &[f32],
     shape: &[u64],
     scale: &[f32],
     scale_shape: &[u64],
@@ -1070,7 +1188,7 @@ fn dequant_ct(
     for r in 0..rows {
         for c in 0..cols {
             let at = pick(r, c);
-            let mut q = round(codes[r * cols + c] as f32);
+            let mut q = round(codes[r * cols + c]);
             if let Some(zero) = zero {
                 q = round(q - round(zero[at]));
             }
@@ -1167,8 +1285,12 @@ fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTen
         let Some(scales_member) = members.get(scales_name.as_str()) else {
             continue;
         };
-        let params = MlxParams::for_module(object, prefix, &top)?
-            .ok_or_else(|| msg(format!("{prefix} has scales but quantization.{prefix} is false")))?;
+        let params = match object.get(prefix) {
+            None => MlxParams::infer(&top, member, scales_member)
+                .map_err(|err| msg(format!("{prefix}: {err}")))?,
+            Some(_) => MlxParams::for_module(object, prefix, &top)?
+                .ok_or_else(|| msg(format!("{prefix} has scales but quantization.{prefix} is false")))?,
+        };
         let (bits, group) = (params.bits, params.group_size);
         let weight = read_u32(member)?;
         let scale_shape = scales_member.shape.clone();
@@ -1261,15 +1383,58 @@ impl MlxParams {
     /// filled from its mode's defaults, not from the top level.
     fn for_module(object: &Map<String, Value>, module: &str, top: &MlxParams) -> Result<Option<MlxParams>> {
         match object.get(module) {
-            None | Some(Value::Bool(true)) => Ok(Some(MlxParams {
+            Some(Value::Bool(true)) => Ok(Some(MlxParams {
                 mode: top.mode.clone(),
                 group_size: top.group_size,
                 bits: top.bits,
             })),
             Some(Value::Bool(false)) => Ok(None),
             Some(Value::Object(entry)) => Self::from_object(entry).map(Some),
-            Some(_) => Err(msg(format!("quantization.{module} is not true, false, or an object"))),
+            _ => Err(msg(format!("quantization.{module} is not true, false, or an object"))),
         }
+    }
+
+    /// MLX-016: mlx-lm's infer_quant_config for a module with scales and no
+    /// `quantization.<module>` entry. It needs the unquantized input width,
+    /// which the files do not hold, but bits * group_size = 32 * W / S does
+    /// not. uint8 scales name the mode by that product alone; for affine the
+    /// top-level values are used only when their product matches.
+    fn infer(top: &MlxParams, weight: &Member, scales: &Member) -> Result<MlxParams> {
+        let words = weight.shape.last().copied().unwrap_or(0);
+        let groups = scales.shape.last().copied().unwrap_or(0);
+        if groups == 0 || (words * 32) % groups != 0 {
+            return Err(msg("the weight and scales widths do not give bits * group_size (MLX-016)"));
+        }
+        let product = words * 32 / groups;
+        let params = if dtype::canonical_id(&scales.dtype)? == "uint8" {
+            let (mode, bits, group_size) = match product {
+                64 => ("nvfp4", 4, 16),
+                128 => ("mxfp4", 4, 32),
+                256 => ("mxfp8", 8, 32),
+                _ => return Err(msg(format!(
+                    "uint8 scales with bits * group_size {product} name no mode (MLX-016)"
+                ))),
+            };
+            MlxParams {
+                mode: mode.to_string(),
+                group_size,
+                bits,
+            }
+        } else {
+            if top.bits as u64 * top.group_size as u64 != product {
+                return Err(msg(format!(
+                    "no quantization entry, and the top-level bits {} and group_size {} do not give the stored bits * group_size {product} (MLX-016)",
+                    top.bits, top.group_size
+                )));
+            }
+            MlxParams {
+                mode: "affine".to_string(),
+                group_size: top.group_size,
+                bits: top.bits,
+            }
+        };
+        params.check()?;
+        Ok(params)
     }
 
     /// MLX-006 and MLX-008.
@@ -1714,19 +1879,20 @@ pub fn quant_main(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         QuantCommand::Run(request) => {
-            if request.quantize.is_some() {
-                quantize_file(&request)?;
+            let warnings = if request.quantize.is_some() {
+                quantize_file(&request)?
             } else {
-                for warning in run(&request)? {
-                    eprintln!("tensquant: {warning}");
-                }
+                run(&request)?
+            };
+            for warning in warnings {
+                eprintln!("tensquant: {warning}");
             }
             Ok(0)
         }
     }
 }
 
-fn quantize_file(request: &Request) -> Result<()> {
+fn quantize_file(request: &Request) -> Result<Vec<String>> {
     let kind = request.quantize.as_deref().unwrap_or("");
     let (block_type, file_type) = match kind {
         "q4_0" => (2, 2),
@@ -1740,6 +1906,7 @@ fn quantize_file(request: &Request) -> Result<()> {
     let resolved = archive::resolve_user_path(&request.source, request.force_single)?;
     let archive = archive::open(&resolved.path, None, DEFAULT_MAX_HEADER, None, None)?;
     let mut dense = Vec::new();
+    let mut warnings = Vec::new();
     let mut metadata = vec![
         ("general.quantization_version".into(), MetaValue::U32(2)),
         // llama_ftype MOSTLY_Q4_0 / MOSTLY_Q8_0 (gguf.yaml).
@@ -1761,8 +1928,7 @@ fn quantize_file(request: &Request) -> Result<()> {
             ));
         }
         let is_float = matches!(canonical, "float32" | "float16" | "bfloat16");
-        // gguf.yaml from_canonical: 1-D tensors and norms stay F32; matrices
-        // are quantized. Other element types are copied as they are.
+        // Other element types are copied as they are.
         if !is_float {
             let code = dtype::element_ggml_code(canonical).ok_or_else(|| {
                 msg(format!("{} dtype {canonical} has no GGUF type", member.name))
@@ -1776,15 +1942,24 @@ fn quantize_file(request: &Request) -> Result<()> {
             continue;
         }
         let tensor = member_f32(member)?;
-        let (ggml_type, payload) = if shape.len() < 2 {
+        let (ggml_type, payload) = if keeps_f32(&tensor.name, shape.len()) {
             (0, tensor.values.iter().flat_map(|value| value.to_le_bytes()).collect())
+        } else if ne[0] % 32 != 0 {
+            // GGUF-024 step 5: a tensor the quantizer cannot take falls back
+            // to F16.
+            warnings.push(format!(
+                "{} innermost size {} is not a multiple of 32; it is written F16 (GGUF-024)",
+                tensor.name, ne[0]
+            ));
+            (
+                1,
+                tensor
+                    .values
+                    .iter()
+                    .flat_map(|value| ggml_dequant::f32_to_f16(*value).to_le_bytes())
+                    .collect(),
+            )
         } else {
-            if ne[0] % 32 != 0 {
-                return Err(msg(format!(
-                    "{} innermost size {} is not a multiple of 32",
-                    tensor.name, ne[0]
-                )));
-            }
             let packed = if block_type == 2 {
                 ggml_dequant::quantize_q4_0(&tensor.values)?
             } else {
@@ -1799,7 +1974,44 @@ fn quantize_file(request: &Request) -> Result<()> {
             payload: Payload::Bytes(payload),
         });
     }
-    write_dense(&request.output, &metadata, &dense)
+    write_dense(&request.output, &metadata, &dense)?;
+    Ok(warnings)
+}
+
+/// GGUF-024 steps 2 and 3: the tensors convert_hf_to_gguf keeps F32. Rank
+/// 1 and below, `*_norm.weight`, every name that does not end in `.weight`,
+/// `.lora_a`, or `.lora_b`, and a fixed list of roles. The roles are matched
+/// by name whatever the architecture.
+fn keeps_f32(name: &str, rank: usize) -> bool {
+    const ROLES: &[&str] = &[
+        "ffn_gate_inp", "ffn_gate_inp_shexp", "position_embd", "token_types", "ssm_conv1d",
+        "shortconv.conv", "time_mix_first", "time_mix_w1", "time_mix_w2", "time_mix_decay_w1",
+        "time_mix_decay_w2", "time_mix_lerp_fused", "v.position_embd", "a.position_embd",
+        "altup_correct_coef", "altup_predict_coef", "ssm_conv1d_q", "ssm_conv1d_k", "ssm_conv1d_v",
+        "indexer.proj",
+    ];
+    if rank <= 1 || name.ends_with("_norm.weight") {
+        return true;
+    }
+    if ![".weight", ".lora_a", ".lora_b"].iter().any(|suffix| name.ends_with(suffix)) {
+        return true;
+    }
+    let Some(role) = name.strip_suffix(".weight") else {
+        return false;
+    };
+    let role = match role.strip_prefix("blk.") {
+        Some(rest) => match rest.split_once('.') {
+            Some((block, role)) if block.bytes().all(|byte| byte.is_ascii_digit()) => role,
+            _ => role,
+        },
+        None => role,
+    };
+    if let Some(rest) = role.strip_prefix("posnet.") {
+        if let Some((block, norm)) = rest.split_once('.') {
+            return block.bytes().all(|byte| byte.is_ascii_digit()) && (norm == "norm1" || norm == "norm2");
+        }
+    }
+    ROLES.contains(&role)
 }
 
 enum QuantCommand {
@@ -1940,6 +2152,19 @@ mod tests {
         // Output row 0 is [out=0, in=0..32]; in 0 and 1 are codes 1 and 2.
         assert!((values[0] - (1.0 - 1.0) * 2.0).abs() < 1e-6);
         assert!((values[1] - (2.0 - 1.0) * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quantize_keeps_the_gguf_024_tensors_f32() {
+        assert!(super::keeps_f32("blk.0.attn_norm.weight", 1));
+        assert!(super::keeps_f32("blk.0.ffn_gate_inp.weight", 2));
+        assert!(super::keeps_f32("blk.3.attn_k_norm.weight", 2));
+        assert!(super::keeps_f32("blk.0.attn_q.bias", 2));
+        assert!(super::keeps_f32("posnet.1.norm2.weight", 2));
+        assert!(super::keeps_f32("position_embd.weight", 2));
+        assert!(!super::keeps_f32("token_embd.weight", 2));
+        assert!(!super::keeps_f32("blk.0.attn_q.weight", 2));
+        assert!(!super::keeps_f32("blk.0.attn_q.lora_a", 2));
     }
 
     #[test]

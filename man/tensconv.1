@@ -33,9 +33,11 @@ and its shape is kept in the key
 Metadata is carried over.
 GGUF keys keep their types in GGUF and rawtensor output, and become
 .I gguf.<key>
-JSON strings in safetensors and ONNX.
+JSON envelopes in safetensors and ONNX, such as
+.IR {"type":"UINT32","value":4096} .
 Tokenizer arrays are left out of those string maps.
-String metadata becomes
+Converting back to GGUF restores those keys with their types.
+Other string metadata becomes
 .I <format>.metadata.<key>
 in GGUF.
 npy, npz, and PyTorch output have no metadata, and a warning says so.

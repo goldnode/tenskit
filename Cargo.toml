@@ -26,13 +26,14 @@ name = "tensquant"
 path = "src/tensquant.rs"
 
 [dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
 sha2 = "0.10"
 thiserror = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 tempfile = "3"

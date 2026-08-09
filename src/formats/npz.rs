@@ -65,6 +65,12 @@ pub fn read_entries(path: &Path) -> Result<(Vec<NpzEntry>, Vec<String>)> {
             continue;
         }
         let info = npy::read_info_from(Path::new(&name), &mut reader)?;
+        if info.native_order {
+            notes.push(format!(
+                "member {name} descr {} names the native byte order; it is read as little-endian (NPY-013)",
+                info.descr
+            ));
+        }
         let key = name.strip_suffix(".npy").unwrap_or(&name).to_string();
         if entries.iter().any(|entry| entry.key == key) {
             return Err(msg(format!(

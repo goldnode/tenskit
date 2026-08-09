@@ -38,16 +38,23 @@ GGML blocks use the transcribed dequantize formulas.
 Q8_1 is refused.
 GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored
 exllama layout.
-Zeros are incremented before the scale, and
+Zeros are incremented before the scale for
+.IR checkpoint_format " gptq"
+and used as stored for
+.IR gptq_v2 ,
+and
 .I g_idx
 selects the row.
 AWQ uses the gemm nibble order.
 bitsandbytes uses the NF4 or FP4 codebook.
-compressed-tensors unpacks pack-quantized codes and keeps the scale tensors.
+compressed-tensors takes each module's scheme from
+.I \%config_groups
+in file order and applies its scale and zero point.
 MLX uses
 .I \%quantization
 in
-.IR config.json .
+.IR config.json ,
+and infers the mode of a module with no entry.
 .PP
 GPTQ 3-bit, the marlin tile inverse, EXL2
 .RI ( EXL2\-Q1 ),
@@ -62,7 +69,7 @@ and
 .I q8_0
 and writes a GGUF file with those reference quantizers.
 K-quants and IQ types are not quantized.
-The innermost size must be a multiple of 32.
+A matrix whose innermost size is not a multiple of 32 is written F16.
 .SH OPTIONS
 Pass
 .B \-\-dequant
@@ -76,7 +83,18 @@ Write float32 from a transcribed pack.
 .BI \-\-quantize " q4_0|q8_0"
 Quantize float weights with the named reference quantizer.
 The output is GGUF.
-Matrices are quantized; 1-D tensors stay F32, and integer tensors are copied.
+Matrices are quantized.
+Tensors of rank 1 or below, names ending in
+.IR _norm.weight ,
+names that do not end in
+.IR .weight ,
+.IR .lora_a ,
+or
+.IR .lora_b ,
+and roles such as
+.I ffn_gate_inp
+stay F32.
+Integer tensors are copied.
 .TP
 .BR \-o ", " \-\-output " \fIfile\fR"
 Output path.

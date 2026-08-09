@@ -356,6 +356,9 @@ fn open_npy(path: &Path) -> Result<Archive> {
     if info.data_offset % 64 != 0 {
         notes.push("npy data is not 64-byte aligned (NPY-005); the array is still read".into());
     }
+    if info.native_order {
+        notes.push(format!("descr {} names the native byte order; it is read as little-endian (NPY-013)", info.descr));
+    }
     Ok(Archive {
         format: FormatName::Npy,
         version: format!("{}.{}", info.major, info.minor),

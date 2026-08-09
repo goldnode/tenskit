@@ -428,6 +428,13 @@ fn elem_min_size(elem: u32) -> Result<u64> {
     })
 }
 
+/// The type id for a gguf-py type name, in either case.
+pub fn gguf_type_id(name: &str) -> Option<u32> {
+    [TYPE_U8, TYPE_I8, TYPE_U16, TYPE_I16, TYPE_U32, TYPE_I32, TYPE_F32, TYPE_BOOL, TYPE_STRING, TYPE_ARRAY, TYPE_U64, TYPE_I64, TYPE_F64]
+        .into_iter()
+        .find(|id| gguf_type_name(*id).eq_ignore_ascii_case(name))
+}
+
 pub fn gguf_type_name(id: u32) -> &'static str {
     match id {
         TYPE_U8 => "uint8",
@@ -447,7 +454,7 @@ pub fn gguf_type_name(id: u32) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetaValue {
     U8(u8),
     I8(i8),
@@ -514,6 +521,83 @@ impl MetaValue {
     /// `elem`, 64-bit integers above 2^53 as decimal strings, and non-finite
     /// floats as "nan", "inf", "-inf".
     pub fn typed_value(&self) -> Value {
+        self.tagged(false)
+    }
+
+    /// The CONV-004 envelope for a string map: TypedValue with the upper-case
+    /// gguf-py type names. Floats are f64 shortest round trip (CONV-005).
+    pub fn envelope(&self) -> Value {
+        self.tagged(true)
+    }
+
+    /// The inverse of `typed_value` and `envelope` (either case), for the
+    /// types GGUF has; None for anything else, or a value that does not fit
+    /// its type.
+    pub fn from_typed(tagged: &Value) -> Option<MetaValue> {
+        let object = tagged.as_object()?;
+        let kind = gguf_type_id(object.get("type")?.as_str()?)?;
+        let value = object.get("value")?;
+        if kind == TYPE_ARRAY {
+            let elem = gguf_type_id(object.get("elem")?.as_str()?)?;
+            if elem == TYPE_ARRAY {
+                return None;
+            }
+            let values = value
+                .as_array()?
+                .iter()
+                .map(|item| Self::plain_from(elem, item))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(MetaValue::Array { elem, values });
+        }
+        Self::plain_from(kind, value)
+    }
+
+    fn plain_from(kind: u32, value: &Value) -> Option<MetaValue> {
+        let int = || -> Option<i128> {
+            match value {
+                Value::Number(n) => n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from)),
+                Value::String(text) => text.parse().ok(),
+                _ => None,
+            }
+        };
+        let float = || -> Option<f64> {
+            match value {
+                Value::Number(n) => n.as_f64(),
+                Value::String(text) => match text.as_str() {
+                    "nan" => Some(f64::NAN),
+                    "inf" => Some(f64::INFINITY),
+                    "-inf" => Some(f64::NEG_INFINITY),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        Some(match kind {
+            TYPE_U8 => MetaValue::U8(int()?.try_into().ok()?),
+            TYPE_I8 => MetaValue::I8(int()?.try_into().ok()?),
+            TYPE_U16 => MetaValue::U16(int()?.try_into().ok()?),
+            TYPE_I16 => MetaValue::I16(int()?.try_into().ok()?),
+            TYPE_U32 => MetaValue::U32(int()?.try_into().ok()?),
+            TYPE_I32 => MetaValue::I32(int()?.try_into().ok()?),
+            TYPE_U64 => MetaValue::U64(int()?.try_into().ok()?),
+            TYPE_I64 => MetaValue::I64(int()?.try_into().ok()?),
+            TYPE_F32 => MetaValue::F32(float()? as f32),
+            TYPE_F64 => MetaValue::F64(float()?),
+            TYPE_BOOL => MetaValue::Bool(value.as_bool()?),
+            TYPE_STRING => MetaValue::String(value.as_str()?.to_string()),
+            _ => return None,
+        })
+    }
+
+    fn tagged(&self, upper: bool) -> Value {
+        let name = |id: u32| {
+            let name = gguf_type_name(id);
+            if upper {
+                name.to_ascii_uppercase()
+            } else {
+                name.to_string()
+            }
+        };
         fn plain(value: &MetaValue) -> Value {
             const EXACT: u64 = 1 << 53;
             let float = |v: f64| {
@@ -536,12 +620,12 @@ impl MetaValue {
         }
         match self {
             Self::Array { elem, .. } => serde_json::json!({
-                "type": "array",
-                "elem": gguf_type_name(*elem),
+                "type": name(TYPE_ARRAY),
+                "elem": name(*elem),
                 "value": plain(self),
             }),
             other => serde_json::json!({
-                "type": gguf_type_name(other.type_id()),
+                "type": name(other.type_id()),
                 "value": plain(other),
             }),
         }

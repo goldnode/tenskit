@@ -23,6 +23,8 @@ pub struct NpyInfo {
     /// `>` descr of a multi-byte type: the bytes are byteswapped into the
     /// canonical little-endian order when read (npy.yaml to_canonical).
     pub big_endian: bool,
+    /// The descr says '=' and is read as '<' (NPY-013).
+    pub native_order: bool,
 }
 
 impl NpyInfo {
@@ -90,7 +92,10 @@ pub fn read_info_from(path: &Path, file: &mut (impl Read + Seek)) -> Result<NpyI
     let data_offset = file.stream_position()?;
     // A big-endian descr names the same dtype as its little-endian twin.
     let big_endian = descr.starts_with('>') && descr_itemsize(&descr).is_some_and(|size| size > 1);
-    let lookup = if big_endian {
+    // NPY-013: numpy never writes '=' (native). np.load reads it in the
+    // host's order, which is '<' on every little-endian host.
+    let native_order = descr.starts_with('=');
+    let lookup = if big_endian || native_order {
         format!("<{}", &descr[1..])
     } else {
         descr.clone()
@@ -124,6 +129,7 @@ pub fn read_info_from(path: &Path, file: &mut (impl Read + Seek)) -> Result<NpyI
         nbytes,
         dtype,
         big_endian: big_endian && dtype.is_some(),
+        native_order: native_order && dtype.is_some(),
     })
 }
 

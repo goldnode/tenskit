@@ -29,4 +29,4 @@ tenspile -x -f out.safetensors --format raw -o embed.rawtensor.json embed
 tenspile -x -f model.gguf --format raw -o weight.rawtensor.json weight
 ```
 
-One `--format raw` command writes one manifest. A GGUF quantized tensor is stored as its canonical block dtype and block bytes, without the GGUF alignment padding. A Fortran-order array is stored with `native.fortran_order` and is not transposed. Importing that tensor back into safetensors is refused.
+One `--format raw` command writes one manifest. A GGUF quantized tensor is stored as its canonical block dtype and block bytes, without the GGUF alignment padding. A Fortran-order array is refused, because rawtensor bytes are C order and tenspile does not transpose (RAW-009).

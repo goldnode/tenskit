@@ -721,7 +721,10 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .large_file(true);
-        // data/ records start on a 64-byte boundary, as .storage_alignment says.
+        // data/ records start on a 64-byte boundary, as .storage_alignment
+        // says. The zip library's layout is not torch's miniz layout, so
+        // .format_version is left out (PT-009): with it, torch can compute
+        // the record offsets itself and read the wrong bytes.
         let aligned = options.with_alignment(64);
         let put = |writer: &mut ZipWriter<File>, name: &str, bytes: &[u8]| -> Result<()> {
             writer
@@ -731,7 +734,6 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
             Ok(())
         };
         put(&mut writer, &format!("{stem}/data.pkl"), &pickle)?;
-        put(&mut writer, &format!("{stem}/.format_version"), b"1")?;
         put(&mut writer, &format!("{stem}/.storage_alignment"), b"64")?;
         put(&mut writer, &format!("{stem}/byteorder"), b"little")?;
         for (index, tensor) in tensors.iter().enumerate() {

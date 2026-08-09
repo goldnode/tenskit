@@ -608,9 +608,9 @@ fn single_encoding(cli: &Cli, path: Option<&Path>, member: &Member) -> Result<Fo
 }
 
 fn planned_export(archive: &Archive, member: &Member, pack: Pack) -> Result<Planned> {
-    if member.fortran && pack != Pack::Raw {
+    if member.fortran {
         return Err(msg(format!(
-            "member {} is fortran-order; tenspile does not transpose it. --format raw stores the bytes and records fortran_order",
+            "member {} is fortran-order; tenspile does not transpose it, and rawtensor bytes are C order (RAW-009)",
             member.name
         )));
     }

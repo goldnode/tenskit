@@ -887,15 +887,16 @@ fn write_target(
         #[cfg(format_gguf)]
         FormatName::Gguf => {
             let (mut metadata, dense) = gguf_out(tensors, hparams, rename)?;
-            let gguf_source = matches!(archive.inner, Inner::Gguf(_));
-            let prefix = format!("{}.metadata.", archive.format.as_str());
-            for (key, value) in source {
-                // A GGUF source keeps its typed keys. Other sources keep
-                // their string map under a private prefix (metadata-mapping
-                // safetensors_metadata_to_gguf).
-                let key = if gguf_source { key } else { format!("{prefix}{key}") };
-                if !metadata.iter().any(|(existing, _)| *existing == key) {
-                    metadata.push((key, value));
+            for (key, value) in gguf_metadata(archive, source, warnings) {
+                // Keys the writer computes win (CONV-007).
+                match metadata.iter().find(|(existing, _)| *existing == key) {
+                    Some((_, computed)) if *computed != value => warnings.push(format!(
+                        "{key} from the source was {} and is written as {} (CONV-007)",
+                        value.text(),
+                        computed.text()
+                    )),
+                    Some(_) => {}
+                    None => metadata.push((key, value)),
                 }
             }
             write_dense(path, &metadata, &dense)
@@ -917,10 +918,13 @@ fn write_target(
             let converted = raw_out(tensors)?;
             // raw-sidecar keeps every key with its type (metadata: "Converters
             // SHOULD copy source metadata keys verbatim").
-            let meta: Map<String, Value> = source
-                .iter()
-                .map(|(key, value)| (key.clone(), value.typed_value()))
-                .collect();
+            let meta: Map<String, Value> = match &archive.inner {
+                Inner::Raw(file) => file.metadata.clone(),
+                _ => source
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.typed_value()))
+                    .collect(),
+            };
             crate::formats::rawtensor::write_archive(path, &meta, &converted)
         }
     }
@@ -939,6 +943,20 @@ fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
             .map(|field| (field.key.clone(), field.value.clone()))
             .collect();
     }
+    #[cfg(format_raw_sidecar)]
+    if let Inner::Raw(file) = &archive.inner {
+        // TypedValue keeps its type where GGUF has one; bytes, json, and
+        // anything else go as the TypedValue text (CONV-008).
+        return file
+            .metadata
+            .iter()
+            .map(|(key, value)| {
+                let typed = MetaValue::from_typed(value)
+                    .unwrap_or_else(|| MetaValue::String(value.to_string()));
+                (key.clone(), typed)
+            })
+            .collect();
+    }
     archive
         .metadata
         .iter()
@@ -946,11 +964,57 @@ fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
         .collect()
 }
 
+/// `format.id` of the source's spec, the prefix of its keys in GGUF
+/// (CONV-008).
+fn format_id(format: FormatName) -> &'static str {
+    match format {
+        FormatName::Raw => "raw-sidecar",
+        other => other.as_str(),
+    }
+}
+
+/// Source metadata as GGUF KVs (conversion-considerations section 16). A
+/// GGUF source keeps its keys. A `gguf.<key>` envelope is restored as the
+/// typed `<key>` (CONV-007); one that does not parse stays a STRING under
+/// `<format id>.metadata.gguf.<key>`. Any other key goes under
+/// `<format id>.metadata.<key>` (CONV-008): as a STRING, or for
+/// raw-sidecar with its own type when GGUF has it.
+fn gguf_metadata(
+    archive: &Archive,
+    source: Vec<(String, MetaValue)>,
+    warnings: &mut Vec<String>,
+) -> Vec<(String, MetaValue)> {
+    if matches!(archive.inner, Inner::Gguf(_)) {
+        return source;
+    }
+    let prefix = format!("{}.metadata.", format_id(archive.format));
+    let mut out = Vec::new();
+    for (key, value) in source {
+        if let (Some(gguf_key), MetaValue::String(text)) = (key.strip_prefix("gguf."), &value) {
+            let restored = serde_json::from_str::<Value>(text)
+                .ok()
+                .as_ref()
+                .and_then(MetaValue::from_typed);
+            match restored {
+                Some(typed) => out.push((gguf_key.to_string(), typed)),
+                None => {
+                    warnings.push(format!(
+                        "{key} is not a typed GGUF envelope and is kept as {prefix}{key} (CONV-007)"
+                    ));
+                    out.push((format!("{prefix}{key}"), value));
+                }
+            }
+            continue;
+        }
+        out.push((format!("{prefix}{key}"), value));
+    }
+    out
+}
+
 /// Metadata for a string map (safetensors `__metadata__`, ONNX
-/// `metadata_props`). A GGUF key becomes `gguf.<key>` with its type tagged
-/// in JSON (metadata-mapping safetensors_metadata_to_gguf, reverse
-/// direction). Tokenizer arrays belong in tokenizer.json, not a header, so
-/// they are left out and named in a warning.
+/// `metadata_props`). A GGUF key becomes `gguf.<key>` with the CONV-004
+/// envelope. Tokenizer arrays belong in tokenizer.json, not a header, so
+/// they are left out and named in a warning (CONV-006).
 fn string_metadata(
     archive: &Archive,
     source: &[(String, MetaValue)],
@@ -967,11 +1031,7 @@ fn string_metadata(
             ));
             continue;
         }
-        let tagged = serde_json::json!({
-            "type": crate::formats::gguf::gguf_type_name(value.type_id()).to_ascii_uppercase(),
-            "value": value.json(),
-        });
-        out.push((format!("gguf.{key}"), tagged.to_string()));
+        out.push((format!("gguf.{key}"), value.envelope().to_string()));
     }
     out
 }
@@ -1721,5 +1781,60 @@ mod tests {
         let restored = crate::archive::open(&back, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         assert_eq!(restored.members[0].shape, vec![2, 3]);
         assert_eq!(restored.members[0].payload.read_vec().unwrap(), bytes);
+    }
+    #[cfg(all(format_safetensors, format_gguf))]
+    #[test]
+    fn gguf_metadata_survives_a_string_map() {
+        use crate::formats::gguf::{DenseTensor, MetaValue};
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.gguf");
+        let mid = dir.path().join("mid.safetensors");
+        let back = dir.path().join("back.gguf");
+        let metadata = vec![
+            ("demo.count".to_string(), MetaValue::U64(1 << 60)),
+            ("demo.eps".to_string(), MetaValue::F32(0.1)),
+            ("demo.ids".to_string(), MetaValue::Array { elem: 5, values: vec![] }),
+            ("tokenizer.ggml.tokens".to_string(), MetaValue::Array {
+                elem: 8,
+                values: vec![MetaValue::String("a".into())],
+            }),
+        ];
+        crate::formats::gguf::write_dense(
+            &src,
+            &metadata,
+            &[DenseTensor {
+                name: "w".into(),
+                ggml_type: 0,
+                ne: vec![2],
+                payload: Payload::Bytes(vec![0; 8]),
+            }],
+        )
+        .unwrap();
+        let request = |source: &Path, output: &Path| Request {
+            source: source.to_path_buf(),
+            output: output.to_path_buf(),
+            format: None,
+            rename: false,
+            names_only: false,
+            force_single: false,
+            force: false,
+        };
+        let warnings = run(&request(&src, &mid)).unwrap();
+        assert!(warnings.iter().any(|warning| warning.contains("tokenizer.ggml.tokens")));
+        // CONV-004 and CONV-005: upper-case tags, elem, big integers as text,
+        // f32 widened to the shortest f64.
+        let st = crate::formats::safetensors::read_file(&mid, DEFAULT_MAX_HEADER).unwrap();
+        let get = |key: &str| st.metadata.iter().find(|(name, _)| name == key).unwrap().1.clone();
+        assert_eq!(get("gguf.demo.count"), r#"{"type":"UINT64","value":"1152921504606846976"}"#);
+        assert_eq!(get("gguf.demo.eps"), r#"{"type":"FLOAT32","value":0.10000000149011612}"#);
+        assert_eq!(get("gguf.demo.ids"), r#"{"type":"ARRAY","elem":"INT32","value":[]}"#);
+        // CONV-007: the typed keys come back.
+        run(&request(&mid, &back)).unwrap();
+        let archive = crate::archive::open(&back, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let Inner::Gguf(file) = &archive.inner else { panic!() };
+        let find = |key: &str| file.metadata.iter().find(|field| field.key == key).map(|field| field.value.clone());
+        for (key, value) in &metadata[..3] {
+            assert_eq!(find(key).as_ref(), Some(value), "{key}");
+        }
     }
 }

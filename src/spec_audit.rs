@@ -534,7 +534,7 @@ fn awq_dequant_matches_the_reference() {
         serde_json::json!({"quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 64, "version": "GEMM"}}),
         "awq.weight",
         "small-awq.safetensors",
-        true,
+        false,
     );
 }
 
@@ -589,4 +589,147 @@ fn big_endian_npy_reads_as_canonical_little_endian() {
     let mut expect = 1.0f32.to_le_bytes().to_vec();
     expect.extend_from_slice(&2.0f32.to_le_bytes());
     assert_eq!(archive.members[0].payload.read_vec().unwrap(), expect);
+}
+
+#[test]
+fn compressed_tensors_asymmetric_dequant_matches_the_reference() {
+    // CT-006: the zero point is packed on dim 0.
+    check_dequant(
+        "small-ct-asym.safetensors",
+        serde_json::json!({"quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {"group_0": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 4, "type": "int", "symmetric": false, "strategy": "group", "group_size": 8}
+            }}
+        }}),
+        "ct.weight",
+        "small-ct-asym.safetensors ct.weight",
+        false,
+    );
+}
+
+#[test]
+fn bitsandbytes_nested_absmax_dequant_matches_the_reference() {
+    // BNB-004: compress_statistics=True.
+    check_dequant(
+        "small-bnb-nested.safetensors",
+        serde_json::json!({"quantization_config": {"quant_method": "bitsandbytes"}}),
+        "layer.weight",
+        "small-bnb-nested.safetensors layer.weight",
+        false,
+    );
+}
+
+#[test]
+fn gptq_v2_dequant_matches_the_reference() {
+    // GPTQ-008: v2 zeros are the true zero point.
+    check_dequant(
+        "small-gptq-v2.safetensors",
+        serde_json::json!({"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 32, "checkpoint_format": "gptq_v2"}}),
+        "gptq.weight",
+        "small-gptq-v2.safetensors",
+        false,
+    );
+}
+
+#[test]
+fn mlx_nvfp4_per_expert_dequant_matches_the_reference() {
+    // MLX-014: global_scale[e] belongs to expert e.
+    let name = "model.layers.0.mlp.switch_mlp.gate_proj.weight";
+    let entry = format!("small-mlx-nvfp4-experts.safetensors {name}");
+    let config = expected()["dequantized"][&entry]["config"].clone();
+    check_dequant("small-mlx-nvfp4-experts.safetensors", config, name, &entry, false);
+    // MLX-016: without the per-module entry the mode is inferred from the
+    // uint8 scales (bits * group_size = 32 * 4 / 2 = 64, nvfp4).
+    let inferred = serde_json::json!({"quantization": {"group_size": 64, "bits": 4}});
+    check_dequant("small-mlx-nvfp4-experts.safetensors", inferred, name, &entry, false);
+}
+
+#[test]
+fn gguf_orig_shape_restores_the_canonical_shape() {
+    // GGUF-023: an empty orig_shape is a scalar; [2, 3] stored as ne [6].
+    let path = vectors().join("edge/gguf-orig-shape.gguf");
+    let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let shapes: Vec<(&str, Vec<u64>)> = archive
+        .members
+        .iter()
+        .map(|member| (member.name.as_str(), member.shape.clone()))
+        .collect();
+    assert_eq!(shapes, vec![("s_f32", vec![]), ("v", vec![3, 2])]);
+    assert!(!archive.metadata.iter().any(|(key, _)| key.ends_with(".orig_shape")));
+}
+
+#[test]
+fn compressed_tensors_targets_follow_ct_009_to_ct_011() {
+    let modules: std::collections::BTreeSet<String> =
+        ["model", "model.layers", "model.layers.0", "model.layers.0.self_attn", "model.layers.0.self_attn.q_proj", "lm_head"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+    let scheme = |bits: u64| serde_json::json!({"num_bits": bits, "type": "int", "symmetric": true, "strategy": "channel"});
+    let quant = |groups: Value, ignore: Value| {
+        serde_json::json!({"config_groups": groups, "ignore": ignore}).as_object().unwrap().clone()
+    };
+    let mut warnings = Vec::new();
+    // CT-011: groups and alternation, anchored at the start only.
+    let schemes = crate::quant::CtSchemes::from_config(
+        &quant(
+            serde_json::json!({"group_0": {"targets": [r"re:.*self_attn\.(q|k|v|o)_proj"], "weights": scheme(4)}}),
+            serde_json::json!(["lm_head"]),
+        ),
+        &modules,
+        &mut warnings,
+    )
+    .unwrap();
+    assert!(schemes.scheme_for("model.layers.0.self_attn.q_proj", &|_| true).is_ok());
+    assert!(schemes.scheme_for("model.layers.0.mlp.up_proj", &|_| true).is_err());
+    assert!(warnings.is_empty());
+    // Lookahead is past what the regex crate compiles: refused, with the pattern.
+    let err = crate::quant::CtSchemes::from_config(
+        &quant(
+            serde_json::json!({"group_0": {"targets": [r"re:^(?!.*mtp\.).+$"], "weights": scheme(4)}}),
+            serde_json::json!([]),
+        ),
+        &modules,
+        &mut warnings,
+    )
+    .err()
+    .unwrap();
+    assert!(err.to_string().contains("CT-011") && err.to_string().contains("mtp"));
+    // CT-009: class targets of two schemes; only the tensors can decide.
+    let two = crate::quant::CtSchemes::from_config(
+        &quant(
+            serde_json::json!({
+                "group_0": {"targets": ["Linear"], "weights": scheme(4)},
+                "group_1": {"targets": ["MoELinear"], "weights": scheme(8)}
+            }),
+            serde_json::json!(["Embedding"]),
+        ),
+        &modules,
+        &mut warnings,
+    )
+    .unwrap();
+    assert!(warnings.iter().any(|warning| warning.contains("Embedding") && warning.contains("CT-009")));
+    let module = "model.layers.0.self_attn.q_proj";
+    assert!(two.scheme_for(module, &|_| true).is_err());
+    let eight = two
+        .scheme_for(module, &|scheme| scheme.num_bits == 8)
+        .unwrap();
+    assert_eq!(eight.num_bits, 8);
+}
+
+#[cfg(format_npy)]
+#[test]
+fn native_order_npy_reads_as_little_endian_with_a_note() {
+    // NPY-013: '=' is read as '<' and reported.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n.npy");
+    let mut bytes = crate::formats::npy::write_header("=f4", &[1]).unwrap();
+    bytes.extend_from_slice(&1.5f32.to_le_bytes());
+    fs::write(&path, &bytes).unwrap();
+    let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    assert!(archive.notes.iter().any(|note| note.contains("NPY-013")));
+    assert_eq!(archive.members[0].payload.read_vec().unwrap(), 1.5f32.to_le_bytes());
 }

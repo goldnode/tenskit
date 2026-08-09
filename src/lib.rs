@@ -13,7 +13,6 @@ mod gguf_names;
 mod io_util;
 mod listing;
 mod ops;
-mod pattern;
 mod payload;
 mod quant;
 mod sha256;
