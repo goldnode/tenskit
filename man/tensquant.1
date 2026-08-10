@@ -49,12 +49,15 @@ AWQ uses the gemm nibble order.
 bitsandbytes uses the NF4 or FP4 codebook.
 compressed-tensors takes each module's scheme from
 .I \%config_groups
-in file order and applies its scale and zero point.
+in file order, expands preset names, and applies the scale and zero point
+to pack-quantized or naive-quantized codes.
 MLX uses
 .I \%quantization
 in
 .IR config.json ,
-and infers the mode of a module with no entry.
+and infers the mode of a module with no entry, using the input width from
+.I config.json
+for LLaMA modules.
 .PP
 GPTQ 3-bit, the marlin tile inverse, EXL2
 .RI ( EXL2\-Q1 ),
@@ -94,6 +97,15 @@ or
 and roles such as
 .I ffn_gate_inp
 stay F32.
+Names that are not GGUF names are first resolved to their GGUF role through
+.I config.json
+.IR architectures[0] ;
+a name with no role is F32 only for rank 1 or a name not ending in
+.IR .weight ,
+and a warning lists it.
+The per-architecture
+.I tensor_force_quant
+overrides are not applied.
 Integer tensors are copied.
 .TP
 .BR \-o ", " \-\-output " \fIfile\fR"

@@ -779,12 +779,11 @@ fn dequant_compressed(
             continue;
         };
         let get = |suffix: &str| members.get(format!("{module}.{suffix}").as_str()).copied();
-        let (codes, shape, float_codes) = if packed {
-            let shape = weight_shape(archive, &member.name)?;
-            (Some(read_i32(member)?), shape, false)
+        let stored_dtype = dtype::canonical_id(&member.dtype)?;
+        let (codes, shape) = if packed {
+            (Some(read_i32(member)?), weight_shape(archive, &member.name)?)
         } else {
-            let float_codes = dtype::canonical_id(&member.dtype)? != "int8";
-            (None, member.shape.clone(), float_codes)
+            (None, member.shape.clone())
         };
         // The stored tensors can tell schemes apart that class targets cannot
         // (CT-009): the packed width follows num_bits, and only an asymmetric
@@ -795,7 +794,7 @@ fn dequant_compressed(
                     let cols = shape.last().copied().unwrap_or(0);
                     packed_shape.last().copied() == Some((cols * u64::from(scheme.num_bits)).div_ceil(32))
                 }
-                None => scheme.float == float_codes,
+                None => scheme.code_dtype().ok() == Some(stored_dtype),
             };
             width_fits && scheme.symmetric == get("weight_zero_point").is_none()
         };
@@ -814,7 +813,9 @@ fn dequant_compressed(
         let scale_dtype = dtype::canonical_id(&scale_member.dtype)?;
         let (scale, scale_shape) = read_f32(scale_member)?;
         let zero = match get("weight_zero_point") {
-            Some(zp) if !scheme.symmetric => Some(read_zero_point(zp, &scheme, &shape, &scale_shape)?),
+            Some(zp) if !scheme.symmetric && packed => Some(read_zero_point(zp, &scheme, &shape, &scale_shape)?),
+            // The naive formats store the zero point unpacked in zp_dtype.
+            Some(zp) if !scheme.symmetric => Some(stored_values(zp)?),
             Some(_) => {
                 return Err(msg(format!(
                     "{module} has a weight_zero_point but its scheme is symmetric"
@@ -848,23 +849,42 @@ fn dequant_compressed(
     Ok(out)
 }
 
-/// Codes of an int- or float-quantized weight, stored unpacked: int8 for an
-/// int scheme, an fp8 type for a float one.
+/// Codes of a naive-, int-, or float-quantized weight, stored unpacked in
+/// `QuantizationArgs.pytorch_dtype()` (compressed-tensors.yaml versions).
 fn stored_codes(member: &Member, scheme: &CtScheme) -> Result<Vec<f32>> {
     let canonical = dtype::canonical_id(&member.dtype)?;
-    let raw = member.payload.read_vec()?;
-    match (canonical, scheme.float) {
-        ("int8", false) => Ok(raw.iter().map(|byte| f32::from(*byte as i8)).collect()),
-        (_, true) => {
-            let format = dtype::MiniFloat::for_dtype(canonical)
-                .map_err(|_| msg(format!("{}: {canonical} is not a float-quantized weight type", member.name)))?;
-            Ok(raw.iter().map(|byte| format.decode(*byte)).collect())
-        }
-        _ => Err(msg(format!(
-            "{}: {canonical} does not hold the codes of its int scheme",
-            member.name
-        ))),
+    if canonical != scheme.code_dtype()? {
+        return Err(msg(format!(
+            "{}: {canonical} does not hold the codes of a {}-bit {} scheme",
+            member.name,
+            scheme.num_bits,
+            if scheme.float { "float" } else { "int" }
+        )));
     }
+    stored_values(member)
+}
+
+/// Values of an unpacked code or zero-point tensor: integers, float8, or
+/// the plain float types.
+fn stored_values(member: &Member) -> Result<Vec<f32>> {
+    let canonical = dtype::canonical_id(&member.dtype)?;
+    let raw = member.payload.read_vec()?;
+    Ok(match canonical {
+        "int8" => raw.iter().map(|byte| f32::from(*byte as i8)).collect(),
+        "int16" => raw
+            .chunks_exact(2)
+            .map(|chunk| f32::from(i16::from_le_bytes([chunk[0], chunk[1]])))
+            .collect(),
+        "int32" => raw
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()) as f32)
+            .collect(),
+        "float8_e4m3fn" => {
+            let format = dtype::MiniFloat::for_dtype(canonical)?;
+            raw.iter().map(|byte| format.decode(*byte)).collect()
+        }
+        _ => member_f32(member)?.values,
+    })
 }
 
 /// Every module path in the checkpoint: each dotted prefix of a tensor name.
@@ -881,14 +901,79 @@ fn module_paths(archive: &Archive) -> std::collections::BTreeSet<String> {
     paths
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) struct CtScheme {
     pub(crate) num_bits: u32,
-    float: bool,
-    symmetric: bool,
-    strategy: String,
-    group_size: usize,
+    pub(crate) float: bool,
+    pub(crate) symmetric: bool,
+    pub(crate) strategy: String,
+    pub(crate) group_size: usize,
     block: Option<(usize, usize)>,
+}
+
+impl CtScheme {
+    /// The stored dtype of a naive-format weight: int8, int16, or int32 by
+    /// num_bits for int, float8_e4m3fn for 8-bit float. Other float widths
+    /// raise NotImplementedError in the reference.
+    fn code_dtype(&self) -> Result<&'static str> {
+        Ok(match (self.float, self.num_bits) {
+            (false, 1..=8) => "int8",
+            (false, 9..=16) => "int16",
+            (false, _) => "int32",
+            (true, 8) => "float8_e4m3fn",
+            (true, bits) => {
+                return Err(msg(format!(
+                    "a {bits}-bit float scheme is not stored as a plain weight (compressed-tensors.yaml naive-quantized)"
+                )))
+            }
+        })
+    }
+
+    /// CT-012: the weights part of a preset scheme name.
+    fn preset(name: &str) -> Result<Option<CtScheme>> {
+        let upper = name.to_ascii_uppercase();
+        let scheme = |num_bits, float, symmetric, strategy: &str, group_size, block| CtScheme {
+            num_bits,
+            float,
+            symmetric,
+            strategy: strategy.to_string(),
+            group_size,
+            block,
+        };
+        let int_wnam = upper
+            .strip_prefix('W')
+            .and_then(|rest| rest.split_once('A'))
+            .and_then(|(weight, act)| {
+                let bits: u32 = weight.parse().ok()?;
+                let valid = match act {
+                    "16" => (2..=8).contains(&bits),
+                    "4" => (2..=4).contains(&bits),
+                    "8" => (2..=7).contains(&bits),
+                    _ => false,
+                };
+                valid.then_some(bits)
+            });
+        if let Some(bits) = int_wnam {
+            return Ok(Some(scheme(bits, false, true, "group", 128, None)));
+        }
+        Ok(Some(match upper.as_str() {
+            "UNQUANTIZED" => return Ok(None),
+            "W8A8" | "INT8" => scheme(8, false, true, "channel", 0, None),
+            "W4A16_ASYM" => scheme(4, false, false, "group", 128, None),
+            "W4AFP8" => scheme(4, false, true, "group", 128, None),
+            "FP8" => scheme(8, true, true, "tensor", 0, None),
+            "FP8_DYNAMIC" => scheme(8, true, true, "channel", 0, None),
+            "FP8_BLOCK" => scheme(8, true, true, "block", 0, Some((128, 128))),
+            "NVFP4" | "NVFP4A16" => scheme(4, true, true, "tensor_group", 16, None),
+            "MXFP4" | "MXFP4A16" => scheme(4, true, true, "group", 32, None),
+            "MXFP8" | "MXFP8A16" => scheme(8, true, true, "group", 32, None),
+            _ => {
+                return Err(msg(format!(
+                    "config_groups {name} is a target list under an unknown preset name (CT-012)"
+                )))
+            }
+        }))
+    }
 }
 
 pub(crate) enum CtTarget {
@@ -943,10 +1028,17 @@ impl CtSchemes {
         // serde_json keeps the file's key order (preserve_order), which is
         // the order CT-010 asks for.
         for (name, group) in groups {
-            if group.is_array() {
-                return Err(msg(format!(
-                    "config_groups {name} is a preset scheme name; preset_name_to_scheme is not in the spec, so it is refused (CT-010)"
-                )));
+            // CT-012: a target list under the key names a preset; a scheme
+            // object makes the key a label only.
+            if let Some(list) = group.as_array() {
+                let Some(scheme) = CtScheme::preset(name)? else {
+                    continue;
+                };
+                for target in list.iter().filter_map(Value::as_str) {
+                    targets.retain(|(existing, _)| existing.text() != target);
+                    targets.push((CtTarget::new(target, modules)?, scheme.clone()));
+                }
+                continue;
             }
             let weights = group
                 .get("weights")
@@ -955,8 +1047,8 @@ impl CtSchemes {
             let num_bits = weights
                 .get("num_bits")
                 .and_then(Value::as_u64)
-                .filter(|bits| (1..=8).contains(bits))
-                .ok_or_else(|| msg("compressed-tensors num_bits is not in 1..8 (CT-001)"))?
+                .filter(|bits| (1..=32).contains(bits))
+                .ok_or_else(|| msg("compressed-tensors num_bits is missing or not in 1..32"))?
                 as u32;
             let float = match weights.get("type").and_then(Value::as_str).unwrap_or("int") {
                 "int" => false,
@@ -1286,7 +1378,7 @@ fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTen
             continue;
         };
         let params = match object.get(prefix) {
-            None => MlxParams::infer(&top, member, scales_member)
+            None => MlxParams::infer(&top, member, scales_member, llama_input_width(config, prefix))
                 .map_err(|err| msg(format!("{prefix}: {err}")))?,
             Some(_) => MlxParams::for_module(object, prefix, &top)?
                 .ok_or_else(|| msg(format!("{prefix} has scales but quantization.{prefix} is false")))?,
@@ -1399,14 +1491,51 @@ impl MlxParams {
     /// which the files do not hold, but bits * group_size = 32 * W / S does
     /// not. uint8 scales name the mode by that product alone; for affine the
     /// top-level values are used only when their product matches.
-    fn infer(top: &MlxParams, weight: &Member, scales: &Member) -> Result<MlxParams> {
+    ///
+    /// With the input width K (MLX-017) the pair is computed as mlx-lm does:
+    /// group_size = K / S and bits = W * 32 / K.
+    fn infer(top: &MlxParams, weight: &Member, scales: &Member, width: Option<u64>) -> Result<MlxParams> {
         let words = weight.shape.last().copied().unwrap_or(0);
         let groups = scales.shape.last().copied().unwrap_or(0);
+        let uint8 = dtype::canonical_id(&scales.dtype)? == "uint8";
+        if let Some(k) = width {
+            let (group_size, bits) = match (k.checked_div(groups), (words * 32).checked_div(k)) {
+                (Some(group), Some(bits)) if group > 0 && bits > 0 && words * 32 / bits == groups * group => {
+                    (group as usize, bits as u32)
+                }
+                _ => {
+                    return Err(msg(format!(
+                        "input width {k} from config.json does not fit {words} weight words and {groups} scales (MLX-017, MLX-007)"
+                    )))
+                }
+            };
+            let mode = if !uint8 {
+                "affine"
+            } else {
+                match (bits, group_size) {
+                    (4, 16) => "nvfp4",
+                    (4, 32) => "mxfp4",
+                    (8, 32) => "mxfp8",
+                    _ => {
+                        return Err(msg(format!(
+                            "uint8 scales with bits {bits} and group_size {group_size} name no mode (MLX-016)"
+                        )))
+                    }
+                }
+            };
+            let params = MlxParams {
+                mode: mode.to_string(),
+                group_size,
+                bits,
+            };
+            params.check()?;
+            return Ok(params);
+        }
         if groups == 0 || (words * 32) % groups != 0 {
             return Err(msg("the weight and scales widths do not give bits * group_size (MLX-016)"));
         }
         let product = words * 32 / groups;
-        let params = if dtype::canonical_id(&scales.dtype)? == "uint8" {
+        let params = if uint8 {
             let (mode, bits, group_size) = match product {
                 64 => ("nvfp4", 4, 16),
                 128 => ("mxfp4", 4, 32),
@@ -1833,6 +1962,31 @@ fn mlx_config(config: Option<&Value>) -> Option<&Map<String, Value>> {
     }
 }
 
+/// MLX-017: the unquantized input width K of a LlamaModel module, from
+/// config.json (`text_config` merged over the top level). None for any
+/// other model_type or module, which keeps MLX-016's product rule.
+fn llama_input_width(config: Option<&Value>, module: &str) -> Option<u64> {
+    let map = crate::convert::merge_text_config(config?);
+    if map.get("model_type").and_then(Value::as_str) != Some("llama") {
+        return None;
+    }
+    let get = |key: &str| map.get(key).and_then(Value::as_u64).filter(|value| *value > 0);
+    let hidden = get("hidden_size")?;
+    let tail = |suffix: &str| module == suffix || module.ends_with(&format!(".{suffix}"));
+    if tail("embed_tokens") || tail("lm_head") || tail("self_attn.q_proj") || tail("self_attn.k_proj")
+        || tail("self_attn.v_proj") || tail("mlp.gate_proj") || tail("mlp.up_proj")
+    {
+        Some(hidden)
+    } else if tail("self_attn.o_proj") {
+        let heads = get("num_attention_heads")?;
+        Some(heads * get("head_dim").unwrap_or(hidden / heads))
+    } else if tail("mlp.down_proj") {
+        get("intermediate_size")
+    } else {
+        None
+    }
+}
+
 fn read_config(dir: &Path) -> Result<Option<Value>> {
     let path = dir.join("config.json");
     if !path.is_file() {
@@ -1905,6 +2059,8 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
     crate::io_util::refuse_existing(&request.output, request.force)?;
     let resolved = archive::resolve_user_path(&request.source, request.force_single)?;
     let archive = archive::open(&resolved.path, None, DEFAULT_MAX_HEADER, None, None)?;
+    let roles = F32Roles::new(&archive, read_config(resolved.path.parent().unwrap_or(Path::new(".")))?);
+    let mut unresolved = Vec::new();
     let mut dense = Vec::new();
     let mut warnings = Vec::new();
     let mut metadata = vec![
@@ -1942,7 +2098,7 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
             continue;
         }
         let tensor = member_f32(member)?;
-        let (ggml_type, payload) = if keeps_f32(&tensor.name, shape.len()) {
+        let (ggml_type, payload) = if roles.keeps_f32(&tensor.name, shape.len(), &mut unresolved) {
             (0, tensor.values.iter().flat_map(|value| value.to_le_bytes()).collect())
         } else if ne[0] % 32 != 0 {
             // GGUF-024 step 5: a tensor the quantizer cannot take falls back
@@ -1974,8 +2130,62 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
             payload: Payload::Bytes(payload),
         });
     }
+    if !unresolved.is_empty() {
+        warnings.insert(
+            0,
+            format!(
+                "{} resolve to no GGUF role{}; only rank and the .weight suffix decided F32 (GGUF-026): {}",
+                if unresolved.len() == 1 { "1 name does" } else { "these names do" },
+                roles.arch.as_deref().map_or(" (no known architecture)".to_string(), |arch| format!(" of {arch}")),
+                unresolved.join(", ")
+            ),
+        );
+    }
     write_dense(&request.output, &metadata, &dense)?;
     Ok(warnings)
+}
+
+/// GGUF-026: which tensors a quantizer that keeps the source names leaves
+/// F32. GGUF names go to GGUF-024 directly. Other names are resolved to
+/// their GGUF role for config.json's architecture first; a name with no
+/// role gets only the name-independent rules. The per-architecture
+/// tensor_force_quant overrides are not applied.
+struct F32Roles {
+    gguf: bool,
+    arch: Option<String>,
+    layers: Option<u64>,
+}
+
+impl F32Roles {
+    fn new(archive: &Archive, config: Option<Value>) -> F32Roles {
+        let gguf = archive.format == FormatName::Gguf;
+        let arch = config
+            .as_ref()
+            .and_then(crate::convert::hf_class)
+            .and_then(|class| crate::gguf_names::architecture_for_hf_class(&class));
+        let layers = config
+            .as_ref()
+            .map(crate::convert::merge_text_config)
+            .and_then(|map| crate::convert::language_layers(Some(&map)));
+        F32Roles { gguf, arch, layers }
+    }
+
+    fn keeps_f32(&self, name: &str, rank: usize, unresolved: &mut Vec<String>) -> bool {
+        if self.gguf {
+            return keeps_f32(name, rank);
+        }
+        let resolved = self
+            .arch
+            .as_deref()
+            .and_then(|arch| crate::gguf_names::map_tensor_name(arch, name, self.layers));
+        match resolved {
+            Some(gguf_name) => keeps_f32(&gguf_name, rank),
+            None => {
+                unresolved.push(name.to_string());
+                rank <= 1 || !name.ends_with(".weight")
+            }
+        }
+    }
 }
 
 /// GGUF-024 steps 2 and 3: the tensors convert_hf_to_gguf keeps F32. Rank
@@ -2110,12 +2320,15 @@ Usage:
 --dequant writes float32. GGML blocks use the dequantize snippets. Q8_1 is
 refused. GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored
 exllama layout. AWQ uses the gemm nibble order. bitsandbytes uses the NF4
-or FP4 codebook. compressed-tensors unpacks pack-quantized codes.
-MLX uses quantization in config.json.
+or FP4 codebook. compressed-tensors reads pack-quantized and naive-quantized
+codes. MLX uses quantization in config.json.
 GPTQ 3-bit, marlin, EXL2 (EXL2-Q1), and ModelOpt NVFP4 (CT-Q1) stop,
 because those inverses are not written out.
 --quantize q4_0 and --quantize q8_0 use the reference quantizers. K-quants
-and IQ types are not quantized. The result is not the original float.
+and IQ types are not quantized. Norms, 1-D tensors, and the GGUF-024 roles
+stay F32; names are resolved through config.json first (GGUF-026), and the
+per-architecture tensor_force_quant overrides are not applied. The result is
+not the original float.
 "
 }
 
@@ -2165,6 +2378,49 @@ mod tests {
         assert!(!super::keeps_f32("token_embd.weight", 2));
         assert!(!super::keeps_f32("blk.0.attn_q.weight", 2));
         assert!(!super::keeps_f32("blk.0.attn_q.lora_a", 2));
+    }
+
+    #[test]
+    fn quantize_resolves_hf_names_before_the_f32_rule() {
+        // GGUF-026: the Qwen2-MoE router gate is ffn_gate_inp, so it stays F32.
+        let config = serde_json::json!({"architectures": ["Qwen2MoeForCausalLM"], "num_hidden_layers": 2});
+        let roles = super::F32Roles::new(&super::empty_archive(), Some(config));
+        let mut unresolved = Vec::new();
+        assert!(roles.keeps_f32("model.layers.0.mlp.gate.weight", 2, &mut unresolved));
+        assert!(!roles.keeps_f32("model.layers.0.self_attn.q_proj.weight", 2, &mut unresolved));
+        assert!(roles.keeps_f32("model.layers.0.self_attn.q_proj.bias", 1, &mut unresolved));
+        assert!(unresolved.is_empty(), "{unresolved:?}");
+        // No role: only rank and the suffix decide, and the name is listed.
+        assert!(!roles.keeps_f32("extra.ffn_gate_inp.weight", 2, &mut unresolved));
+        assert!(roles.keeps_f32("extra.scale", 2, &mut unresolved));
+        assert_eq!(unresolved, ["extra.ffn_gate_inp.weight", "extra.scale"]);
+        // Without an architecture the GGUF role list is never matched.
+        let unknown = super::F32Roles::new(&super::empty_archive(), None);
+        assert!(!unknown.keeps_f32("model.layers.0.mlp.gate.weight", 2, &mut unresolved));
+    }
+
+    #[test]
+    fn mlx_takes_the_input_width_from_a_llama_config() {
+        // MLX-017: an 8-bit, group-32 override has the same product as the
+        // 4-bit, group-64 top level; only K tells them apart.
+        let config = serde_json::json!({"model_type": "llama", "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 128});
+        let module = "model.layers.0.self_attn.q_proj";
+        assert_eq!(super::llama_input_width(Some(&config), module), Some(64));
+        assert_eq!(super::llama_input_width(Some(&config), "model.layers.0.mlp.down_proj"), Some(128));
+        assert_eq!(super::llama_input_width(Some(&config), "model.layers.0.mlp.experts.0"), None);
+        let mut weight = named("w");
+        weight.dtype = "U32".into();
+        weight.shape = vec![8, 16];
+        let mut scales = named("s");
+        scales.dtype = "F16".into();
+        scales.shape = vec![8, 2];
+        let top = super::MlxParams { mode: "affine".into(), group_size: 64, bits: 4 };
+        let inferred = super::MlxParams::infer(&top, &weight, &scales, Some(64)).unwrap();
+        assert_eq!((inferred.bits, inferred.group_size), (8, 32));
+        let guessed = super::MlxParams::infer(&top, &weight, &scales, None).unwrap();
+        assert_eq!((guessed.bits, guessed.group_size), (4, 64));
+        // A width that does not fit the stored sizes is refused.
+        assert!(super::MlxParams::infer(&top, &weight, &scales, Some(48)).is_err());
     }
 
     #[test]

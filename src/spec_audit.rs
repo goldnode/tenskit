@@ -733,3 +733,62 @@ fn native_order_npy_reads_as_little_endian_with_a_note() {
     assert!(archive.notes.iter().any(|note| note.contains("NPY-013")));
     assert_eq!(archive.members[0].payload.read_vec().unwrap(), 1.5f32.to_le_bytes());
 }
+
+#[test]
+fn compressed_tensors_naive_formats_dequant_match_the_reference() {
+    // int-quantized: int8 codes, channel scale.
+    check_dequant(
+        "small-ct-int8.safetensors",
+        serde_json::json!({"quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "int-quantized",
+            "config_groups": {"group_0": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "int", "symmetric": true, "strategy": "channel"}
+            }}
+        }}),
+        "ct.weight",
+        "small-ct-int8.safetensors ct.weight",
+        false,
+    );
+    // float-quantized: float8_e4m3fn codes, block [4, 8] with partial edge
+    // blocks, here reached through the FP8_BLOCK-style preset fields.
+    check_dequant(
+        "small-ct-fp8-block.safetensors",
+        serde_json::json!({"quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "float-quantized",
+            "config_groups": {"FP8_BLOCK": {
+                "targets": ["Linear"],
+                "weights": {"num_bits": 8, "type": "float", "symmetric": true, "strategy": "block", "block_structure": [4, 8]}
+            }}
+        }}),
+        "ct.weight",
+        "small-ct-fp8-block.safetensors ct.weight",
+        false,
+    );
+}
+
+#[test]
+fn compressed_tensors_preset_names_expand_only_for_target_lists() {
+    // CT-012.
+    let modules: std::collections::BTreeSet<String> = ["layer"].iter().map(|path| path.to_string()).collect();
+    let mut warnings = Vec::new();
+    let config = |groups: Value| serde_json::json!({"config_groups": groups}).as_object().unwrap().clone();
+    let schemes = crate::quant::CtSchemes::from_config(
+        &config(serde_json::json!({"w4a16": ["Linear"], "fp8_dynamic": ["re:lm_head"], "UNQUANTIZED": ["re:skip"]})),
+        &modules,
+        &mut warnings,
+    )
+    .unwrap();
+    let group = schemes.scheme_for("layer", &|_| true).unwrap();
+    assert_eq!((group.num_bits, group.float, group.strategy.as_str(), group.group_size), (4, false, "group", 128));
+    let fp8 = schemes.scheme_for("lm_head", &|_| true).unwrap();
+    assert_eq!((fp8.num_bits, fp8.float, fp8.strategy.as_str()), (8, true, "channel"));
+    let unknown = crate::quant::CtSchemes::from_config(
+        &config(serde_json::json!({"W9A16": ["Linear"]})),
+        &modules,
+        &mut warnings,
+    );
+    assert!(unknown.err().unwrap().to_string().contains("CT-012"));
+}

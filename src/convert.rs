@@ -168,7 +168,7 @@ fn choose_architecture(archive: &Archive, config: Option<&Value>) -> Result<Stri
 /// `text_config.architectures[0]` when present, except for the top-level
 /// names llama.cpp keeps as they are (conversion-considerations.md section 6,
 /// "Choosing the converter class").
-fn hf_class(config: &Value) -> Option<String> {
+pub(crate) fn hf_class(config: &Value) -> Option<String> {
     const KEEP_TOP_LEVEL: &[&str] = &[
         "NEOChatModel",
         "StepVLForConditionalGeneration",
@@ -920,10 +920,7 @@ fn write_target(
             // SHOULD copy source metadata keys verbatim").
             let meta: Map<String, Value> = match &archive.inner {
                 Inner::Raw(file) => file.metadata.clone(),
-                _ => source
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.typed_value()))
-                    .collect(),
+                _ => raw_metadata(&source, warnings),
             };
             crate::formats::rawtensor::write_archive(path, &meta, &converted)
         }
@@ -945,14 +942,14 @@ fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
     }
     #[cfg(format_raw_sidecar)]
     if let Inner::Raw(file) = &archive.inner {
-        // TypedValue keeps its type where GGUF has one; bytes, json, and
-        // anything else go as the TypedValue text (CONV-008).
+        // TypedValue keeps its type where GGUF has one; bytes and json go
+        // as a STRING holding the CONV-004 envelope (CONV-008).
         return file
             .metadata
             .iter()
             .map(|(key, value)| {
                 let typed = MetaValue::from_typed(value)
-                    .unwrap_or_else(|| MetaValue::String(value.to_string()));
+                    .unwrap_or_else(|| MetaValue::String(retag(value, str::to_ascii_uppercase).to_string()));
                 (key.clone(), typed)
             })
             .collect();
@@ -962,6 +959,57 @@ fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
         .iter()
         .map(|(key, value)| (key.clone(), MetaValue::String(value.clone())))
         .collect()
+}
+
+#[cfg(format_raw_sidecar)]
+/// A TypedValue or envelope with `type` and `elem` spelled by `case`.
+fn retag(value: &Value, case: fn(&str) -> String) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        for field in ["type", "elem"] {
+            if let Some(Value::String(name)) = object.get_mut(field) {
+                *name = case(name);
+            }
+        }
+    }
+    value
+}
+
+/// Metadata for a rawtensor manifest from a typed source. Each key keeps
+/// its type. `raw-sidecar.metadata.<key>` goes back to `<key>` (CONV-007),
+/// and a STRING there holding an envelope becomes that TypedValue again,
+/// with T lower-cased. The lower-case spelling written before 2026-10-31
+/// is accepted with a warning (CONV-008).
+#[cfg(format_raw_sidecar)]
+fn raw_metadata(source: &[(String, MetaValue)], warnings: &mut Vec<String>) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (key, value) in source {
+        let Some(raw_key) = key.strip_prefix("raw-sidecar.metadata.") else {
+            out.insert(key.clone(), value.typed_value());
+            continue;
+        };
+        let envelope = match value {
+            MetaValue::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(|parsed| parsed.get("type").and_then(Value::as_str).is_some() && parsed.get("value").is_some()),
+            _ => None,
+        };
+        let typed = match envelope {
+            Some(parsed) => {
+                let tag = parsed["type"].as_str().unwrap_or_default();
+                if tag != tag.to_ascii_uppercase() {
+                    warnings.push(format!(
+                        "{key} has a lower-case envelope type {tag}; it is read as {} (CONV-008)",
+                        tag.to_ascii_uppercase()
+                    ));
+                }
+                retag(&parsed, str::to_ascii_lowercase)
+            }
+            None => value.typed_value(),
+        };
+        out.insert(raw_key.to_string(), typed);
+    }
+    out
 }
 
 /// `format.id` of the source's spec, the prefix of its keys in GGUF
@@ -1368,7 +1416,7 @@ fn read_config(dir: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-fn merge_text_config(config: &Value) -> Map<String, Value> {
+pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
     let mut merged = config.as_object().cloned().unwrap_or_default();
     if let Some(text) = config.get("text_config").and_then(Value::as_object) {
         for (key, value) in text {
@@ -1378,7 +1426,7 @@ fn merge_text_config(config: &Value) -> Map<String, Value> {
     merged
 }
 
-fn language_layers(hparams: Option<&Map<String, Value>>) -> Option<u64> {
+pub(crate) fn language_layers(hparams: Option<&Map<String, Value>>) -> Option<u64> {
     let map = hparams?;
     let hidden = hparam_u64(
         Some(map),
@@ -1836,5 +1884,53 @@ mod tests {
         for (key, value) in &metadata[..3] {
             assert_eq!(find(key).as_ref(), Some(value), "{key}");
         }
+    }
+    #[cfg(all(format_raw_sidecar, format_gguf))]
+    #[test]
+    fn raw_sidecar_metadata_round_trips_through_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.rawtensor.json");
+        let mid = dir.path().join("mid.gguf");
+        let back = dir.path().join("back.rawtensor.json");
+        let metadata: Map<String, Value> = serde_json::from_str(
+            r#"{"n": {"type": "uint32", "value": 7}, "blob": {"type": "bytes", "value": "AAE="}, "cfg": {"type": "json", "value": {"a": [1]}}}"#,
+        )
+        .unwrap();
+        crate::formats::rawtensor::write_archive(
+            &src,
+            &metadata,
+            &[crate::formats::rawtensor::OutTensor {
+                name: "w".into(),
+                canonical: "float32".into(),
+                shape: vec![2],
+                payload: Payload::Bytes(vec![0; 8]),
+                fortran: false,
+            }],
+        )
+        .unwrap();
+        let request = |source: &Path, output: &Path| Request {
+            source: source.to_path_buf(),
+            output: output.to_path_buf(),
+            format: None,
+            rename: false,
+            names_only: false,
+            force_single: false,
+            force: false,
+        };
+        run(&request(&src, &mid)).unwrap();
+        // CONV-008: GGUF types kept, bytes and json as upper-case envelopes.
+        let gguf = crate::archive::open(&mid, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let Inner::Gguf(file) = &gguf.inner else { panic!() };
+        let find = |key: &str| file.metadata.iter().find(|field| field.key == key).unwrap().value.clone();
+        assert_eq!(find("raw-sidecar.metadata.n"), MetaValue::U32(7));
+        assert_eq!(
+            find("raw-sidecar.metadata.blob"),
+            MetaValue::String(r#"{"type":"BYTES","value":"AAE="}"#.into())
+        );
+        // CONV-007: back in rawtensor, the prefix goes and T is lower-cased.
+        run(&request(&mid, &back)).unwrap();
+        let raw = crate::archive::open(&back, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let Inner::Raw(file) = &raw.inner else { panic!() };
+        assert_eq!(file.metadata, metadata);
     }
 }
