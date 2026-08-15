@@ -175,7 +175,7 @@ fn pack_note(name: &str, peers: &[&str]) -> Option<&'static str> {
         return Some(note);
     }
     #[cfg(format_compressed_tensors)]
-    if let Some(note) = crate::formats::compressed_tensors::detail(name) {
+    if let Some(note) = crate::formats::compressed_tensors::detail(name, peers) {
         return Some(note);
     }
     #[cfg(format_mlx)]

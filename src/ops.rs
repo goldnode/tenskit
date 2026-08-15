@@ -954,7 +954,45 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     ensure_parent(dest)?;
-    write_onnx(dest, &metadata, &planned)
+    // Initializers that still hold the stored bytes are copied as stored,
+    // and the rest of the model (graph nodes, inputs, outputs) is kept.
+    let unchanged = planned
+        .iter()
+        .filter(|item| {
+            archive
+                .members
+                .iter()
+                .any(|member| {
+                    member.name == item.name
+                        && member.dtype == item.dtype
+                        && member.shape == item.shape
+                        && same_payload(&member.payload, &item.payload)
+                })
+        })
+        .map(|item| item.name.clone())
+        .collect();
+    let tensors = planned
+        .iter()
+        .map(|item| crate::formats::onnx::OutTensor {
+            name: item.name.clone(),
+            dtype: item.dtype.clone(),
+            shape: item.shape.clone(),
+            payload: item.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    crate::formats::onnx::rewrite_archive(&archive.path, dest, &metadata, &tensors, &unchanged)
+}
+
+#[cfg(format_onnx)]
+fn same_payload(left: &Payload, right: &Payload) -> bool {
+    match (left, right) {
+        (
+            Payload::Range { path, offset, len },
+            Payload::Range { path: other_path, offset: other_offset, len: other_len },
+        ) => path == other_path && offset == other_offset && len == other_len,
+        (Payload::Bytes(left), Payload::Bytes(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[cfg(format_raw_sidecar)]

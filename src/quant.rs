@@ -41,6 +41,26 @@ pub(crate) struct FloatTensor {
     pub(crate) name: String,
     pub(crate) shape: Vec<u64>,
     pub(crate) values: Vec<f32>,
+    /// An integer or bool tensor copied as stored; `values` is then empty.
+    pub(crate) kept: Option<(dtype::SafeDtype, Payload)>,
+}
+
+/// A tensor that is not quantized data. Integer and bool tensors are
+/// copied unchanged, since float32 cannot hold every int32 or int64 value;
+/// float tensors are widened to float32.
+fn plain_tensor(archive: &Archive, member: &Member) -> Result<FloatTensor> {
+    let canonical = dtype::canonical_id(&member.dtype)?;
+    if matches!(dtype::canon_kind(canonical), Some("int" | "uint" | "bool")) {
+        return Ok(FloatTensor {
+            name: member.name.clone(),
+            shape: canonical_shape(archive, member),
+            values: Vec::new(),
+            kept: Some((dtype::safe_dtype(canonical)?, member.payload.clone())),
+        });
+    }
+    let mut tensor = member_f32(member)?;
+    tensor.shape = canonical_shape(archive, member);
+    Ok(tensor)
 }
 
 pub(crate) fn dequant_archive(
@@ -164,6 +184,14 @@ fn dequant_ggml(archive: &Archive) -> Result<Vec<FloatTensor>> {
             .iter()
             .find(|item| item.name == member.name)
             .ok_or_else(|| msg(format!("missing GGUF tensor {}", member.name)))?;
+        if dtype::canonical_id(&member.dtype)
+            .ok()
+            .and_then(dtype::canon_kind)
+            .is_some_and(|kind| matches!(kind, "int" | "uint" | "bool"))
+        {
+            out.push(plain_tensor(archive, member)?);
+            continue;
+        }
         let raw = member.payload.read_vec()?;
         let values = dequant_tensor(tensor.ggml_type, &raw)?;
         let mut shape = member.shape.clone();
@@ -177,6 +205,7 @@ fn dequant_ggml(archive: &Archive) -> Result<Vec<FloatTensor>> {
             )));
         }
         out.push(FloatTensor {
+            kept: None,
             name: member.name.clone(),
             shape,
             values,
@@ -219,7 +248,7 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
                     && matches!(*suffix, "qweight" | "qzeros" | "scales" | "g_idx" | "bias")
             });
         let Some((prefix, suffix)) = split else {
-            plain.push(member_f32(member)?);
+            plain.push(plain_tensor(archive, member)?);
             continue;
         };
         let slot = groups.entry(prefix.to_string()).or_default();
@@ -247,6 +276,7 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
         let out_features = qweight.1[1];
         let in_features = g_idx.len() as u64;
         out.push(FloatTensor {
+            kept: None,
             name: format!("{prefix}.weight"),
             shape: vec![out_features, in_features],
             values,
@@ -382,7 +412,7 @@ fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
             packed.contains(*prefix) && matches!(*suffix, "qweight" | "qzeros" | "scales" | "bias")
         });
         let Some((prefix, suffix)) = split else {
-            plain.push(member_f32(member)?);
+            plain.push(plain_tensor(archive, member)?);
             continue;
         };
         let slot = groups.entry(prefix.to_string()).or_default();
@@ -407,6 +437,7 @@ fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
         let in_f = qweight.1[0];
         let out_f = qweight.1[1] * 8;
         out.push(FloatTensor {
+            kept: None,
             name: format!("{prefix}.weight"),
             shape: vec![out_f, in_f],
             values,
@@ -556,6 +587,7 @@ fn dequant_bnb(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
         let values = dequant_4bit(&packed, &absmax, state.blocksize, table, &shape)
             .map_err(|err| msg(format!("{weight}: {err}")))?;
         out.push(FloatTensor {
+            kept: None,
             name: weight.to_string(),
             shape,
             values,
@@ -567,7 +599,7 @@ fn dequant_bnb(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
     }
     for member in &archive.members {
         if !used.contains(&member.name) {
-            out.push(member_f32(member)?);
+            out.push(plain_tensor(archive, member)?);
         }
     }
     Ok(out)
@@ -833,6 +865,7 @@ fn dequant_compressed(
         let values = dequant_ct(&codes, &shape, &scale, &scale_shape, zero.as_deref(), global.as_deref(), &scheme, scale_dtype)
             .map_err(|err| msg(format!("{module}: {err}")))?;
         out.push(FloatTensor {
+            kept: None,
             name: format!("{module}.weight"),
             shape,
             values,
@@ -843,7 +876,7 @@ fn dequant_compressed(
     }
     for member in &archive.members {
         if !used.contains(&member.name) {
-            out.push(member_f32(member)?);
+            out.push(plain_tensor(archive, member)?);
         }
     }
     Ok(out)
@@ -1409,6 +1442,7 @@ fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTen
         };
         let scale_cols = *scale_shape.last().unwrap_or(&1);
         out.push(FloatTensor {
+            kept: None,
             name: member.name.clone(),
             shape: {
                 let mut shape = scale_shape;
@@ -1424,7 +1458,7 @@ fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTen
     }
     for member in &archive.members {
         if !consumed.contains(&member.name) {
-            out.push(member_f32(member)?);
+            out.push(plain_tensor(archive, member)?);
         }
     }
     Ok(out)
@@ -1764,6 +1798,14 @@ fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result
     let owned: Vec<crate::formats::safetensors::OutTensor> = tensors
         .iter()
         .map(|tensor| {
+            if let Some((dtype, payload)) = &tensor.kept {
+                return crate::formats::safetensors::OutTensor {
+                    name: tensor.name.clone(),
+                    dtype: dtype.name.into(),
+                    shape: tensor.shape.clone(),
+                    bytes: payload.clone(),
+                };
+            }
             let bytes = tensor
                 .values
                 .iter()
@@ -1777,6 +1819,13 @@ fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result
             }
         })
         .collect();
+    let descr = |tensor: &crate::formats::safetensors::OutTensor| -> Result<String> {
+        let dtype = dtype::safe_dtype(&tensor.dtype)?;
+        dtype
+            .numpy
+            .map(str::to_string)
+            .ok_or_else(|| msg(format!("{} dtype {} has no NumPy descr", tensor.name, tensor.dtype)))
+    };
     match target {
         #[cfg(format_safetensors)]
         FormatName::Safetensors => crate::formats::safetensors::write_file(path, &[], &owned),
@@ -1786,7 +1835,7 @@ fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result
                 return Err(msg("an npy file holds one tensor"));
             }
             let tensor = &owned[0];
-            crate::formats::npy::write_file(path, "<f4", &tensor.shape, |file| {
+            crate::formats::npy::write_file(path, &descr(tensor)?, &tensor.shape, |file| {
                 tensor.bytes.copy_to(file)
             })
         }
@@ -1794,15 +1843,17 @@ fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result
         FormatName::Npz => {
             let members = owned
                 .iter()
-                .map(|tensor| crate::formats::npz::NpzMember {
-                    key: tensor.name.clone(),
-                    body: crate::formats::npz::NpzMemberBody::Rebuild {
-                        descr: "<f4".into(),
-                        shape: tensor.shape.clone(),
-                        payload: tensor.bytes.clone(),
-                    },
+                .map(|tensor| {
+                    Ok(crate::formats::npz::NpzMember {
+                        key: tensor.name.clone(),
+                        body: crate::formats::npz::NpzMemberBody::Rebuild {
+                            descr: descr(tensor)?,
+                            shape: tensor.shape.clone(),
+                            payload: tensor.bytes.clone(),
+                        },
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>>>()?;
             crate::formats::npz::write_archive(path, &members)
         }
         other => Err(msg(format!(
@@ -1816,11 +1867,7 @@ fn float_copy(archive: &Archive) -> Result<Vec<FloatTensor>> {
     archive
         .members
         .iter()
-        .map(|member| {
-            let mut tensor = member_f32(member)?;
-            tensor.shape = canonical_shape(archive, member);
-            Ok(tensor)
-        })
+        .map(|member| plain_tensor(archive, member))
         .collect()
 }
 
@@ -1857,6 +1904,7 @@ fn member_f32(member: &Member) -> Result<FloatTensor> {
         }
     };
     Ok(FloatTensor {
+        kept: None,
         name: member.name.clone(),
         shape: member.shape.clone(),
         values,
@@ -2104,7 +2152,7 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
             // GGUF-024 step 5: a tensor the quantizer cannot take falls back
             // to F16.
             warnings.push(format!(
-                "{} innermost size {} is not a multiple of 32; it is written F16 (GGUF-024)",
+                "{} innermost size {} is not a multiple of 32; it is written F16 (GGUF-027)",
                 tensor.name, ne[0]
             ));
             (
@@ -2134,8 +2182,8 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
         warnings.insert(
             0,
             format!(
-                "{} resolve to no GGUF role{}; only rank and the .weight suffix decided F32 (GGUF-026): {}",
-                if unresolved.len() == 1 { "1 name does" } else { "these names do" },
+                "{} to no GGUF role{}, so only rank and the .weight suffix decided F32 (GGUF-026): {}",
+                if unresolved.len() == 1 { "1 name resolves".to_string() } else { format!("{} names resolve", unresolved.len()) },
                 roles.arch.as_deref().map_or(" (no known architecture)".to_string(), |arch| format!(" of {arch}")),
                 unresolved.join(", ")
             ),

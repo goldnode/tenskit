@@ -792,3 +792,30 @@ fn compressed_tensors_preset_names_expand_only_for_target_lists() {
     );
     assert!(unknown.err().unwrap().to_string().contains("CT-012"));
 }
+
+#[cfg(all(format_gguf, format_npz))]
+#[test]
+fn dequant_copies_integer_tensors_unchanged() {
+    // float32 cannot hold every int32, so a plain integer tensor is copied.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.npz");
+    crate::quant::run(&crate::quant::Request {
+        source: vectors().join("small.gguf"),
+        output: out.clone(),
+        format: None,
+        quantize: None,
+        force_single: false,
+        force: false,
+    })
+    .unwrap();
+    let source = archive::open(&vectors().join("small.gguf"), None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let written = archive::open(&out, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let find = |archive: &crate::archive::Archive, name: &str| {
+        archive.members.iter().find(|member| member.name == name).unwrap().clone()
+    };
+    let (before, after) = (find(&source, "i_i32"), find(&written, "i_i32"));
+    assert_eq!(after.dtype, "I32");
+    assert_eq!(after.shape, vec![3, 2]);
+    assert_eq!(after.payload.read_vec().unwrap(), before.payload.read_vec().unwrap());
+    assert_eq!(find(&written, "w_q8_0").dtype, "F32");
+}

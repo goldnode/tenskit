@@ -536,38 +536,27 @@ pub struct OutTensor {
     pub payload: Payload,
 }
 
+/// A new model holding only initializers, as onnx.yaml `write` builds it:
+/// graph `weights`, one initializer and one graph output per tensor, and
+/// opset 21.
 pub fn write_archive(path: &Path, metadata: &[(String, String)], tensors: &[OutTensor]) -> Result<()> {
     if tensors.is_empty() {
         return Err(msg("writing an ONNX file with no initializers is not supported"));
     }
     crate::io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
     let mut initializers = Vec::new();
+    let mut outputs = Vec::new();
     let mut ir_version = 10;
     for tensor in tensors {
-        let canonical = dtype::canonical_id(&tensor.dtype)?;
-        let code = onnx_code(canonical)?;
+        let (body, code) = encode_tensor(tensor)?;
         ir_version = ir_version.max(min_ir(code));
-        let raw = tensor.payload.read_vec()?;
-        let expected = canonical_nbytes(canonical, &tensor.shape)?;
-        if raw.len() as u64 != expected {
-            return Err(msg(format!(
-                "tensor {} is {} bytes; {canonical} needs {expected}",
-                tensor.name,
-                raw.len()
-            )));
-        }
-        let mut body = Vec::new();
-        for dim in &tensor.shape {
-            varint_field(&mut body, 1, *dim);
-        }
-        varint_field(&mut body, 2, code);
-        bytes_field(&mut body, 8, tensor.name.as_bytes());
-        bytes_field(&mut body, 9, &raw);
         bytes_field(&mut initializers, 5, &body);
+        bytes_field(&mut outputs, 12, &value_info(tensor, code));
     }
     let mut graph = Vec::new();
     bytes_field(&mut graph, 2, b"weights");
     graph.extend_from_slice(&initializers);
+    graph.extend_from_slice(&outputs);
     let mut model = Vec::new();
     varint_field(&mut model, 1, ir_version);
     bytes_field(&mut model, 7, &graph);
@@ -575,21 +564,222 @@ pub fn write_archive(path: &Path, metadata: &[(String, String)], tensors: &[OutT
     bytes_field(&mut opset, 1, b"");
     varint_field(&mut opset, 2, 21);
     bytes_field(&mut model, 8, &opset);
-    for (key, value) in metadata {
-        let mut pair = Vec::new();
-        bytes_field(&mut pair, 1, key.as_bytes());
-        bytes_field(&mut pair, 2, value.as_bytes());
-        bytes_field(&mut model, 14, &pair);
+    model.extend_from_slice(&metadata_fields(metadata));
+    finish(path, &model)
+}
+
+/// Rewrite an existing model with a new set of initializers and metadata.
+/// Every other field is kept: graph nodes, inputs, outputs, opsets, and an
+/// initializer named in `unchanged` (with its typed fields or external data
+/// reference as stored). A removed initializer also leaves the graph
+/// outputs; one that a node still reads is refused.
+pub fn rewrite_archive(
+    source: &Path,
+    path: &Path,
+    metadata: &[(String, String)],
+    tensors: &[OutTensor],
+    unchanged: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if tensors.is_empty() {
+        return Err(msg("writing an ONNX file with no initializers is not supported"));
     }
+    crate::io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
+    let bytes = std::fs::read(source).map_err(|err| io_err(source, err))?;
+    let keep: std::collections::BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+    let original = initializer_names(&bytes)?;
+    let removed = |name: &str| !keep.contains(name) && original.contains(name);
+    let mut written = std::collections::BTreeSet::new();
+    let mut ir_version = 0;
+    let mut model = Vec::new();
+    let mut metadata_written = false;
+    for field in fields(&bytes, 0)? {
+        match field {
+            Field::Varint { id: 1, value } => ir_version = value,
+            Field::Bytes { id: 7, data, .. } => {
+                let mut graph = Vec::new();
+                for item in fields(data, 0)? {
+                    match item {
+                        Field::Bytes { id: 5, data, .. } => {
+                            let name = tensor_name(data)?;
+                            if !keep.contains(name.as_str()) {
+                                continue;
+                            }
+                            if unchanged.contains(&name) {
+                                bytes_field(&mut graph, 5, data);
+                            } else {
+                                let tensor = tensors.iter().find(|tensor| tensor.name == name).unwrap();
+                                let (body, code) = encode_tensor(tensor)?;
+                                ir_version = ir_version.max(min_ir(code));
+                                bytes_field(&mut graph, 5, &body);
+                            }
+                            written.insert(name);
+                        }
+                        Field::Bytes { id: 1, data, .. } => {
+                            for input in node_inputs(data)? {
+                                if removed(&input) {
+                                    return Err(msg(format!(
+                                        "initializer {input} is an input of a graph node; deleting it would break the model"
+                                    )));
+                                }
+                            }
+                            bytes_field(&mut graph, 1, data);
+                        }
+                        Field::Bytes { id: 12, data, .. } => {
+                            // A graph output naming a removed initializer goes too.
+                            if !removed(&value_info_name(data)?) {
+                                bytes_field(&mut graph, 12, data);
+                            }
+                        }
+                        other => copy_field(&mut graph, &other),
+                    }
+                }
+                for tensor in tensors.iter().filter(|tensor| !written.contains(&tensor.name)) {
+                    let (body, code) = encode_tensor(tensor)?;
+                    ir_version = ir_version.max(min_ir(code));
+                    bytes_field(&mut graph, 5, &body);
+                }
+                bytes_field(&mut model, 7, &graph);
+            }
+            Field::Bytes { id: 14, .. } => {
+                if !metadata_written {
+                    model.extend_from_slice(&metadata_fields(metadata));
+                    metadata_written = true;
+                }
+            }
+            other => copy_field(&mut model, &other),
+        }
+    }
+    if !metadata_written {
+        model.extend_from_slice(&metadata_fields(metadata));
+    }
+    let mut out = Vec::with_capacity(model.len() + 4);
+    varint_field(&mut out, 1, ir_version);
+    out.extend_from_slice(&model);
+    finish(path, &out)
+}
+
+fn finish(path: &Path, model: &[u8]) -> Result<()> {
     if model.len() as u64 >= 2 * 1024 * 1024 * 1024 {
         return Err(msg(
             "the ONNX model would be 2 GiB or more; tenspile does not write external data (ONNX-006)",
         ));
     }
     crate::io_util::atomic_write(path, |file: &mut File| {
-        file.write_all(&model)?;
+        file.write_all(model)?;
         Ok(())
     })
+}
+
+/// TensorProto with `raw_data`, and its ONNX data type code.
+fn encode_tensor(tensor: &OutTensor) -> Result<(Vec<u8>, u64)> {
+    let canonical = dtype::canonical_id(&tensor.dtype)?;
+    let code = onnx_code(canonical)?;
+    let raw = tensor.payload.read_vec()?;
+    let expected = canonical_nbytes(canonical, &tensor.shape)?;
+    if raw.len() as u64 != expected {
+        return Err(msg(format!(
+            "tensor {} is {} bytes; {canonical} needs {expected}",
+            tensor.name,
+            raw.len()
+        )));
+    }
+    let mut body = Vec::new();
+    for dim in &tensor.shape {
+        varint_field(&mut body, 1, *dim);
+    }
+    varint_field(&mut body, 2, code);
+    bytes_field(&mut body, 8, tensor.name.as_bytes());
+    bytes_field(&mut body, 9, &raw);
+    Ok((body, code))
+}
+
+/// ValueInfoProto for a graph output: name, and a tensor type with the
+/// element type and every dimension as `dim_value`.
+fn value_info(tensor: &OutTensor, code: u64) -> Vec<u8> {
+    let mut shape = Vec::new();
+    for dim in &tensor.shape {
+        let mut dimension = Vec::new();
+        varint_field(&mut dimension, 1, *dim);
+        bytes_field(&mut shape, 1, &dimension);
+    }
+    let mut tensor_type = Vec::new();
+    varint_field(&mut tensor_type, 1, code);
+    bytes_field(&mut tensor_type, 2, &shape);
+    let mut type_proto = Vec::new();
+    bytes_field(&mut type_proto, 1, &tensor_type);
+    let mut info = Vec::new();
+    bytes_field(&mut info, 1, tensor.name.as_bytes());
+    bytes_field(&mut info, 2, &type_proto);
+    info
+}
+
+fn metadata_fields(metadata: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, value) in metadata {
+        let mut pair = Vec::new();
+        bytes_field(&mut pair, 1, key.as_bytes());
+        bytes_field(&mut pair, 2, value.as_bytes());
+        bytes_field(&mut out, 14, &pair);
+    }
+    out
+}
+
+fn copy_field(out: &mut Vec<u8>, field: &Field) {
+    match field {
+        Field::Varint { id, value } => varint_field(out, *id, *value),
+        Field::Bytes { id, data, .. } => bytes_field(out, *id, data),
+        Field::Fixed { id, data } => {
+            let wire = if data.len() == 8 { 1 } else { 5 };
+            write_varint(out, (id << 3) | wire);
+            out.extend_from_slice(data);
+        }
+    }
+}
+
+fn text(data: &[u8]) -> Result<String> {
+    String::from_utf8(data.to_vec()).map_err(|_| msg("ONNX string is not utf-8"))
+}
+
+fn tensor_name(tensor: &[u8]) -> Result<String> {
+    for field in fields(tensor, 0)? {
+        if let Field::Bytes { id: 8, data, .. } = field {
+            return text(data);
+        }
+    }
+    Err(msg("ONNX initializer has no name"))
+}
+
+fn value_info_name(info: &[u8]) -> Result<String> {
+    for field in fields(info, 0)? {
+        if let Field::Bytes { id: 1, data, .. } = field {
+            return text(data);
+        }
+    }
+    Ok(String::new())
+}
+
+fn node_inputs(node: &[u8]) -> Result<Vec<String>> {
+    let mut inputs = Vec::new();
+    for field in fields(node, 0)? {
+        if let Field::Bytes { id: 1, data, .. } = field {
+            inputs.push(text(data)?);
+        }
+    }
+    Ok(inputs)
+}
+
+fn initializer_names(model: &[u8]) -> Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for field in fields(model, 0)? {
+        if let Field::Bytes { id: 7, data, .. } = field {
+            for item in fields(data, 0)? {
+                if let Field::Bytes { id: 5, data, .. } = item {
+                    names.insert(tensor_name(data)?);
+                }
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Lowest IR version that has a data type (onnx.yaml `versions`). The
@@ -659,5 +849,100 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
         if value == 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model with initializers `w` and `b`, a graph output for each, and an
+    /// Identity node that reads `w`.
+    fn model_with_node(path: &Path) {
+        let tensor = |name: &str| {
+            let mut body = Vec::new();
+            varint_field(&mut body, 1, 2);
+            varint_field(&mut body, 2, 1);
+            bytes_field(&mut body, 8, name.as_bytes());
+            bytes_field(&mut body, 9, &[0u8; 8]);
+            body
+        };
+        let mut node = Vec::new();
+        bytes_field(&mut node, 1, b"w");
+        bytes_field(&mut node, 2, b"y");
+        bytes_field(&mut node, 4, b"Identity");
+        let mut graph = Vec::new();
+        bytes_field(&mut graph, 1, &node);
+        bytes_field(&mut graph, 2, b"g");
+        for name in ["w", "b"] {
+            bytes_field(&mut graph, 5, &tensor(name));
+            let out = OutTensor {
+                name: name.into(),
+                dtype: "float32".into(),
+                shape: vec![2],
+                payload: Payload::Bytes(vec![0; 8]),
+            };
+            bytes_field(&mut graph, 12, &value_info(&out, 1));
+        }
+        let mut model = Vec::new();
+        varint_field(&mut model, 1, 9);
+        bytes_field(&mut model, 2, b"producer");
+        bytes_field(&mut model, 7, &graph);
+        std::fs::write(path, model).unwrap();
+    }
+
+    fn graph_fields(path: &Path) -> Vec<u64> {
+        let bytes = std::fs::read(path).unwrap();
+        let mut ids = Vec::new();
+        for field in fields(&bytes, 0).unwrap() {
+            if let Field::Bytes { id: 7, data, .. } = field {
+                for item in fields(data, 0).unwrap() {
+                    if let Field::Bytes { id, .. } | Field::Varint { id, .. } | Field::Fixed { id, .. } = item {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.onnx");
+        model_with_node(&path);
+        let archive = open(&path).unwrap();
+        let out = |names: &[&str]| -> Vec<OutTensor> {
+            archive
+                .members
+                .iter()
+                .filter(|member| names.contains(&member.name.as_str()))
+                .map(|member| OutTensor {
+                    name: member.name.clone(),
+                    dtype: member.dtype.clone(),
+                    shape: member.shape.clone(),
+                    payload: member.payload.clone(),
+                })
+                .collect()
+        };
+        let all: std::collections::BTreeSet<String> = ["w".to_string(), "b".to_string()].into();
+        // A metadata change keeps the node, both outputs, and the producer.
+        let edited = dir.path().join("meta.onnx");
+        rewrite_archive(&path, &edited, &[("k".into(), "v".into())], &out(&["w", "b"]), &all).unwrap();
+        assert_eq!(graph_fields(&edited), vec![1, 2, 5, 12, 5, 12]);
+        let reread = open(&edited).unwrap();
+        assert_eq!(reread.metadata, vec![("k".to_string(), "v".to_string())]);
+        assert!(std::fs::read(&edited).unwrap().windows(8).any(|window| window == b"producer"));
+        // Deleting b drops its initializer and its graph output.
+        let deleted = dir.path().join("del.onnx");
+        rewrite_archive(&path, &deleted, &[], &out(&["w"]), &all).unwrap();
+        assert_eq!(graph_fields(&deleted), vec![1, 2, 5, 12]);
+        // w feeds the node, so deleting it is refused.
+        let err = rewrite_archive(&path, &dir.path().join("x.onnx"), &[], &out(&["b"]), &all).unwrap_err();
+        assert!(err.to_string().contains("input of a graph node"), "{err}");
+        // A new file has one graph output per initializer (onnx.yaml write).
+        let fresh = dir.path().join("new.onnx");
+        write_archive(&fresh, &[], &out(&["w", "b"])).unwrap();
+        assert_eq!(graph_fields(&fresh), vec![2, 5, 5, 12, 12]);
     }
 }
