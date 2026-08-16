@@ -89,6 +89,20 @@ pub fn read_entries(path: &Path) -> Result<(Vec<NpzEntry>, Vec<String>)> {
     Ok((entries, notes))
 }
 
+/// Members that are not npy arrays (NPZ-007), in member-name order.
+pub fn blob_names(path: &Path) -> Result<Vec<String>> {
+    let (entries, _) = read_entries(path)?;
+    let file = File::open(path).map_err(|err| io_err(path, err))?;
+    let archive = ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter(|name| !name.ends_with('/') && !entries.iter().any(|entry| entry.zip_name == *name))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
 /// NPZ-004: declared member size checked before inflating.
 const MAX_MEMBER: u64 = 64 * 1024 * 1024 * 1024;
 
@@ -192,6 +206,9 @@ pub enum NpzMemberBody {
     WholeZip { path: PathBuf, entry: String },
     /// An `.npy` file copied in full.
     WholeFile(PathBuf),
+    /// A member of another `.npz` copied under its own name, header
+    /// included; used for members an edit leaves alone, arrays or not.
+    Verbatim { path: PathBuf, entry: String },
 }
 
 pub struct NpzMember {
@@ -217,8 +234,12 @@ pub fn write_archive(path: &Path, members: &[NpzMember]) -> Result<()> {
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .large_file(true);
+            let name = match &member.body {
+                NpzMemberBody::Verbatim { entry, .. } => entry.clone(),
+                _ => format!("{}.npy", member.key),
+            };
             writer
-                .start_file(format!("{}.npy", member.key), options)
+                .start_file(name, options)
                 .map_err(|err| msg(format!("npz: {err}")))?;
             match &member.body {
                 NpzMemberBody::Rebuild {
@@ -230,7 +251,7 @@ pub fn write_archive(path: &Path, members: &[NpzMember]) -> Result<()> {
                     writer.write_all(&header)?;
                     payload.copy_to(&mut writer)?;
                 }
-                NpzMemberBody::WholeZip { path, entry } => {
+                NpzMemberBody::WholeZip { path, entry } | NpzMemberBody::Verbatim { path, entry } => {
                     copy_whole_entry(path, entry, &mut writer)?;
                 }
                 NpzMemberBody::WholeFile(source) => {

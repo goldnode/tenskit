@@ -745,6 +745,14 @@ fn target_accepts(target: FormatName, canonical: &str) -> Result<bool> {
                 | "bool"
                 | "complex64"
                 | "complex128"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "float8_e4m3fn"
+                | "float8_e5m2"
+                | "float8_e4m3fnuz"
+                | "float8_e5m2fnuz"
+                | "float8_e8m0fnu"
         ),
         #[cfg(format_onnx)]
         FormatName::Onnx => matches!(

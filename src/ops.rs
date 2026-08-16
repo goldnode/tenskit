@@ -819,7 +819,7 @@ fn modify(cli: &Cli, mode: Modify) -> Result<()> {
         #[cfg(format_raw_sidecar)]
         Inner::Raw(_) => edit_raw(cli, &archive, mode, &dest),
         #[cfg(format_pytorch)]
-        Inner::Pytorch => edit_pytorch(cli, &archive, mode, &dest),
+        Inner::Pytorch { flat } => edit_pytorch(cli, &archive, mode, &dest, *flat),
         #[cfg(format_onnx)]
         Inner::Onnx => edit_onnx(cli, &archive, mode, &dest),
         _ => Err(msg("this format cannot be edited in this build")),
@@ -885,7 +885,33 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     ensure_parent(dest)?;
-    let members = planned.iter().map(npz_member).collect::<Result<Vec<_>>>()?;
+    // Arrays the edit leaves alone, and members that are not arrays, are
+    // copied as stored, header included.
+    let (entries, _) = npz::read_entries(&archive.path)?;
+    let mut members = Vec::with_capacity(planned.len());
+    for item in &planned {
+        let original = archive.members.iter().find(|member| member.name == item.name);
+        let entry = entries.iter().find(|entry| entry.key == item.name);
+        match (original, entry) {
+            (Some(member), Some(entry)) if same_payload(&member.payload, &item.payload) => members.push(NpzMember {
+                key: item.name.clone(),
+                body: NpzMemberBody::Verbatim {
+                    path: archive.path.clone(),
+                    entry: entry.zip_name.clone(),
+                },
+            }),
+            _ => members.push(npz_member(item)?),
+        }
+    }
+    for name in npz::blob_names(&archive.path)? {
+        members.push(NpzMember {
+            key: name.clone(),
+            body: NpzMemberBody::Verbatim {
+                path: archive.path.clone(),
+                entry: name,
+            },
+        });
+    }
     npz::write_archive(dest, &members)
 }
 
@@ -918,12 +944,18 @@ fn write_onnx(dest: &Path, metadata: &[(String, String)], incoming: &[Planned]) 
 }
 
 #[cfg(format_pytorch)]
-fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<()> {
+fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path, flat: bool) -> Result<()> {
     let updates = string_updates(cli)?;
     if !updates.is_empty() {
         return Err(msg(
             "a pytorch state_dict written here has no string metadata",
         ));
+    }
+    if !flat {
+        return Err(msg(format!(
+            "{} holds nested dicts or values that are not tensors, and tenspile writes a flat dict of tensors; a rewrite would drop them. Use tensconv to write a new state_dict on purpose",
+            archive.path.display()
+        )));
     }
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if planned.is_empty() {
@@ -983,7 +1015,7 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     crate::formats::onnx::rewrite_archive(&archive.path, dest, &metadata, &tensors, &unchanged)
 }
 
-#[cfg(format_onnx)]
+#[cfg(any(format_onnx, format_npz))]
 fn same_payload(left: &Payload, right: &Payload) -> bool {
     match (left, right) {
         (
@@ -991,6 +1023,10 @@ fn same_payload(left: &Payload, right: &Payload) -> bool {
             Payload::Range { path: other_path, offset: other_offset, len: other_len },
         ) => path == other_path && offset == other_offset && len == other_len,
         (Payload::Bytes(left), Payload::Bytes(right)) => left == right,
+        (
+            Payload::Zip { path, entry, skip, len },
+            Payload::Zip { path: other_path, entry: other_entry, skip: other_skip, len: other_len },
+        ) => path == other_path && entry == other_entry && skip == other_skip && len == other_len,
         _ => false,
     }
 }

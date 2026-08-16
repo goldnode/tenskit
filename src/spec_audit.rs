@@ -819,3 +819,32 @@ fn dequant_copies_integer_tensors_unchanged() {
     assert_eq!(after.payload.read_vec().unwrap(), before.payload.read_vec().unwrap());
     assert_eq!(find(&written, "w_q8_0").dtype, "F32");
 }
+
+#[cfg(format_npz)]
+#[test]
+fn an_npz_edit_keeps_members_it_does_not_touch() {
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pack.npz");
+    fs::copy(vectors().join("small.npz"), &path).unwrap();
+    {
+        let file = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut writer = zip::ZipWriter::new_append(file).unwrap();
+        writer.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.finish().unwrap();
+    }
+    let read_member = |path: &std::path::Path, name: &str| {
+        let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        archive.by_name(name).unwrap().read_to_end(&mut bytes).unwrap();
+        bytes
+    };
+    let original_bf16 = read_member(&path, "e_bf16.npy");
+    // e_bf16 is a <V2 array with no safetensors dtype; it is left alone.
+    crate::run(&["--delete".into(), "-f".into(), path.display().to_string(), "s_f32".into()]).unwrap();
+    assert_eq!(read_member(&path, "e_bf16.npy"), original_bf16);
+    assert_eq!(read_member(&path, "readme.txt"), b"hello");
+    let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    assert!(!archive.members.iter().any(|member| member.name == "s_f32"));
+}
