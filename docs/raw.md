@@ -12,7 +12,7 @@ tenspile -i -f embed.rawtensor.json
 tenspile -tvf embed.rawtensor.json
 ```
 
-The manifest records `dtype: float32`. The bytes are in `embed.bin`, aligned to 64. Several tensors share that one `.bin`, with zero padding between them. Append, update, and delete rewrite the manifest and the `.bin`. String metadata is stored as a typed string value. Keys that start with `rawtensor.` are reserved.
+The manifest records `dtype: float32`. The bytes are in `embed.bin`, aligned to 64. Several tensors share that one `.bin`, with zero padding between them. Append, update, and delete rewrite the manifest and the `.bin`. The manifest's `source` object, and the `attrs`, `native`, and `sha256` fields of each tensor the edit leaves alone, are kept. String metadata is stored as a typed string value. Keys that start with `rawtensor.` are reserved.
 
 ```
 tenspile -r -f embed.rawtensor.json --dtype F32 --shape 2 norm=norm.bin

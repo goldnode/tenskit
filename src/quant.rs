@@ -2365,11 +2365,13 @@ Usage:
   tensquant --dequant -o OUT [--format NAME] [--force] [--force-single-file] SRC
   tensquant --quantize q4_0|q8_0 -o OUT.gguf [--force] [--force-single-file] SRC
 
---dequant writes float32. GGML blocks use the dequantize snippets. Q8_1 is
-refused. GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored
-exllama layout. AWQ uses the gemm nibble order. bitsandbytes uses the NF4
-or FP4 codebook. compressed-tensors reads pack-quantized and naive-quantized
-codes. MLX uses quantization in config.json.
+--dequant writes quantized and float tensors as float32 and copies integer
+tensors. GGML blocks use the dequantize snippets. Q8_1 is refused. GPTQ uses
+the 2, 4, and 8 bit cuda pack, which is also the stored exllama layout. AWQ
+uses the gemm nibble order. bitsandbytes uses the NF4 or FP4 codebook.
+compressed-tensors reads pack-quantized and naive-quantized codes. MLX uses
+quantization in config.json. A pack needs the model's config.json: pass the
+directory.
 GPTQ 3-bit, marlin, EXL2 (EXL2-Q1), and ModelOpt NVFP4 (CT-Q1) stop,
 because those inverses are not written out.
 --quantize q4_0 and --quantize q8_0 use the reference quantizers. K-quants
@@ -2377,6 +2379,11 @@ and IQ types are not quantized. Norms, 1-D tensors, and the GGUF-024 roles
 stay F32; names are resolved through config.json first (GGUF-026), and the
 per-architecture tensor_force_quant overrides are not applied. The result is
 not the original float.
+
+Examples:
+  tensquant --dequant -o model-f32.safetensors model.gguf
+  tensquant --dequant -o model-f32.safetensors model/
+  tensquant --quantize q8_0 -o model-q8.gguf model/
 "
 }
 

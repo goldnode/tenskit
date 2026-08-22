@@ -18,7 +18,19 @@ The layout and type table are [gguf.yaml](../tensdataspecs_readonly/specs/format
 
 ## List and info
 
-Shapes on `-t` and `-i` are ggml `ne[]`: `ne[0]` is the innermost axis. A note says that a conversion reverses them. `bytes` is the span from this tensor's offset to the next tensor, padding included. A quantized tensor says `quantized span includes alignment padding` in `detail`.
+Shapes on `-t` and `-i` are ggml `ne[]`: `ne[0]` is the innermost axis. A note says that a conversion reverses them. `bytes` is the tensor's own length, from its type and shape. When alignment padding follows a tensor, `detail` says how many bytes, for example `16 bytes of alignment padding follow the tensor`.
+
+```
+$ tenspile -t --columns -f small.gguf
+name    dtype  shape    bytes  offset  params  detail
+w_f32   F32    [64, 4]  1 KiB     384     256
+b_f16   F16    [8]       16 B    1408       8  16 bytes of alignment padding follow the tensor
+i_i32   I32    [2, 3]    24 B    1440       6  8 bytes of alignment padding follow the tensor
+e_bf16  BF16   [3, 2]    12 B    1472       6  20 bytes of alignment padding follow the tensor
+w_q8_0  Q8_0   [64, 4]  272 B    1504     256  16 bytes of alignment padding follow the tensor
+```
+
+A key `<name>.orig_shape` restores a shape that GGUF cannot store, such as a scalar written as `ne = [1]`, and is not listed as metadata (GGUF-023).
 
 ## Extract
 
@@ -39,6 +51,21 @@ tenspile -cf copied.safetensors weight=model.gguf:weight
 ```
 tenspile -u -f model.gguf --metadata general.name=renamed
 tenspile -u -f model.gguf --metadata-file meta.json
+tenspile -u -f model.gguf -o renamed.gguf --metadata general.name=renamed
 ```
 
-`--metadata` writes a string. Other values are a JSON object with `type` and `value`. Types: `uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `uint64`, `int64`, `float32`, `float64`, `bool`, `string`, `array`. An array is one level deep. `general.alignment` has to be a power of two and at least 8. A missing key means 32.
+`-o` writes a new file and leaves the original alone.
+
+`--metadata` writes a string. In `--metadata-file`, each value is a JSON object with `type` and `value`. Types: `uint8`, `int8`, `uint16`, `int16`, `uint32`, `int32`, `uint64`, `int64`, `float32`, `float64`, `bool`, `string`, `array`. An array also needs `elem`, its element type, and is one level deep. `general.alignment` has to be a power of two and at least 8. A missing key means 32. A file such as `meta.json`:
+
+```json
+{
+  "general.name": {"type": "string", "value": "demo"},
+  "llama.context_length": {"type": "uint32", "value": 4096},
+  "llama.rope.freq_base": {"type": "float32", "value": 10000.0},
+  "tokenizer.ggml.add_bos_token": {"type": "bool", "value": true},
+  "demo.ids": {"type": "array", "elem": "int32", "value": [1, 2]}
+}
+```
+
+Converting to and from GGUF, and carrying its metadata into other formats, is [tensconv](tensconv.md). Dequantizing its blocks is [tensquant](tensquant.md).

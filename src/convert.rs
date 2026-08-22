@@ -1229,6 +1229,7 @@ fn raw_out(tensors: &[Tensor]) -> Result<Vec<crate::formats::rawtensor::OutTenso
             shape: tensor.shape.clone(),
             payload: tensor.bytes.clone(),
             fortran: false,
+            extra: Map::new(),
         })
         .collect())
 }
@@ -1747,6 +1748,11 @@ general.architecture, or config.json architectures[0]. Value changes
 run for a complete converter record, for the LLaMA Q/K permutation,
 and for the Qwen3.5 changes. --names-only renames and skips those
 changes. Quantized tensors are left for tensquant.
+
+Examples:
+  tensconv -o model.gguf model.safetensors
+  tensconv --rename -o model.gguf model/
+  tensconv -o weights.npz model.gguf
 "
 }
 
@@ -1913,6 +1919,7 @@ mod tests {
                 shape: vec![2],
                 payload: Payload::Bytes(vec![0; 8]),
                 fortran: false,
+                extra: Map::new(),
             }],
         )
         .unwrap();

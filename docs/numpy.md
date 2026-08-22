@@ -34,7 +34,7 @@ tenspile -u -f pack.npz embed=embed.npy
 tenspile --delete -f pack.npz norm
 ```
 
-`version: zip` is tenspile's label. Each entry is written as `{key}.npy` with zip method stored. A deflate entry still lists, and `-v` puts `zip deflate` in `detail`. A member is an array when it starts with the npy magic; any other member is skipped with a note (NPZ-007). The key is the member name with one `.npy` removed, and a `/` in it is kept. Two members with the same key are refused (NPZ-006). An empty archive lists with no arrays (NPZ-005). A ZIP with neither `.npy` members nor a PyTorch `data.pkl` is not a tensor file. The last array cannot be removed. `--metadata` stops with `npz files have no string metadata`.
+`version: zip` is tenspile's label. Each entry is written as `{key}.npy` with zip method stored. A deflate entry still lists, and `-v` puts `zip deflate` in `detail`. A member is an array when it starts with the npy magic; any other member is skipped with a note (NPZ-007). The key is the member name with one `.npy` removed, and a `/` in it is kept. Two members with the same key are refused (NPZ-006). An empty archive lists with no arrays (NPZ-005). A ZIP with neither `.npy` members nor a PyTorch `data.pkl` is not a tensor file. An edit copies every member it does not change as stored, header included, so an array with a descr that has no safetensors type (such as `<V2`) and a member that is not an array both survive. The last array cannot be removed. `--metadata` stops with `npz files have no string metadata`.
 
 `offset` on `-v` is the file offset of a stored entry's array data, and 0 for a deflated entry. `data_bytes` is the sum of the arrays.
 

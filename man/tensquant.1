@@ -1,4 +1,4 @@
-.TH TENSQUANT 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.TH TENSQUANT 1 "31 October 2026" "tenspile 0.1.0" "User Commands"
 .SH NAME
 tensquant \- dequantize a pack, or quantize with Q4_0 or Q8_0
 .SH SYNOPSIS
@@ -33,7 +33,9 @@ An existing output file is left in place unless
 is set.
 .PP
 .B \-\-dequant
-writes float32.
+writes quantized and float tensors as float32, shaped
+.IR "[out_features, in_features]" ,
+and copies integer and bool tensors unchanged.
 GGML blocks use the transcribed dequantize formulas.
 Q8_1 is refused.
 GPTQ uses the 2, 4, and 8 bit cuda pack, which is also the stored
@@ -148,10 +150,48 @@ An error.
 The message is written to stderr and starts with
 .BR "\%tensquant: " .
 .SH EXAMPLES
-.nf
-.B tensquant \-\-dequant \-o model.safetensors model.gguf
-.B tensquant \-\-quantize q8_0 \-o model.gguf weights.safetensors
-.fi
+.PP
+Dequantize a GGUF file to float32 safetensors:
+.RS
+.EX
+tensquant \-\-dequant \-o model\-f32.safetensors model.gguf
+.EE
+.RE
+.PP
+Dequantize a GPTQ, AWQ, compressed-tensors, or MLX model; pass the directory so config.json is read:
+.RS
+.EX
+tensquant \-\-dequant \-o model\-f32.safetensors model/
+.EE
+.RE
+.PP
+Dequantize into one .npz archive:
+.RS
+.EX
+tensquant \-\-dequant \-o weights.npz model/
+.EE
+.RE
+.PP
+Quantize a model to Q8_0 GGUF:
+.RS
+.EX
+tensquant \-\-quantize q8_0 \-o model\-q8.gguf model/
+.EE
+.RE
+.SH FILES
+.TP
+.I config.json
+Beside the source file or in the source directory.
+.B \-\-dequant
+reads
+.I \%quantization_config
+(GPTQ, AWQ, bitsandbytes, compressed-tensors) or
+.I quantization
+(MLX) from it, and
+.B \-\-quantize
+reads
+.I \%architectures[0]
+to resolve tensor roles.
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO

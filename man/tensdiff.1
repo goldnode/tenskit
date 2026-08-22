@@ -1,4 +1,4 @@
-.TH TENSDIFF 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.TH TENSDIFF 1 "31 October 2026" "tenspile 0.1.0" "User Commands"
 .SH NAME
 tensdiff \- compare two tensor containers
 .SH SYNOPSIS
@@ -112,21 +112,49 @@ Show the version.
 .SH EXIT STATUS
 .TP
 .B 0
-The names, types, shapes, values, and metadata match.
+The format, names, types, shapes, values, and metadata match.
 .TP
 .B 1
 A difference was printed.
+A different container format counts, so a file and its conversion exit 1
+even when every tensor matches; the report then has only its
+.I format:
+line.
 .TP
 .B 2
 A file could not be read, or the command line was not valid.
 The message is written to stderr and starts with
 .BR "\%tensdiff: " .
 .SH EXAMPLES
-.nf
-.B tensdiff left.safetensors right.gguf
-.B tensdiff \-\-match\-names model.safetensors model.gguf
-.B tensdiff \-\-fold left.gguf right.safetensors
-.fi
+.PP
+Compare two files of any formats:
+.RS
+.EX
+tensdiff before.safetensors after.safetensors
+.EE
+.RE
+.PP
+Check a conversion: only the format line is printed when every tensor matches.
+.RS
+.EX
+tensconv \-o model.pt model.safetensors
+tensdiff model.safetensors model.pt
+.EE
+.RE
+.PP
+Compare a Hugging Face checkpoint with its GGUF conversion, pairing the names and folding the layers:
+.RS
+.EX
+tensdiff \-\-match\-names \-\-fold model/ model.gguf
+.EE
+.RE
+.PP
+Get the findings as JSON:
+.RS
+.EX
+tensdiff \-\-json left.npz right.npz
+.EE
+.RE
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO

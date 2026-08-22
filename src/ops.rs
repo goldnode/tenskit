@@ -1015,7 +1015,7 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     crate::formats::onnx::rewrite_archive(&archive.path, dest, &metadata, &tensors, &unchanged)
 }
 
-#[cfg(any(format_onnx, format_npz))]
+#[cfg(any(format_onnx, format_npz, format_raw_sidecar))]
 fn same_payload(left: &Payload, right: &Payload) -> bool {
     match (left, right) {
         (
@@ -1076,16 +1076,26 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     let tensors = planned
         .iter()
         .map(|item| {
-            crate::formats::rawtensor::to_out(
+            let mut out = crate::formats::rawtensor::to_out(
                 &item.name,
                 &item.dtype,
                 &item.shape,
                 &item.payload,
                 item.fortran,
-            )
+            )?;
+            // A tensor the edit leaves alone keeps attrs, native, and sha256.
+            if let Some(record) = file.tensors.iter().find(|record| {
+                record.name == item.name
+                    && record.dtype == item.dtype
+                    && record.shape == item.shape
+                    && same_payload(&record.payload, &item.payload)
+            }) {
+                out.extra = record.extra.clone();
+            }
+            Ok(out)
         })
         .collect::<Result<Vec<_>>>()?;
-    crate::formats::rawtensor::write_archive(dest, &metadata, &tensors)
+    crate::formats::rawtensor::write_archive_with_source(dest, &metadata, file.source.as_ref(), &tensors)
 }
 
 #[cfg(format_raw_sidecar)]

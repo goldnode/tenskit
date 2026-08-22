@@ -1,4 +1,4 @@
-.TH TENSCONV 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.TH TENSCONV 1 "31 October 2026" "tenspile 0.1.0" "User Commands"
 .SH NAME
 tensconv \- copy tensors into another container
 .SH SYNOPSIS
@@ -145,10 +145,55 @@ An error.
 The message is written to stderr and starts with
 .BR "\%tensconv: " .
 .SH EXAMPLES
-.nf
-.B tensconv \-o model.gguf model.safetensors
-.B tensconv \-\-rename \-o model.gguf model/
-.fi
+.PP
+Convert safetensors to GGUF, keeping the names:
+.RS
+.EX
+tensconv \-o model.gguf model.safetensors
+.EE
+.RE
+.PP
+Convert a Hugging Face directory to GGUF names, with its config.json hyperparameters:
+.RS
+.EX
+tensconv \-\-rename \-o model.gguf model/
+.EE
+.RE
+.PP
+Show the name mapping without changing any values:
+.RS
+.EX
+tensconv \-\-rename \-\-names\-only \-o names.gguf model/
+.EE
+.RE
+.PP
+Convert GGUF to NumPy or to a PyTorch state_dict:
+.RS
+.EX
+tensconv \-o weights.npz model.gguf
+tensconv \-o model.pt model.gguf
+.EE
+.RE
+.PP
+Name the output format when the file name does not:
+.RS
+.EX
+tensconv \-\-format safetensors \-o pytorch_model.bin model.gguf
+.EE
+.RE
+.PP
+Check the result:
+.RS
+.EX
+tensdiff model.safetensors model.gguf
+.EE
+.RE
+.SH FILES
+.TP
+.I config.json
+Beside the source file or in the source directory.
+.B \-\-rename
+reads the architecture and the hyperparameters from it.
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO

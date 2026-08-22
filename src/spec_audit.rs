@@ -848,3 +848,24 @@ fn an_npz_edit_keeps_members_it_does_not_touch() {
     let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
     assert!(!archive.members.iter().any(|member| member.name == "s_f32"));
 }
+
+#[cfg(format_raw_sidecar)]
+#[test]
+fn a_rawtensor_edit_keeps_source_and_untouched_entry_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("small.rawtensor.json");
+    fs::copy(vectors().join("small.bin"), dir.path().join("small.bin")).unwrap();
+    let mut doc: Value = serde_json::from_slice(&fs::read(vectors().join("small.rawtensor.json")).unwrap()).unwrap();
+    doc["source"] = serde_json::json!({"format": "gguf", "converter": "demo"});
+    doc["tensors"][0]["attrs"] = serde_json::json!({"note": "keep"});
+    doc["tensors"][0]["native"] = serde_json::json!({"format": "gguf", "type": 0});
+    fs::write(&manifest, serde_json::to_vec(&doc).unwrap()).unwrap();
+    crate::run(&["--delete".into(), "-f".into(), manifest.display().to_string(), "s_f32".into()]).unwrap();
+    let after: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(after["source"], doc["source"]);
+    for key in ["attrs", "native", "sha256"] {
+        assert_eq!(after["tensors"][0][key], doc["tensors"][0][key], "{key}");
+    }
+    // RAW-008: the kept hashes still match the bytes.
+    archive::open(&manifest, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+}

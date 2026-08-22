@@ -1,4 +1,4 @@
-.TH TENSPILE 1 "30 October 2026" "tenspile 0.1.0" "User Commands"
+.TH TENSPILE 1 "31 October 2026" "tenspile 0.1.0" "User Commands"
 .SH NAME
 tenspile \- inspect and edit tensor containers
 .SH SYNOPSIS
@@ -81,7 +81,14 @@ They do not load weight bytes, except where the format needs them:
 a rawtensor manifest with
 .I sha256
 is verified, and big-endian or compressed data is decoded.
-A rewrite streams unchanged tensor bytes into the new file.
+A rewrite streams unchanged tensor bytes into a temporary file and renames it
+into place.
+It keeps what it does not change: safetensors and GGUF metadata, the graph of
+an ONNX model, npz members that are not arrays, and a rawtensor manifest's
+.I source
+and per-tensor fields.
+A PyTorch checkpoint with nested dicts or values that are not tensors is
+refused, because tenspile writes a flat state_dict.
 .PP
 Comparison is
 .BR \%tensdiff (1).
@@ -257,15 +264,99 @@ An error.
 The message is written to stderr and starts with
 .BR "\%tenspile: " .
 .SH EXAMPLES
-.nf
-.B tenspile \-tvf model.safetensors
-.B tenspile \-t \-\-columns \-\-fold \-f model.safetensors
-.B tenspile \-i model.gguf
-.B tenspile \-xf model.safetensors \-C out embed
-.B tenspile \-cf out.safetensors embed=embed.npy \-\-metadata format=pt
-.B tenspile \-uf model.safetensors norm=new_norm.npy
-.B tenspile \-\-delete \-f model.safetensors optimizer.step
-.fi
+.PP
+List the tensors in a file, with dtype, shape, size, and offset, separated by tabs:
+.RS
+.EX
+tenspile \-tvf model.safetensors
+.EE
+.RE
+.PP
+Read a large model in a terminal, with repeated layers folded into one block:
+.RS
+.EX
+tenspile \-t \-\-columns \-\-fold \-f model/
+.EE
+.RE
+.PP
+Show the header, metadata, and dtype tally of a GGUF file:
+.RS
+.EX
+tenspile \-i model.gguf
+.EE
+.RE
+.PP
+Print the listing as JSON for a script:
+.RS
+.EX
+tenspile \-t \-\-json \-f model.safetensors
+.EE
+.RE
+.PP
+Extract every tensor as .npy files into out/, or one tensor:
+.RS
+.EX
+tenspile \-xf model.safetensors \-C out
+tenspile \-xf model.safetensors \-C out embed
+.EE
+.RE
+.PP
+Extract a quantized GGUF tensor as rawtensor, block bytes unchanged:
+.RS
+.EX
+tenspile \-x \-f model.gguf \-\-format raw \-o w.rawtensor.json blk.0.attn_q.weight
+.EE
+.RE
+.PP
+Write two tensors into one new safetensors file:
+.RS
+.EX
+tenspile \-x \-f model.safetensors \-\-format safetensors \-o layer.safetensors embed norm
+.EE
+.RE
+.PP
+Create a file from an .npy array and a tensor copied out of a GGUF file:
+.RS
+.EX
+tenspile \-cf out.safetensors w=w.npy b=model.gguf:blk.0.attn_norm.weight
+.EE
+.RE
+.PP
+Append headerless bytes; --dtype and --shape describe them:
+.RS
+.EX
+tenspile \-r \-f out.safetensors \-\-dtype F32 \-\-shape 2,4 z=zeros.bin
+.EE
+.RE
+.PP
+Replace a tensor, and see the plan first with -n:
+.RS
+.EX
+tenspile \-n \-u \-f model.safetensors norm=new_norm.npy
+tenspile \-u \-f model.safetensors norm=new_norm.npy
+.EE
+.RE
+.PP
+Delete a tensor:
+.RS
+.EX
+tenspile \-\-delete \-f model.safetensors optimizer.step
+.EE
+.RE
+.PP
+Rename a GGUF model into a new file, leaving the original alone:
+.RS
+.EX
+tenspile \-u \-f model.gguf \-o renamed.gguf \-\-metadata general.name=renamed
+.EE
+.RE
+.PP
+Set typed GGUF metadata from a JSON file:
+.RS
+.EX
+tenspile \-u \-f model.gguf \-\-metadata\-file meta.json
+.EE
+.RE
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO

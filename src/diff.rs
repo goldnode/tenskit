@@ -896,11 +896,12 @@ Usage:
   tensdiff [--json] [--match-names] [--fold] [--force-single-file] LEFT RIGHT
 
 Exit status:
-  0  same names, types, shapes, values, and metadata
-  1  a difference was found
-  2  a file could not be read
+  0  same format, names, types, shapes, values, and metadata
+  1  a difference was found; a different container format counts
+  2  a file could not be read, or the command line was not valid
 
-The container format is reported and does not stop the member comparison.
+A different container format is reported and does not stop the member
+comparison, so a file and its conversion report only the format line.
 A tensor is one line: name, dtype, and shape. => marks a field that differs.
 GGUF shapes are reversed to canonical order. Alignment padding is not compared.
 Quantized blocks are compared as stored bytes.
@@ -913,6 +914,11 @@ so blk.20 and blk.21 become blk.[20-21]. A gap stays on its own line.
 --force-single-file applies only to the path written immediately after it.
 A .safetensors file beside config.json is refused unless that flag is set.
 Pass the directory to read the whole safetensors weight set.
+
+Examples:
+  tensdiff before.safetensors after.safetensors
+  tensdiff --match-names --fold model/ model.gguf
+  tensdiff --json left.npz right.npz
 "
 }
 

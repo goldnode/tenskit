@@ -28,6 +28,9 @@ pub struct TensorRec {
     pub nbytes: u64,
     pub fortran: bool,
     pub payload: Payload,
+    /// `attrs`, `native`, and `sha256` as stored, kept when an edit leaves
+    /// the tensor alone.
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +40,8 @@ pub struct RawFile {
     pub byte_order: String,
     pub alignment: u64,
     pub metadata: Map<String, Value>,
+    /// The optional provenance object.
+    pub source: Option<Value>,
     pub tensors: Vec<TensorRec>,
     pub notes: Vec<String>,
 }
@@ -226,6 +231,10 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
             }
         }
         ranges.push((file_name.to_string(), offset, nbytes));
+        let extra = ["attrs", "native", "sha256"]
+            .into_iter()
+            .filter_map(|key| tensor.get(key).map(|value| (key.to_string(), value.clone())))
+            .collect();
         tensors.push(TensorRec {
             name,
             dtype: dtype.to_string(),
@@ -235,6 +244,7 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
             nbytes,
             fortran,
             payload,
+            extra,
         });
     }
     note_overlaps(&mut notes, &ranges);
@@ -243,6 +253,7 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
         byte_order,
         alignment,
         metadata,
+        source: object.get("source").cloned(),
         tensors,
         notes,
     })
@@ -300,11 +311,23 @@ pub struct OutTensor {
     pub shape: Vec<u64>,
     pub payload: Payload,
     pub fortran: bool,
+    /// Entry fields written as given: `attrs`, `native`, or `sha256`.
+    pub extra: Map<String, Value>,
 }
 
 pub fn write_archive(
     manifest: &Path,
     metadata: &Map<String, Value>,
+    tensors: &[OutTensor],
+) -> Result<()> {
+    write_archive_with_source(manifest, metadata, None, tensors)
+}
+
+/// `write_archive`, plus the manifest's `source` object.
+pub fn write_archive_with_source(
+    manifest: &Path,
+    metadata: &Map<String, Value>,
+    source: Option<&Value>,
     tensors: &[OutTensor],
 ) -> Result<()> {
     if !is_manifest_name(
@@ -342,14 +365,18 @@ pub fn write_archive(
                 tensor.name, tensor.canonical
             )));
         }
-        entries.push(json!({
+        let mut entry = json!({
             "name": tensor.name,
             "dtype": tensor.canonical,
             "shape": tensor.shape,
             "file": data_name,
             "offset": offset,
             "nbytes": nbytes,
-        }));
+        });
+        if let Value::Object(fields) = &mut entry {
+            fields.extend(tensor.extra.clone());
+        }
+        entries.push(entry);
         offset += nbytes;
     }
     let mut document = Map::new();
@@ -360,6 +387,9 @@ pub fn write_archive(
     document.insert("tensors".into(), Value::Array(entries));
     if !metadata.is_empty() {
         document.insert("metadata".into(), Value::Object(metadata.clone()));
+    }
+    if let Some(source) = source {
+        document.insert("source".into(), source.clone());
     }
     let mut body = serde_json::to_vec_pretty(&Value::Object(document))?;
     body.push(b'\n');
@@ -406,6 +436,7 @@ pub fn to_out(
         shape: shape.to_vec(),
         payload: payload.clone(),
         fortran,
+        extra: Map::new(),
     })
 }
 

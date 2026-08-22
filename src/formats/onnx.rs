@@ -897,9 +897,8 @@ mod tests {
         for field in fields(&bytes, 0).unwrap() {
             if let Field::Bytes { id: 7, data, .. } = field {
                 for item in fields(data, 0).unwrap() {
-                    if let Field::Bytes { id, .. } | Field::Varint { id, .. } | Field::Fixed { id, .. } = item {
-                        ids.push(id);
-                    }
+                    let (Field::Bytes { id, .. } | Field::Varint { id, .. } | Field::Fixed { id, .. }) = item;
+                    ids.push(id);
                 }
             }
         }
