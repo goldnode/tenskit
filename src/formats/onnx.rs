@@ -5,6 +5,7 @@
 //! left in the file. Remove this file and the `onnx` line in
 //! `local/supported-formats.txt` to drop the format.
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -568,33 +569,44 @@ pub fn write_archive(path: &Path, metadata: &[(String, String)], tensors: &[OutT
     finish(path, &model)
 }
 
-/// Rewrite an existing model with a new set of initializers and metadata.
-/// Every other field is kept: graph nodes, inputs, outputs, opsets, and an
-/// initializer named in `unchanged` (with its typed fields or external data
-/// reference as stored). A removed initializer also leaves the graph
-/// outputs; one that a node still reads is refused.
+/// Rewrite an existing model with a new set of initializers and metadata
+/// (ONNX-009 to ONNX-013). Every other field is copied as stored, unknown
+/// fields included, and so is an initializer named in `unchanged`, with its
+/// typed fields or external data reference. A replaced or added initializer
+/// is written with `raw_data`, and `ir_version` is raised only when its
+/// dtype needs a newer IR. A removed initializer also leaves the graph
+/// inputs, outputs, and value_info. Removing one that a node reads, in the
+/// graph or in a subgraph, that a training binding names, or that a
+/// quantization annotation names, is refused. Returns notes on what changed
+/// besides the edit.
 pub fn rewrite_archive(
     source: &Path,
     path: &Path,
     metadata: &[(String, String)],
     tensors: &[OutTensor],
-    unchanged: &std::collections::BTreeSet<String>,
-) -> Result<()> {
+    unchanged: &BTreeSet<String>,
+) -> Result<Vec<String>> {
     if tensors.is_empty() {
         return Err(msg("writing an ONNX file with no initializers is not supported"));
     }
     crate::io_util::check_unique_names(tensors.iter().map(|tensor| tensor.name.as_str()))?;
     let bytes = std::fs::read(source).map_err(|err| io_err(source, err))?;
-    let keep: std::collections::BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
-    let original = initializer_names(&bytes)?;
-    let removed = |name: &str| !keep.contains(name) && original.contains(name);
-    let mut written = std::collections::BTreeSet::new();
-    let mut ir_version = 0;
+    let keep: BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+    let removed: BTreeSet<String> = initializer_names(&bytes)?
+        .into_iter()
+        .filter(|name| !keep.contains(name.as_str()))
+        .collect();
+    check_removals(&bytes, &removed)?;
+    let mut notes = Vec::new();
+    let mut written = BTreeSet::new();
+    let mut external = BTreeSet::new();
+    let mut ir_version = None;
+    let mut needed_ir = 0;
     let mut model = Vec::new();
     let mut metadata_written = false;
     for field in fields(&bytes, 0)? {
         match field {
-            Field::Varint { id: 1, value } => ir_version = value,
+            Field::Varint { id: 1, value } => ir_version = Some(value),
             Field::Bytes { id: 7, data, .. } => {
                 let mut graph = Vec::new();
                 for item in fields(data, 0)? {
@@ -605,37 +617,28 @@ pub fn rewrite_archive(
                                 continue;
                             }
                             if unchanged.contains(&name) {
+                                if let Some(location) = external_location(data)? {
+                                    external.insert(location);
+                                }
                                 bytes_field(&mut graph, 5, data);
                             } else {
                                 let tensor = tensors.iter().find(|tensor| tensor.name == name).unwrap();
                                 let (body, code) = encode_tensor(tensor)?;
-                                ir_version = ir_version.max(min_ir(code));
+                                needed_ir = needed_ir.max(dtype_ir(code));
                                 bytes_field(&mut graph, 5, &body);
                             }
                             written.insert(name);
                         }
-                        Field::Bytes { id: 1, data, .. } => {
-                            for input in node_inputs(data)? {
-                                if removed(&input) {
-                                    return Err(msg(format!(
-                                        "initializer {input} is an input of a graph node; deleting it would break the model"
-                                    )));
-                                }
-                            }
-                            bytes_field(&mut graph, 1, data);
-                        }
-                        Field::Bytes { id: 12, data, .. } => {
-                            // A graph output naming a removed initializer goes too.
-                            if !removed(&value_info_name(data)?) {
-                                bytes_field(&mut graph, 12, data);
-                            }
-                        }
+                        // A graph input, output, or value_info naming a removed
+                        // initializer goes too (ONNX-010, ONNX-012).
+                        Field::Bytes { id: 11..=13, data, .. }
+                            if removed.contains(&value_info_name(data)?) => {}
                         other => copy_field(&mut graph, &other),
                     }
                 }
                 for tensor in tensors.iter().filter(|tensor| !written.contains(&tensor.name)) {
                     let (body, code) = encode_tensor(tensor)?;
-                    ir_version = ir_version.max(min_ir(code));
+                    needed_ir = needed_ir.max(dtype_ir(code));
                     bytes_field(&mut graph, 5, &body);
                 }
                 bytes_field(&mut model, 7, &graph);
@@ -652,10 +655,181 @@ pub fn rewrite_archive(
     if !metadata_written {
         model.extend_from_slice(&metadata_fields(metadata));
     }
+    // ir_version and opset_import stay as stored; the checker rejects a
+    // data type newer than the model's IR (ONNX-009, ONNX-013).
+    if needed_ir > ir_version.unwrap_or(0) {
+        notes.push(format!(
+            "raised ir_version from {} to {needed_ir} for the new initializers' data types (ONNX-009)",
+            ir_version.map_or("none".to_string(), |value| value.to_string())
+        ));
+        ir_version = Some(needed_ir);
+    }
     let mut out = Vec::with_capacity(model.len() + 4);
-    varint_field(&mut out, 1, ir_version);
+    if let Some(value) = ir_version {
+        varint_field(&mut out, 1, value);
+    }
     out.extend_from_slice(&model);
-    finish(path, &out)
+    // External data the kept initializers name must still resolve beside the
+    // new model (ONNX-003, ONNX-009).
+    let from = source.parent().unwrap_or_else(|| Path::new("."));
+    let to = path.parent().unwrap_or_else(|| Path::new("."));
+    if !external.is_empty() && !same_dir(from, to) {
+        for location in &external {
+            let target = relative_child(to, location)?;
+            if target.exists() {
+                return Err(msg(format!(
+                    "{} exists; the edited model would reference it in place of {}'s external data",
+                    target.display(),
+                    source.display()
+                )));
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| io_err(parent, err))?;
+            }
+            let origin = relative_child(from, location)?;
+            std::fs::copy(&origin, &target).map_err(|err| io_err(&origin, err))?;
+            notes.push(format!("copied external data {location} beside the new model (ONNX-009)"));
+        }
+    }
+    finish(path, &out)?;
+    Ok(notes)
+}
+
+fn same_dir(left: &Path, right: &Path) -> bool {
+    let resolve = |dir: &Path| {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        dir.canonicalize().ok()
+    };
+    matches!((resolve(left), resolve(right)), (Some(left), Some(right)) if left == right)
+}
+
+/// Refuse to remove an initializer that the model still names: a node input
+/// in the graph or in any nested subgraph, a training binding key
+/// (ONNX-011), or a quantization annotation (ONNX-012).
+fn check_removals(model: &[u8], removed: &BTreeSet<String>) -> Result<()> {
+    if removed.is_empty() {
+        return Ok(());
+    }
+    for field in fields(model, 0)? {
+        match field {
+            Field::Bytes { id: 7, data, .. } => {
+                for item in fields(data, 0)? {
+                    match item {
+                        Field::Bytes { id: 1, data, .. } => {
+                            let mut reads = BTreeSet::new();
+                            node_reads(data, &mut reads)?;
+                            if let Some(name) = reads.intersection(removed).next() {
+                                return Err(msg(format!(
+                                    "initializer {name} is an input of a graph node; deleting it would break the model (ONNX-011)"
+                                )));
+                            }
+                        }
+                        // TensorAnnotation: tensor_name (1), and
+                        // quant_parameter_tensor_names (2) entries.
+                        Field::Bytes { id: 14, data, .. } => {
+                            for entry in fields(data, 0)? {
+                                let named = match entry {
+                                    Field::Bytes { id: 1, data, .. } => Some(text(data)?),
+                                    Field::Bytes { id: 2, data, .. } => string_pair(data)?.map(|(_, value)| value),
+                                    _ => None,
+                                };
+                                if let Some(name) = named.filter(|name| removed.contains(name)) {
+                                    return Err(msg(format!(
+                                        "initializer {name} is named by a quantization annotation; deleting it would lose that data (ONNX-012)"
+                                    )));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // TrainingInfoProto: initialization_binding (3) and
+            // update_binding (4) keys name initializers.
+            Field::Bytes { id: 20, data, .. } => {
+                for entry in fields(data, 0)? {
+                    if let Field::Bytes { id: 3 | 4, data, .. } = entry {
+                        if let Some((name, _)) = string_pair(data)?.filter(|(key, _)| removed.contains(key)) {
+                            return Err(msg(format!(
+                                "initializer {name} is bound by the model's training_info; deleting it would break the model (ONNX-011)"
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Names a node reads: its inputs, and what the graphs in its attributes
+/// (`g`, `graphs`) read from outer scopes, recursively (ONNX-011).
+fn node_reads(node: &[u8], out: &mut BTreeSet<String>) -> Result<()> {
+    for field in fields(node, 0)? {
+        match field {
+            Field::Bytes { id: 1, data, .. } => {
+                out.insert(text(data)?);
+            }
+            Field::Bytes { id: 5, data, .. } => {
+                for attribute in fields(data, 0)? {
+                    if let Field::Bytes { id: 6 | 11, data, .. } = attribute {
+                        subgraph_reads(data, out)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Names a subgraph's nodes read that the subgraph does not define itself
+/// as an input, an initializer, or a node output.
+fn subgraph_reads(graph: &[u8], out: &mut BTreeSet<String>) -> Result<()> {
+    let mut defined = BTreeSet::new();
+    let mut reads = BTreeSet::new();
+    for field in fields(graph, 0)? {
+        match field {
+            Field::Bytes { id: 1, data, .. } => {
+                node_reads(data, &mut reads)?;
+                for item in fields(data, 0)? {
+                    if let Field::Bytes { id: 2, data, .. } = item {
+                        defined.insert(text(data)?);
+                    }
+                }
+            }
+            Field::Bytes { id: 5, data, .. } => {
+                defined.insert(tensor_name(data)?);
+            }
+            Field::Bytes { id: 11, data, .. } => {
+                defined.insert(value_info_name(data)?);
+            }
+            _ => {}
+        }
+    }
+    out.extend(reads.difference(&defined).cloned());
+    Ok(())
+}
+
+/// The `location` of an initializer stored as external data.
+fn external_location(tensor: &[u8]) -> Result<Option<String>> {
+    let mut external = false;
+    let mut location = None;
+    for field in fields(tensor, 0)? {
+        match field {
+            Field::Varint { id: 14, value: 1 } => external = true,
+            Field::Bytes { id: 13, data, .. } => {
+                if let Some((key, value)) = string_pair(data)? {
+                    if key == "location" {
+                        location = Some(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(location.filter(|_| external))
 }
 
 fn finish(path: &Path, model: &[u8]) -> Result<()> {
@@ -758,18 +932,8 @@ fn value_info_name(info: &[u8]) -> Result<String> {
     Ok(String::new())
 }
 
-fn node_inputs(node: &[u8]) -> Result<Vec<String>> {
-    let mut inputs = Vec::new();
-    for field in fields(node, 0)? {
-        if let Field::Bytes { id: 1, data, .. } = field {
-            inputs.push(text(data)?);
-        }
-    }
-    Ok(inputs)
-}
-
-fn initializer_names(model: &[u8]) -> Result<std::collections::BTreeSet<String>> {
-    let mut names = std::collections::BTreeSet::new();
+fn initializer_names(model: &[u8]) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
     for field in fields(model, 0)? {
         if let Field::Bytes { id: 7, data, .. } = field {
             for item in fields(data, 0)? {
@@ -782,15 +946,23 @@ fn initializer_names(model: &[u8]) -> Result<std::collections::BTreeSet<String>>
     Ok(names)
 }
 
-/// Lowest IR version that has a data type (onnx.yaml `versions`). The
-/// writer never goes below IR 10.
+/// Lowest IR version for a new file. The writer never goes below IR 10.
 fn min_ir(code: u64) -> u64 {
+    dtype_ir(code).max(10)
+}
+
+/// The IR version that introduced a data type (onnx.yaml `versions`), or 0
+/// for the types every IR has.
+fn dtype_ir(code: u64) -> u64 {
     match code {
+        16 => 4,
+        17..=20 => 9,
+        21 | 22 => 10,
         23 => 11,
         24 => 12,
         25 | 26 => 13,
         27 | 28 => 14,
-        _ => 10,
+        _ => 0,
     }
 }
 
@@ -924,7 +1096,7 @@ mod tests {
                 })
                 .collect()
         };
-        let all: std::collections::BTreeSet<String> = ["w".to_string(), "b".to_string()].into();
+        let all: BTreeSet<String> = ["w".to_string(), "b".to_string()].into();
         // A metadata change keeps the node, both outputs, and the producer.
         let edited = dir.path().join("meta.onnx");
         rewrite_archive(&path, &edited, &[("k".into(), "v".into())], &out(&["w", "b"]), &all).unwrap();
@@ -943,5 +1115,170 @@ mod tests {
         let fresh = dir.path().join("new.onnx");
         write_archive(&fresh, &[], &out(&["w", "b"])).unwrap();
         assert_eq!(graph_fields(&fresh), vec![2, 5, 5, 12, 12]);
+    }
+
+    fn float_tensor(name: &str) -> OutTensor {
+        OutTensor {
+            name: name.into(),
+            dtype: "float32".into(),
+            shape: vec![2],
+            payload: Payload::Bytes(vec![0; 8]),
+        }
+    }
+
+    /// An IR 3 model with initializers `w` and `b`, each also a graph input
+    /// and a value_info, plus `graph_extra` and `model_extra` fields.
+    fn model_with(path: &Path, graph_extra: &[u8], model_extra: &[u8]) {
+        let mut graph = Vec::new();
+        bytes_field(&mut graph, 2, b"g");
+        for name in ["w", "b"] {
+            let (body, _) = encode_tensor(&float_tensor(name)).unwrap();
+            bytes_field(&mut graph, 5, &body);
+            bytes_field(&mut graph, 11, &value_info(&float_tensor(name), 1));
+            bytes_field(&mut graph, 13, &value_info(&float_tensor(name), 1));
+        }
+        graph.extend_from_slice(graph_extra);
+        let mut model = Vec::new();
+        varint_field(&mut model, 1, 3);
+        bytes_field(&mut model, 7, &graph);
+        model.extend_from_slice(model_extra);
+        std::fs::write(path, model).unwrap();
+    }
+
+    fn delete_b(path: &Path, dest: &Path) -> Result<Vec<String>> {
+        let all: BTreeSet<String> = ["w".to_string(), "b".to_string()].into();
+        rewrite_archive(path, dest, &[], &[float_tensor("w")], &all)
+    }
+
+    #[test]
+    fn deleting_an_initializer_removes_its_input_and_value_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.onnx");
+        model_with(&path, &[], &[]);
+        let dest = dir.path().join("d.onnx");
+        delete_b(&path, &dest).unwrap();
+        assert_eq!(graph_fields(&dest), vec![2, 5, 11, 13]);
+        // IR 3 stays IR 3 when nothing needs a newer one (ONNX-013).
+        let bytes = std::fs::read(&dest).unwrap();
+        assert!(matches!(fields(&bytes, 0).unwrap()[0], Field::Varint { id: 1, value: 3 }));
+    }
+
+    #[test]
+    fn a_new_dtype_raises_ir_version_only_as_far_as_it_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.onnx");
+        model_with(&path, &[], &[]);
+        let dest = dir.path().join("bf.onnx");
+        let unchanged: BTreeSet<String> = ["w".to_string()].into();
+        let bf16 = OutTensor {
+            name: "b".into(),
+            dtype: "bfloat16".into(),
+            shape: vec![2],
+            payload: Payload::Bytes(vec![0; 4]),
+        };
+        let notes = rewrite_archive(&path, &dest, &[], &[float_tensor("w"), bf16], &unchanged).unwrap();
+        assert!(notes[0].contains("from 3 to 4"), "{notes:?}");
+        let bytes = std::fs::read(&dest).unwrap();
+        assert!(matches!(fields(&bytes, 0).unwrap()[0], Field::Varint { id: 1, value: 4 }));
+    }
+
+    #[test]
+    fn subgraphs_training_bindings_and_annotations_block_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.onnx");
+        let dest = dir.path().join("d.onnx");
+        // An If node whose then_branch reads b from the outer graph.
+        let mut inner = Vec::new();
+        bytes_field(&mut inner, 1, b"b");
+        bytes_field(&mut inner, 2, b"y");
+        bytes_field(&mut inner, 4, b"Identity");
+        let mut branch = Vec::new();
+        bytes_field(&mut branch, 1, &inner);
+        let mut attribute = Vec::new();
+        bytes_field(&mut attribute, 1, b"then_branch");
+        bytes_field(&mut attribute, 6, &branch);
+        let mut node = Vec::new();
+        bytes_field(&mut node, 1, b"cond");
+        bytes_field(&mut node, 4, b"If");
+        bytes_field(&mut node, 5, &attribute);
+        let mut graph_extra = Vec::new();
+        bytes_field(&mut graph_extra, 1, &node);
+        model_with(&path, &graph_extra, &[]);
+        let err = delete_b(&path, &dest).unwrap_err().to_string();
+        assert!(err.contains("ONNX-011"), "{err}");
+        // A subgraph that defines b itself does not read the outer one.
+        let mut defines = Vec::new();
+        bytes_field(&mut defines, 2, b"g2");
+        let (body, _) = encode_tensor(&float_tensor("b")).unwrap();
+        bytes_field(&mut defines, 5, &body);
+        bytes_field(&mut defines, 1, &inner);
+        let mut attribute = Vec::new();
+        bytes_field(&mut attribute, 6, &defines);
+        let mut node = Vec::new();
+        bytes_field(&mut node, 5, &attribute);
+        let mut graph_extra = Vec::new();
+        bytes_field(&mut graph_extra, 1, &node);
+        model_with(&path, &graph_extra, &[]);
+        delete_b(&path, &dest).unwrap();
+        // A training binding key.
+        let mut binding = Vec::new();
+        bytes_field(&mut binding, 1, b"b");
+        bytes_field(&mut binding, 2, b"b_next");
+        let mut training = Vec::new();
+        bytes_field(&mut training, 4, &binding);
+        let mut model_extra = Vec::new();
+        bytes_field(&mut model_extra, 20, &training);
+        model_with(&path, &[], &model_extra);
+        let err = delete_b(&path, &dest).unwrap_err().to_string();
+        assert!(err.contains("training_info"), "{err}");
+        // A quantization annotation.
+        let mut pair = Vec::new();
+        bytes_field(&mut pair, 1, b"SCALE_TENSOR");
+        bytes_field(&mut pair, 2, b"b");
+        let mut annotation = Vec::new();
+        bytes_field(&mut annotation, 1, b"x");
+        bytes_field(&mut annotation, 2, &pair);
+        let mut graph_extra = Vec::new();
+        bytes_field(&mut graph_extra, 14, &annotation);
+        model_with(&path, &graph_extra, &[]);
+        let err = delete_b(&path, &dest).unwrap_err().to_string();
+        assert!(err.contains("ONNX-012"), "{err}");
+    }
+
+    #[test]
+    fn external_data_is_copied_when_the_model_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.onnx");
+        std::fs::write(dir.path().join("w.bin"), [0u8; 8]).unwrap();
+        let mut tensor = Vec::new();
+        varint_field(&mut tensor, 1, 2);
+        varint_field(&mut tensor, 2, 1);
+        bytes_field(&mut tensor, 8, b"w");
+        let mut location = Vec::new();
+        bytes_field(&mut location, 1, b"location");
+        bytes_field(&mut location, 2, b"w.bin");
+        bytes_field(&mut tensor, 13, &location);
+        varint_field(&mut tensor, 14, 1);
+        let mut graph = Vec::new();
+        bytes_field(&mut graph, 5, &tensor);
+        let mut model = Vec::new();
+        varint_field(&mut model, 1, 10);
+        bytes_field(&mut model, 7, &graph);
+        std::fs::write(&path, model).unwrap();
+        let archive = open(&path).unwrap();
+        let member = &archive.members[0];
+        let kept = OutTensor {
+            name: "w".into(),
+            dtype: member.dtype.clone(),
+            shape: member.shape.clone(),
+            payload: member.payload.clone(),
+        };
+        let unchanged: BTreeSet<String> = ["w".to_string()].into();
+        let moved = dir.path().join("out/m.onnx");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        let notes = rewrite_archive(&path, &moved, &[], &[kept], &unchanged).unwrap();
+        assert!(notes[0].contains("w.bin"), "{notes:?}");
+        let reread = open(&moved).unwrap();
+        assert_eq!(reread.members[0].payload.read_vec().unwrap(), vec![0u8; 8]);
     }
 }

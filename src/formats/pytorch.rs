@@ -5,7 +5,7 @@
 //! and the old tar container are recognized and refused. Remove this file and
 //! the `pytorch` line in `local/supported-formats.txt` to drop the format.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -19,20 +19,50 @@ use crate::dtype::{self, numel};
 use crate::error::{io_err, msg, Result};
 use crate::payload::Payload;
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    V2,
+    V3,
+    /// `_rebuild_tensor`, which a rewrite does not reproduce.
+    Legacy,
+}
+
+/// The persistent id `('storage', type, key, location, numel)`.
+#[derive(Debug, Clone)]
+struct StorageRef {
+    module: String,
+    type_name: String,
+    key: String,
+    location: String,
+    numel: u64,
+}
+
+#[derive(Debug, Clone)]
 struct TensorRef {
     dtype: String,
     shape: Vec<u64>,
     strides: Vec<u64>,
-    storage_key: String,
+    storage: StorageRef,
     /// Storage size in bytes. A typed storage counts elements and an
     /// UntypedStorage counts bytes (PT-003).
     storage_bytes: u64,
     offset_elems: u64,
     itemsize: u64,
+    rebuild: Rebuild,
+    /// The torch dtype global that `_rebuild_tensor_v3` names.
+    torch_dtype: Option<String>,
+    requires_grad: bool,
+    /// The conj and neg bits of the optional metadata argument (PT-010).
+    conj: bool,
+    neg: bool,
+    /// `requires_grad` of an `nn.Parameter` wrapper.
+    parameter: Option<bool>,
+    /// False when the pickle carried something a rewrite cannot reproduce,
+    /// such as backward hooks or tensor state.
+    exact: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Obj {
     None,
     Bool(bool),
@@ -42,10 +72,28 @@ enum Obj {
     Tuple(Vec<Obj>),
     List(Vec<Obj>),
     Set,
-    Dict(Vec<(Obj, Obj)>),
+    /// A dict, or an `OrderedDict` with the state BUILD gave it (PT-007).
+    Dict {
+        pairs: Vec<(Obj, Obj)>,
+        ordered: bool,
+        state: Option<Box<Obj>>,
+    },
     Global { module: String, name: String },
-    Storage { type_name: String, key: String, numel: u64 },
+    Storage(StorageRef),
     Tensor(TensorRef),
+    /// A tensor an edit writes, by index into its new tensors.
+    Fresh { index: usize, parameter: Option<bool> },
+}
+
+/// What a rewrite needs from the file it edits.
+#[derive(Debug, Clone)]
+pub struct TorchFile {
+    root: Obj,
+    /// The archive folder, with its trailing `/`.
+    prefix: String,
+    byteorder: String,
+    /// Why the pickle cannot be reproduced, if it cannot (PT-011).
+    pub refused: Option<String>,
 }
 
 pub fn is_torch_zip(path: &Path) -> Result<bool> {
@@ -116,7 +164,7 @@ fn flatten(
     meta: &mut Vec<(String, String)>,
     notes: &mut Vec<String>,
 ) {
-    let Obj::Dict(pairs) = obj else {
+    let Obj::Dict { pairs, .. } = obj else {
         notes.push("the pickled object is not a dict of tensors".into());
         return;
     };
@@ -135,7 +183,7 @@ fn flatten(
                 name,
                 tensor: tensor.clone(),
             }),
-            Obj::Dict(_) => flatten(value, &name, out, meta, notes),
+            Obj::Dict { .. } => flatten(value, &name, out, meta, notes),
             Obj::Str(text) => meta.push((name, text.clone())),
             Obj::Int(number) => meta.push((name, number.to_string())),
             Obj::Float(number) => meta.push((name, number.to_string())),
@@ -172,7 +220,7 @@ impl Obj {
         };
         match self {
             Obj::Tuple(items) | Obj::List(items) => visit(&mut items.iter()),
-            Obj::Dict(pairs) => visit(&mut pairs.iter().flat_map(|(k, v)| [k, v])),
+            Obj::Dict { pairs, .. } => visit(&mut pairs.iter().flat_map(|(k, v)| [k, v])),
             _ => {}
         }
         total
@@ -201,7 +249,11 @@ impl Machine<'_> {
                 }
                 0x2e => return self.pop(),
                 0x28 => self.marks.push(self.stack.len()),
-                0x7d => self.stack.push(Obj::Dict(Vec::new())),
+                0x7d => self.stack.push(Obj::Dict {
+                    pairs: Vec::new(),
+                    ordered: false,
+                    state: None,
+                }),
                 0x29 => self.stack.push(Obj::Tuple(Vec::new())),
                 0x4e => self.stack.push(Obj::None),
                 0x89 => self.stack.push(Obj::Bool(false)),
@@ -279,11 +331,14 @@ impl Machine<'_> {
                     self.stack.push(reduce(callable, args)?);
                 }
                 0x62 => {
-                    let _state = self.pop()?;
-                    match self.stack.last() {
-                        // OrderedDict carries _metadata here; tensors carry
-                        // flags. Neither changes the tensor bytes.
-                        Some(Obj::Dict(_) | Obj::Tensor(_)) => {}
+                    let new_state = self.pop()?;
+                    match self.stack.last_mut() {
+                        // An OrderedDict carries _metadata here. A rewrite
+                        // keeps it.
+                        Some(Obj::Dict { state, .. }) => *state = Some(Box::new(new_state)),
+                        // Tensor state does not change the bytes, but a
+                        // rewrite would lose it.
+                        Some(Obj::Tensor(tensor)) => tensor.exact = false,
                         _ => return Err(msg("pytorch pickle BUILD target is not a dict or tensor")),
                     }
                 }
@@ -425,7 +480,7 @@ impl Machine<'_> {
         if items.len() % 2 != 0 {
             return Err(msg("pytorch pickle dict items are not in pairs"));
         }
-        let Obj::Dict(pairs) = self
+        let Obj::Dict { pairs, .. } = self
             .stack
             .last_mut()
             .ok_or_else(|| msg("pytorch pickle SETITEMS has no dict"))?
@@ -519,18 +574,23 @@ fn persistent(pid: &Obj) -> Result<Obj> {
             "pytorch pickle persistent id {kind} is not a storage"
         )));
     }
-    let Obj::Global { name, .. } = &items[1] else {
+    let Obj::Global { module, name } = &items[1] else {
         return Err(msg("pytorch pickle storage type is not a global"));
     };
     let Obj::Str(key) = &items[2] else {
         return Err(msg("pytorch pickle storage key is not a string"));
     };
+    let Obj::Str(location) = &items[3] else {
+        return Err(msg("pytorch pickle storage location is not a string"));
+    };
     let numel = as_u64(&items[4])?;
-    Ok(Obj::Storage {
+    Ok(Obj::Storage(StorageRef {
+        module: module.clone(),
         type_name: name.clone(),
         key: key.clone(),
+        location: location.clone(),
         numel,
-    })
+    }))
 }
 
 fn reduce(callable: Obj, args: Obj) -> Result<Obj> {
@@ -541,58 +601,124 @@ fn reduce(callable: Obj, args: Obj) -> Result<Obj> {
         return Err(msg("pytorch pickle REDUCE arguments are not a tuple"));
     };
     if module == "collections" && name == "OrderedDict" {
-        return Ok(Obj::Dict(Vec::new()));
+        return Ok(Obj::Dict {
+            pairs: Vec::new(),
+            ordered: true,
+            state: None,
+        });
     }
     if name == "_rebuild_parameter" || name == "_rebuild_parameter_with_state" {
-        return args
-            .into_iter()
-            .find(|arg| matches!(arg, Obj::Tensor(_)))
-            .ok_or_else(|| msg("pytorch parameter rebuild has no tensor"));
+        // _rebuild_parameter(data, requires_grad, backward_hooks)
+        let mut args = args.into_iter();
+        let Some(Obj::Tensor(mut tensor)) = args.next() else {
+            return Err(msg("pytorch parameter rebuild has no tensor"));
+        };
+        let requires_grad = args.next();
+        let hooks = args.next();
+        tensor.exact &= name == "_rebuild_parameter" && args.next().is_none() && is_empty_dict(hooks.as_ref());
+        tensor.parameter = Some(match requires_grad {
+            Some(Obj::Bool(flag)) => flag,
+            _ => {
+                tensor.exact = false;
+                false
+            }
+        });
+        return Ok(Obj::Tensor(tensor));
     }
-    if name == "_rebuild_tensor_v2" || name == "_rebuild_tensor" || name == "_rebuild_tensor_v3" {
-        return rebuild(&args);
-    }
-    Err(msg(format!(
-        "pytorch pickle reduce {module}.{name} is not a tensor rebuild"
-    )))
+    let rebuild = match name.as_str() {
+        "_rebuild_tensor_v2" => Rebuild::V2,
+        "_rebuild_tensor_v3" => Rebuild::V3,
+        "_rebuild_tensor" => Rebuild::Legacy,
+        _ => {
+            return Err(msg(format!(
+                "pytorch pickle reduce {module}.{name} is not a tensor rebuild"
+            )))
+        }
+    };
+    rebuild_tensor(rebuild, &args)
 }
 
-fn rebuild(args: &[Obj]) -> Result<Obj> {
+fn is_empty_dict(obj: Option<&Obj>) -> bool {
+    matches!(obj, Some(Obj::Dict { pairs, state: None, .. }) if pairs.is_empty())
+}
+
+/// `_rebuild_tensor_v2(storage, offset, size, stride, requires_grad,
+/// backward_hooks[, metadata])`; v3 has the dtype before metadata.
+fn rebuild_tensor(rebuild: Rebuild, args: &[Obj]) -> Result<Obj> {
     if args.len() < 4 {
         return Err(msg("pytorch tensor rebuild is missing arguments"));
     }
-    let Obj::Storage {
-        type_name,
-        key,
-        numel,
-    } = &args[0]
-    else {
+    let Obj::Storage(storage) = &args[0] else {
         return Err(msg("pytorch tensor storage is not a persistent id"));
     };
-    let (mut dtype, mut itemsize) = storage_layout(type_name)?;
-    let storage_bytes = if type_name == "UntypedStorage" {
-        *numel
+    let (mut dtype, mut itemsize) = storage_layout(&storage.type_name)?;
+    let storage_bytes = if storage.type_name == "UntypedStorage" {
+        storage.numel
     } else {
-        numel
+        storage
+            .numel
             .checked_mul(itemsize)
             .ok_or_else(|| msg("pytorch storage is too large"))?
     };
-    if let Some(Obj::Global { name, .. }) = args.iter().find(|arg| {
-        matches!(arg, Obj::Global { module, name } if module == "torch" && !name.ends_with("Storage"))
-    }) {
-        if let Some((canonical, bits)) = torch_dtype(name) {
-            dtype = canonical.into();
-            itemsize = bits / 8;
+    let mut exact = rebuild != Rebuild::Legacy;
+    let requires_grad = match args.get(4) {
+        Some(Obj::Bool(flag)) => *flag,
+        _ => {
+            exact = false;
+            false
         }
+    };
+    exact &= is_empty_dict(args.get(5));
+    let mut next = 6;
+    let mut torch_name = None;
+    if rebuild == Rebuild::V3 {
+        let Some(Obj::Global { module, name }) = args.get(6) else {
+            return Err(msg("pytorch _rebuild_tensor_v3 has no dtype"));
+        };
+        let (canonical, bits) = torch_dtype(name)
+            .filter(|_| module == "torch")
+            .ok_or_else(|| msg(format!("pytorch dtype {module}.{name} has no canonical dtype")))?;
+        dtype = canonical.into();
+        itemsize = bits / 8;
+        torch_name = Some(name.clone());
+        next = 7;
+    }
+    let (mut conj, mut neg) = (false, false);
+    if rebuild != Rebuild::Legacy {
+        match args.get(next) {
+            None => {}
+            Some(Obj::Dict { pairs, .. }) => {
+                for (key, value) in pairs {
+                    match (key, value) {
+                        (Obj::Str(key), Obj::Bool(flag)) if key == "conj" => conj = *flag,
+                        (Obj::Str(key), Obj::Bool(flag)) if key == "neg" => neg = *flag,
+                        _ => {
+                            return Err(msg(
+                                "pytorch tensor metadata holds more than the conj and neg bits (PT-010)",
+                            ))
+                        }
+                    }
+                }
+            }
+            Some(_) => return Err(msg("pytorch tensor metadata is not a dict (PT-010)")),
+        }
+        exact &= args.len() <= next + 1;
     }
     Ok(Obj::Tensor(TensorRef {
         dtype,
         shape: as_shape(&args[2])?,
         strides: as_shape(&args[3])?,
-        storage_key: key.clone(),
+        storage: storage.clone(),
         storage_bytes,
         offset_elems: as_u64(&args[1])?,
         itemsize,
+        rebuild,
+        torch_dtype: torch_name,
+        requires_grad,
+        conj,
+        neg,
+        parameter: None,
+        exact,
     }))
 }
 
@@ -666,6 +792,7 @@ pub struct OutTensor {
     pub payload: Payload,
 }
 
+/// Write a new checkpoint: a flat dict of tensors, as pytorch.yaml `write`.
 pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
     if tensors.is_empty() {
         return Err(msg("writing a pytorch checkpoint with no tensors is not supported"));
@@ -675,59 +802,239 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
         .and_then(|text| text.to_str())
         .filter(|text| !text.is_empty())
         .unwrap_or("archive");
-    let mut pickle = Vec::new();
-    pickle.extend_from_slice(&[0x80, 2, 0x7d, 0x28]);
-    for (index, tensor) in tensors.iter().enumerate() {
-        let canonical = dtype::canonical_id(&tensor.dtype)?;
-        // A dtype without a legacy storage class goes through
-        // _rebuild_tensor_v3 with an UntypedStorage, whose numel counts
-        // bytes (pytorch.yaml `write`).
-        let untyped = canonical_storage(canonical).is_err();
-        let (storage, itemsize) = if untyped {
-            let bits = untyped_dtype(canonical)?.1;
-            ("UntypedStorage", bits / 8)
-        } else {
-            canonical_storage(canonical)?
-        };
-        let count = numel(&tensor.shape).ok_or_else(|| msg("shape is too large to count"))?;
-        let nbytes = count
-            .checked_mul(itemsize)
-            .ok_or_else(|| msg("pytorch tensor is too large"))?;
-        if tensor.payload.len() != nbytes {
-            return Err(msg(format!(
-                "tensor {} is {} bytes; {canonical} needs {nbytes}",
-                tensor.name,
-                tensor.payload.len()
-            )));
-        }
-        put_unicode(&mut pickle, &tensor.name);
-        let rebuild = if untyped { "_rebuild_tensor_v3" } else { "_rebuild_tensor_v2" };
-        put_global(&mut pickle, "torch._utils", rebuild);
-        pickle.push(0x28);
-        pickle.push(0x28);
-        put_unicode(&mut pickle, "storage");
-        put_global(&mut pickle, if untyped { "torch.storage" } else { "torch" }, storage);
-        put_unicode(&mut pickle, &index.to_string());
-        put_unicode(&mut pickle, "cpu");
-        put_int(&mut pickle, if untyped { nbytes } else { count });
-        pickle.push(0x74);
-        pickle.push(0x51);
-        put_int(&mut pickle, 0);
-        put_shape(&mut pickle, &tensor.shape);
-        put_shape(&mut pickle, &c_strides(&tensor.shape));
-        pickle.push(0x89);
-        put_global(&mut pickle, "collections", "OrderedDict");
-        pickle.push(0x29);
-        pickle.push(0x52);
-        if untyped {
-            put_global(&mut pickle, "torch", untyped_dtype(canonical)?.0);
-        }
-        pickle.push(0x74);
-        pickle.push(0x52);
-    }
-    pickle.push(0x75);
-    pickle.push(0x2e);
+    let root = Obj::Dict {
+        pairs: tensors
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| {
+                (
+                    Obj::Str(tensor.name.clone()),
+                    Obj::Fresh {
+                        index,
+                        parameter: None,
+                    },
+                )
+            })
+            .collect(),
+        ordered: false,
+        state: None,
+    };
+    let layout = Layout {
+        prefix: format!("{stem}/"),
+        byteorder: "little".into(),
+        source: None,
+        records: vec![("version".into(), b"3\n".to_vec())],
+    };
+    write_zip(path, &root, tensors, &layout).map(|_| ())
+}
 
+/// Rewrite `source` into `dest` (PT-011). The pickled structure is written
+/// back as it was read: containers, key order, OrderedDict state, plain
+/// values, and each tensor in `unchanged` with its storage, offset, strides,
+/// and conj and neg bits. A storage that several tensors share stays one
+/// `data/` record. Names missing from `tensors` are deleted; the rest are
+/// replaced in place or added. Returns notes on what was re-encoded.
+pub fn rewrite_archive(
+    file: &TorchFile,
+    source: &Path,
+    dest: &Path,
+    tensors: &[OutTensor],
+    unchanged: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if let Some(reason) = &file.refused {
+        return Err(msg(format!(
+            "{} holds {reason}, which tenspile cannot write back (PT-011); use tensconv to write a new state_dict on purpose",
+            source.display()
+        )));
+    }
+    let mut root = file.root.clone();
+    let mut found = Vec::new();
+    flatten(&root, "", &mut found, &mut Vec::new(), &mut Vec::new());
+    for named in &found {
+        if !tensors.iter().any(|tensor| tensor.name == named.name) {
+            remove_tensor(&mut root, &named.name);
+        }
+    }
+    for (index, tensor) in tensors.iter().enumerate() {
+        if unchanged.contains(&tensor.name) {
+            continue;
+        }
+        match find_tensor(&mut root, &tensor.name) {
+            Some(slot) => {
+                // A replaced nn.Parameter stays a Parameter.
+                let parameter = match slot {
+                    Obj::Tensor(old) => old.parameter,
+                    _ => None,
+                };
+                *slot = Obj::Fresh { index, parameter };
+            }
+            None => insert_tensor(
+                &mut root,
+                &tensor.name,
+                Obj::Fresh {
+                    index,
+                    parameter: None,
+                },
+            ),
+        }
+    }
+    let mut zip = open_zip(source)?;
+    let mut records = Vec::new();
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|err| msg(format!("{}: {err}", source.display())))?;
+        let Some(rest) = entry.name().strip_prefix(&file.prefix).map(str::to_string) else {
+            continue;
+        };
+        if entry.is_dir()
+            || rest == "data.pkl"
+            || rest.starts_with("data/")
+            || matches!(rest.as_str(), ".format_version" | ".storage_alignment" | "byteorder")
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|err| io_err(source, err))?;
+        records.push((rest, bytes));
+    }
+    let layout = Layout {
+        prefix: file.prefix.clone(),
+        byteorder: file.byteorder.clone(),
+        source: Some(source),
+        records,
+    };
+    let mut notes = write_zip(dest, &root, tensors, &layout)?;
+    if zip.by_name(&format!("{}.format_version", file.prefix)).is_ok() {
+        notes.push(
+            "left out .format_version, so torch reads each record's offset from its header (PT-009)"
+                .into(),
+        );
+    }
+    Ok(notes)
+}
+
+fn open_zip(path: &Path) -> Result<ZipArchive<File>> {
+    let file = File::open(path).map_err(|err| io_err(path, err))?;
+    ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))
+}
+
+/// The tensor slot that `name` flattens from, as `flatten` names it.
+fn find_tensor<'a>(obj: &'a mut Obj, name: &str) -> Option<&'a mut Obj> {
+    let Obj::Dict { pairs, .. } = obj else {
+        return None;
+    };
+    for (key, value) in pairs.iter_mut() {
+        let Obj::Str(key) = key else {
+            continue;
+        };
+        if key == name && matches!(value, Obj::Tensor(_) | Obj::Fresh { .. }) {
+            return Some(value);
+        }
+        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
+            if let Some(found) = find_tensor(value, rest) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn remove_tensor(obj: &mut Obj, name: &str) -> bool {
+    let Obj::Dict { pairs, .. } = obj else {
+        return false;
+    };
+    for index in 0..pairs.len() {
+        let (Obj::Str(key), value) = &mut pairs[index] else {
+            continue;
+        };
+        if key == name && matches!(value, Obj::Tensor(_) | Obj::Fresh { .. }) {
+            pairs.remove(index);
+            return true;
+        }
+        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
+            let rest = rest.to_string();
+            if remove_tensor(value, &rest) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Add a new tensor to the deepest dict whose path prefixes `name`, or to
+/// the root.
+fn insert_tensor(obj: &mut Obj, name: &str, value: Obj) {
+    let Obj::Dict { pairs, .. } = obj else {
+        return;
+    };
+    for (key, child) in pairs.iter_mut() {
+        let Obj::Str(key) = key else {
+            continue;
+        };
+        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
+            if matches!(child, Obj::Dict { .. }) {
+                insert_tensor(child, rest, value);
+                return;
+            }
+        }
+    }
+    pairs.push((Obj::Str(name.into()), value));
+}
+
+/// Why `obj` cannot be pickled back as it was read, if it cannot.
+fn unreproducible(obj: &Obj) -> Option<String> {
+    match obj {
+        Obj::Set => Some("a set".into()),
+        Obj::Global { module, name } => Some(format!("the value {module}.{name}")),
+        Obj::Storage(_) => Some("a storage outside a tensor".into()),
+        Obj::Tensor(tensor) if !tensor.exact => {
+            Some("a tensor with backward hooks, extra state, or an old rebuild call".into())
+        }
+        Obj::Tuple(items) | Obj::List(items) => items.iter().find_map(unreproducible),
+        Obj::Dict { pairs, state, .. } => pairs
+            .iter()
+            .flat_map(|(key, value)| [key, value])
+            .find_map(unreproducible)
+            .or_else(|| state.as_deref().and_then(unreproducible)),
+        _ => None,
+    }
+}
+
+/// Where a checkpoint's records go, apart from data.pkl and data/.
+struct Layout<'a> {
+    prefix: String,
+    byteorder: String,
+    /// The checkpoint whose `data/` records unchanged tensors point at.
+    source: Option<&'a Path>,
+    /// Records written after `data/`, by name under the prefix.
+    records: Vec<(String, Vec<u8>)>,
+}
+
+enum Record {
+    /// A storage copied from the source checkpoint, by key.
+    Kept(String),
+    /// A new storage holding `tensors[index]`.
+    Fresh { key: String, index: usize },
+}
+
+fn write_zip(path: &Path, root: &Obj, tensors: &[OutTensor], layout: &Layout) -> Result<Vec<String>> {
+    let mut taken = BTreeSet::new();
+    collect_keys(root, &mut taken);
+    let mut emitter = Emitter {
+        out: vec![0x80, 2],
+        tensors,
+        taken,
+        next_key: 0,
+        records: Vec::new(),
+        seen: BTreeSet::new(),
+    };
+    emitter.emit(root)?;
+    emitter.out.push(0x2e);
+    let Emitter { out: pickle, records, .. } = emitter;
+    let big = layout.byteorder == "big";
+    let mut notes = Vec::new();
+    let mut source = layout.source.map(open_zip).transpose()?;
     crate::io_util::with_temp_file(path, |tmp| {
         let file = crate::io_util::create_new(tmp)?;
         let mut writer = ZipWriter::new(file);
@@ -739,29 +1046,277 @@ pub fn write_archive(path: &Path, tensors: &[OutTensor]) -> Result<()> {
         // .format_version is left out (PT-009): with it, torch can compute
         // the record offsets itself and read the wrong bytes.
         let aligned = options.with_alignment(64);
+        let prefix = &layout.prefix;
         let put = |writer: &mut ZipWriter<File>, name: &str, bytes: &[u8]| -> Result<()> {
             writer
-                .start_file(name, options)
+                .start_file(format!("{prefix}{name}"), options)
                 .map_err(|err| msg(format!("pytorch: {err}")))?;
             writer.write_all(bytes)?;
             Ok(())
         };
-        put(&mut writer, &format!("{stem}/data.pkl"), &pickle)?;
-        put(&mut writer, &format!("{stem}/.storage_alignment"), b"64")?;
-        put(&mut writer, &format!("{stem}/byteorder"), b"little")?;
-        for (index, tensor) in tensors.iter().enumerate() {
+        put(&mut writer, "data.pkl", &pickle)?;
+        put(&mut writer, ".storage_alignment", b"64")?;
+        put(&mut writer, "byteorder", layout.byteorder.as_bytes())?;
+        for record in &records {
+            let key = match record {
+                Record::Kept(key) | Record::Fresh { key, .. } => key,
+            };
             writer
-                .start_file(format!("{stem}/data/{index}"), aligned)
+                .start_file(format!("{prefix}data/{key}"), aligned)
                 .map_err(|err| msg(format!("pytorch: {err}")))?;
-            tensor.payload.copy_to(&mut writer)?;
+            match record {
+                Record::Kept(key) => {
+                    let (Some(zip), Some(source_path)) = (source.as_mut(), layout.source) else {
+                        return Err(msg("internal error: a kept storage has no source"));
+                    };
+                    let mut entry = zip.by_name(&format!("{prefix}data/{key}")).map_err(|_| {
+                        msg(format!("{} is missing storage {key}", source_path.display()))
+                    })?;
+                    if entry.compression() != CompressionMethod::Stored {
+                        notes.push(format!(
+                            "storage {key} was compressed and is now stored uncompressed (PT-005)"
+                        ));
+                    }
+                    std::io::copy(&mut entry, &mut writer).map_err(|err| io_err(source_path, err))?;
+                }
+                Record::Fresh { index, .. } => {
+                    let tensor = &tensors[*index];
+                    if big {
+                        let mut bytes = tensor.payload.read_vec()?;
+                        dtype::byteswap(&mut bytes, dtype::canonical_id(&tensor.dtype)?)?;
+                        writer.write_all(&bytes)?;
+                    } else {
+                        tensor.payload.copy_to(&mut writer)?;
+                    }
+                }
+            }
         }
-        put(&mut writer, &format!("{stem}/version"), b"3\n")?;
+        for (name, bytes) in &layout.records {
+            put(&mut writer, name, bytes)?;
+        }
         writer
             .finish()
             .map_err(|err| msg(format!("pytorch: {err}")))?
             .sync_all()?;
         Ok(())
+    })?;
+    Ok(notes)
+}
+
+/// Storage keys that unchanged tensors keep.
+fn collect_keys(obj: &Obj, keys: &mut BTreeSet<String>) {
+    match obj {
+        Obj::Tensor(tensor) => {
+            keys.insert(tensor.storage.key.clone());
+        }
+        Obj::Tuple(items) | Obj::List(items) => items.iter().for_each(|item| collect_keys(item, keys)),
+        Obj::Dict { pairs, state, .. } => {
+            for (key, value) in pairs {
+                collect_keys(key, keys);
+                collect_keys(value, keys);
+            }
+            if let Some(state) = state {
+                collect_keys(state, keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct Emitter<'a> {
+    out: Vec<u8>,
+    tensors: &'a [OutTensor],
+    /// Keys of kept storages, which new storages must not reuse.
+    taken: BTreeSet<String>,
+    next_key: u64,
+    records: Vec<Record>,
+    seen: BTreeSet<String>,
+}
+
+impl Emitter<'_> {
+    fn emit(&mut self, obj: &Obj) -> Result<()> {
+        match obj {
+            Obj::None => self.out.push(0x4e),
+            Obj::Bool(flag) => self.out.push(if *flag { 0x88 } else { 0x89 }),
+            Obj::Int(value) => put_signed(&mut self.out, *value),
+            Obj::Float(value) => {
+                self.out.push(0x47);
+                self.out.extend_from_slice(&value.to_be_bytes());
+            }
+            Obj::Str(text) => put_unicode(&mut self.out, text),
+            Obj::Tuple(items) if items.is_empty() => self.out.push(0x29),
+            Obj::Tuple(items) => {
+                self.out.push(0x28);
+                for item in items {
+                    self.emit(item)?;
+                }
+                self.out.push(0x74);
+            }
+            Obj::List(items) => {
+                self.out.push(0x5d);
+                if !items.is_empty() {
+                    self.out.push(0x28);
+                    for item in items {
+                        self.emit(item)?;
+                    }
+                    self.out.push(0x65);
+                }
+            }
+            Obj::Dict { pairs, ordered, state } => {
+                if *ordered {
+                    put_ordered_dict(&mut self.out);
+                } else {
+                    self.out.push(0x7d);
+                }
+                if !pairs.is_empty() {
+                    self.out.push(0x28);
+                    for (key, value) in pairs {
+                        self.emit(key)?;
+                        self.emit(value)?;
+                    }
+                    self.out.push(0x75);
+                }
+                if let Some(state) = state {
+                    self.emit(state)?;
+                    self.out.push(0x62);
+                }
+            }
+            Obj::Tensor(tensor) => {
+                if self.seen.insert(tensor.storage.key.clone()) {
+                    self.records.push(Record::Kept(tensor.storage.key.clone()));
+                }
+                put_tensor(&mut self.out, tensor)?;
+            }
+            Obj::Fresh { index, parameter } => {
+                let key = loop {
+                    let key = self.next_key.to_string();
+                    self.next_key += 1;
+                    if !self.taken.contains(&key) {
+                        break key;
+                    }
+                };
+                let mut tensor = fresh_ref(&self.tensors[*index], key.clone())?;
+                tensor.parameter = *parameter;
+                self.records.push(Record::Fresh { key, index: *index });
+                put_tensor(&mut self.out, &tensor)?;
+            }
+            Obj::Set | Obj::Global { .. } | Obj::Storage(_) => {
+                return Err(msg("internal error: this pickle value cannot be written"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The rebuild call for a new tensor. A dtype without a legacy storage class
+/// goes through _rebuild_tensor_v3 with an UntypedStorage, whose numel counts
+/// bytes (pytorch.yaml `write`).
+fn fresh_ref(tensor: &OutTensor, key: String) -> Result<TensorRef> {
+    let canonical = dtype::canonical_id(&tensor.dtype)?;
+    let untyped = canonical_storage(canonical).is_err();
+    let (module, storage, itemsize, torch_name) = if untyped {
+        let (name, bits) = untyped_dtype(canonical)?;
+        ("torch.storage", "UntypedStorage", bits / 8, Some(name.to_string()))
+    } else {
+        let (storage, itemsize) = canonical_storage(canonical)?;
+        ("torch", storage, itemsize, None)
+    };
+    let count = numel(&tensor.shape).ok_or_else(|| msg("shape is too large to count"))?;
+    let nbytes = count
+        .checked_mul(itemsize)
+        .ok_or_else(|| msg("pytorch tensor is too large"))?;
+    if tensor.payload.len() != nbytes {
+        return Err(msg(format!(
+            "tensor {} is {} bytes; {canonical} needs {nbytes}",
+            tensor.name,
+            tensor.payload.len()
+        )));
+    }
+    Ok(TensorRef {
+        dtype: canonical.into(),
+        shape: tensor.shape.clone(),
+        strides: c_strides(&tensor.shape),
+        storage: StorageRef {
+            module: module.into(),
+            type_name: storage.into(),
+            key,
+            location: "cpu".into(),
+            numel: if untyped { nbytes } else { count },
+        },
+        storage_bytes: nbytes,
+        offset_elems: 0,
+        itemsize,
+        rebuild: if untyped { Rebuild::V3 } else { Rebuild::V2 },
+        torch_dtype: torch_name,
+        requires_grad: false,
+        conj: false,
+        neg: false,
+        parameter: None,
+        exact: true,
     })
+}
+
+fn put_tensor(out: &mut Vec<u8>, tensor: &TensorRef) -> Result<()> {
+    if !tensor.exact || tensor.rebuild == Rebuild::Legacy {
+        return Err(msg("internal error: this tensor's rebuild call cannot be written"));
+    }
+    if let Some(requires_grad) = tensor.parameter {
+        put_global(out, "torch._utils", "_rebuild_parameter");
+        out.push(0x28);
+        put_rebuild(out, tensor)?;
+        out.push(if requires_grad { 0x88 } else { 0x89 });
+        put_ordered_dict(out);
+        out.push(0x74);
+        out.push(0x52);
+        Ok(())
+    } else {
+        put_rebuild(out, tensor)
+    }
+}
+
+fn put_rebuild(out: &mut Vec<u8>, tensor: &TensorRef) -> Result<()> {
+    let v3 = tensor.rebuild == Rebuild::V3;
+    put_global(out, "torch._utils", if v3 { "_rebuild_tensor_v3" } else { "_rebuild_tensor_v2" });
+    out.push(0x28);
+    out.push(0x28);
+    put_unicode(out, "storage");
+    put_global(out, &tensor.storage.module, &tensor.storage.type_name);
+    put_unicode(out, &tensor.storage.key);
+    put_unicode(out, &tensor.storage.location);
+    put_int(out, tensor.storage.numel);
+    out.push(0x74);
+    out.push(0x51);
+    put_int(out, tensor.offset_elems);
+    put_shape(out, &tensor.shape);
+    put_shape(out, &tensor.strides);
+    out.push(if tensor.requires_grad { 0x88 } else { 0x89 });
+    put_ordered_dict(out);
+    if v3 {
+        let name = tensor
+            .torch_dtype
+            .as_deref()
+            .ok_or_else(|| msg("internal error: a v3 rebuild has no dtype"))?;
+        put_global(out, "torch", name);
+    }
+    if tensor.conj || tensor.neg {
+        out.extend_from_slice(&[0x7d, 0x28]);
+        for (key, set) in [("conj", tensor.conj), ("neg", tensor.neg)] {
+            if set {
+                put_unicode(out, key);
+                out.push(0x88);
+            }
+        }
+        out.push(0x75);
+    }
+    out.push(0x74);
+    out.push(0x52);
+    Ok(())
+}
+
+fn put_ordered_dict(out: &mut Vec<u8>) {
+    put_global(out, "collections", "OrderedDict");
+    out.push(0x29);
+    out.push(0x52);
 }
 
 fn canonical_storage(dtype: &str) -> Result<(&'static str, u64)> {
@@ -842,6 +1397,19 @@ fn put_int(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+fn put_signed(out: &mut Vec<u8>, value: i64) {
+    if value >= 0 {
+        put_int(out, value as u64);
+    } else if value >= i64::from(i32::MIN) {
+        out.push(0x4a);
+        out.extend_from_slice(&(value as i32).to_le_bytes());
+    } else {
+        out.push(0x8a);
+        out.push(8);
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 fn put_shape(out: &mut Vec<u8>, shape: &[u64]) {
     match shape.len() {
         0 => out.push(0x29),
@@ -871,8 +1439,7 @@ fn put_shape(out: &mut Vec<u8>, shape: &[u64]) {
 }
 
 pub fn open(path: &Path) -> Result<Archive> {
-    let file = File::open(path).map_err(|err| io_err(path, err))?;
-    let mut zip = ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
+    let mut zip = open_zip(path)?;
     // PT-001 / PT-001i: the first record names the archive folder, every
     // record sits under it, and data.pkl is directly inside it.
     let mut prefix: Option<String> = None;
@@ -924,14 +1491,16 @@ pub fn open(path: &Path) -> Result<Archive> {
     let mut metadata = Vec::new();
     let mut notes = Vec::new();
     flatten(&obj, "", &mut found, &mut metadata, &mut notes);
-    // tenspile writes a flat dict of tensors. A nested dict, or a value that
-    // is not a tensor, would not survive a rewrite.
-    let flat = metadata.is_empty()
-        && notes.is_empty()
-        && found.iter().all(|tensor| !has_nested_key(&obj, &tensor.name));
     if found.is_empty() {
         return Err(msg(format!("{} pickle has no tensors", path.display())));
     }
+    let mut names = BTreeSet::new();
+    let refused = unreproducible(&obj).or_else(|| {
+        found
+            .iter()
+            .find(|named| !names.insert(named.name.as_str()))
+            .map(|named| format!("two entries named {}", named.name))
+    });
     let byteorder =
         record_text(&mut zip, &format!("{prefix}byteorder")).unwrap_or_else(|| "little".into());
     if byteorder != "little" && byteorder != "big" {
@@ -949,83 +1518,20 @@ pub fn open(path: &Path) -> Result<Archive> {
         .unwrap_or_else(|| "zip".into());
     let mut members = Vec::with_capacity(found.len());
     for named in found {
-        let tensor = named.tensor;
-        if !is_c_order(&tensor.shape, &tensor.strides) {
-            return Err(msg(format!(
-                "pytorch tensor {} is strided; tenspile does not gather it",
-                named.name
-            )));
-        }
+        let tensor = &named.tensor;
         let count = numel(&tensor.shape).ok_or_else(|| msg("shape is too large to count"))?;
         let nbytes = count
             .checked_mul(tensor.itemsize)
             .ok_or_else(|| msg("pytorch tensor is too large"))?;
-        let byte_off = tensor
-            .offset_elems
-            .checked_mul(tensor.itemsize)
-            .ok_or_else(|| msg("pytorch storage offset overflows"))?;
-        let end = byte_off
-            .checked_add(nbytes)
-            .ok_or_else(|| msg("pytorch storage offset overflows"))?;
-        if count > 0 && tensor.storage_bytes < end {
-            return Err(msg(format!(
-                "pytorch tensor {} storage is smaller than its view (PT-004)",
-                named.name
-            )));
-        }
-        let entry_name = format!("{prefix}data/{}", tensor.storage_key);
-        let stored = zip.by_name(&entry_name).map_err(|_| {
-            msg(format!(
-                "{} is missing storage {}",
-                path.display(),
-                tensor.storage_key
-            ))
-        })?;
-        if stored.size() < tensor.storage_bytes {
-            return Err(msg(format!(
-                "pytorch storage {} is shorter than its numel (PT-003)",
-                tensor.storage_key
-            )));
-        }
-        let compressed = stored.compression() != CompressionMethod::Stored;
-        if compressed {
-            notes.push(format!("storage {} is compressed (PT-005)", tensor.storage_key));
-        }
-        let payload = if compressed || byteorder == "big" {
-            // Read only up to the end of this view, not the whole storage.
-            let mut stored = stored;
-            std::io::copy(&mut (&mut stored).take(byte_off), &mut std::io::sink())
-                .map_err(|err| io_err(path, err))?;
-            let mut bytes = Vec::new();
-            (&mut stored)
-                .take(nbytes)
-                .read_to_end(&mut bytes)
-                .map_err(|err| io_err(path, err))?;
-            if bytes.len() as u64 != nbytes {
-                return Err(msg(format!(
-                    "pytorch storage {} slice is out of range",
-                    tensor.storage_key
-                )));
-            }
-            if byteorder == "big" {
-                dtype::byteswap(&mut bytes, &tensor.dtype)?;
-            }
-            Payload::Bytes(bytes)
-        } else {
-            Payload::Range {
-                path: path.to_path_buf(),
-                offset: stored.data_start() + byte_off,
-                len: nbytes,
-            }
-        };
+        let payload = tensor_payload(&mut zip, path, &prefix, &named, &byteorder, &mut notes)?;
         let file_offset = match &payload {
             Payload::Range { offset, .. } => *offset,
             _ => 0,
         };
         members.push(Member {
             name: named.name,
-            dtype: tensor.dtype,
-            shape: tensor.shape,
+            dtype: named.tensor.dtype,
+            shape: named.tensor.shape,
             file_offset,
             nbytes,
             numel: Some(count),
@@ -1046,18 +1552,165 @@ pub fn open(path: &Path) -> Result<Archive> {
         metadata,
         data_bytes,
         notes,
-        inner: Inner::Pytorch { flat },
+        inner: Inner::Pytorch(TorchFile {
+            root: obj,
+            prefix,
+            byteorder,
+            refused,
+        }),
     })
 }
 
-/// Whether `name` came from a nested dict rather than one top-level key.
-fn has_nested_key(obj: &Obj, name: &str) -> bool {
-    let Obj::Dict(pairs) = obj else {
-        return false;
+/// A tensor's canonical bytes. A contiguous view of a little-endian,
+/// uncompressed storage is read where it lies. Otherwise the view is read,
+/// gathered when strided, byteswapped (PT-006), and has its conj and neg
+/// bits applied (PT-010).
+fn tensor_payload(
+    zip: &mut ZipArchive<File>,
+    path: &Path,
+    prefix: &str,
+    named: &NamedTensor,
+    byteorder: &str,
+    notes: &mut Vec<String>,
+) -> Result<Payload> {
+    let tensor = &named.tensor;
+    let count = numel(&tensor.shape).ok_or_else(|| msg("shape is too large to count"))?;
+    if tensor.strides.len() != tensor.shape.len() {
+        return Err(msg(format!(
+            "pytorch tensor {} has {} strides for {} dimensions",
+            named.name,
+            tensor.strides.len(),
+            tensor.shape.len()
+        )));
+    }
+    // Elements from the first to the last one the view reads (PT-004).
+    let mut span = u64::from(count > 0);
+    if count > 0 {
+        for (size, stride) in tensor.shape.iter().zip(&tensor.strides) {
+            span = (size - 1)
+                .checked_mul(*stride)
+                .and_then(|reach| span.checked_add(reach))
+                .ok_or_else(|| msg("pytorch tensor view overflows"))?;
+        }
+    }
+    let byte_off = tensor
+        .offset_elems
+        .checked_mul(tensor.itemsize)
+        .ok_or_else(|| msg("pytorch storage offset overflows"))?;
+    let span_bytes = span
+        .checked_mul(tensor.itemsize)
+        .ok_or_else(|| msg("pytorch tensor is too large"))?;
+    let end = byte_off
+        .checked_add(span_bytes)
+        .ok_or_else(|| msg("pytorch storage offset overflows"))?;
+    if count > 0 && tensor.storage_bytes < end {
+        return Err(msg(format!(
+            "pytorch tensor {} storage is smaller than its view (PT-004)",
+            named.name
+        )));
+    }
+    let key = &tensor.storage.key;
+    let stored = zip
+        .by_name(&format!("{prefix}data/{key}"))
+        .map_err(|_| msg(format!("{} is missing storage {key}", path.display())))?;
+    if stored.size() < tensor.storage_bytes {
+        return Err(msg(format!(
+            "pytorch storage {key} is shorter than its numel (PT-003)"
+        )));
+    }
+    let compressed = stored.compression() != CompressionMethod::Stored;
+    if compressed {
+        notes.push(format!("storage {key} is compressed (PT-005)"));
+    }
+    let contiguous = is_c_order(&tensor.shape, &tensor.strides);
+    if contiguous && !compressed && byteorder == "little" && !tensor.conj && !tensor.neg {
+        return Ok(Payload::Range {
+            path: path.to_path_buf(),
+            offset: stored.data_start() + byte_off,
+            len: span_bytes,
+        });
+    }
+    // Read only up to the end of this view, not the whole storage.
+    let mut stored = stored;
+    std::io::copy(&mut (&mut stored).take(byte_off), &mut std::io::sink())
+        .map_err(|err| io_err(path, err))?;
+    let mut bytes = Vec::new();
+    (&mut stored)
+        .take(span_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|err| io_err(path, err))?;
+    if bytes.len() as u64 != span_bytes {
+        return Err(msg(format!("pytorch storage {key} slice is out of range")));
+    }
+    if !contiguous {
+        bytes = gather(&bytes, &tensor.shape, &tensor.strides, tensor.itemsize as usize);
+    }
+    if byteorder == "big" {
+        dtype::byteswap(&mut bytes, &tensor.dtype)?;
+    }
+    if tensor.conj {
+        negate(&mut bytes, &tensor.dtype, true)?;
+    }
+    if tensor.neg {
+        negate(&mut bytes, &tensor.dtype, false)?;
+    }
+    Ok(Payload::Bytes(bytes))
+}
+
+/// The elements of a strided view, in C order. `span` starts at the view's
+/// first element and holds every element it reads.
+fn gather(span: &[u8], shape: &[u64], strides: &[u64], itemsize: usize) -> Vec<u8> {
+    let count = shape.iter().product::<u64>() as usize;
+    let mut out = Vec::with_capacity(count * itemsize);
+    let mut index = vec![0u64; shape.len()];
+    for _ in 0..count {
+        let at = index
+            .iter()
+            .zip(strides)
+            .map(|(position, stride)| position * stride)
+            .sum::<u64>() as usize
+            * itemsize;
+        out.extend_from_slice(&span[at..at + itemsize]);
+        for dim in (0..shape.len()).rev() {
+            index[dim] += 1;
+            if index[dim] < shape[dim] {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+    out
+}
+
+/// Negate every element, or with `imag_only` every imaginary part, by
+/// flipping the IEEE sign bit: the top bit of each little-endian value's
+/// last byte. torch sets the conj bit only on complex tensors, and the neg
+/// bit on the float views of them.
+fn negate(bytes: &mut [u8], dtype: &str, imag_only: bool) -> Result<()> {
+    let bit = if imag_only { "conj" } else { "neg" };
+    let (width, complex) = match dtype {
+        "float16" | "bfloat16" => (2, false),
+        "float32" => (4, false),
+        "float64" => (8, false),
+        "complex64" => (4, true),
+        "complex128" => (8, true),
+        other => {
+            return Err(msg(format!(
+                "pytorch {bit} bit on a {other} tensor is not supported (PT-010)"
+            )))
+        }
     };
-    !pairs
-        .iter()
-        .any(|(key, _)| matches!(key, Obj::Str(key) if key == name))
+    if imag_only && !complex {
+        return Err(msg(format!(
+            "pytorch conj bit on a {dtype} tensor, which is not complex (PT-010)"
+        )));
+    }
+    for (index, part) in bytes.chunks_exact_mut(width).enumerate() {
+        if !imag_only || index % 2 == 1 {
+            part[width - 1] ^= 0x80;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1106,6 +1759,7 @@ mod tests {
         ];
         write_archive(&path, &tensors).unwrap();
         let archive = open(&path).unwrap();
+        assert!(matches!(&archive.inner, Inner::Pytorch(file) if file.refused.is_none()));
         for (member, tensor) in archive.members.iter().zip(&tensors) {
             assert_eq!((member.name.as_str(), member.dtype.as_str()), (tensor.name.as_str(), tensor.dtype.as_str()));
             assert_eq!(member.shape, tensor.shape);
@@ -1113,8 +1767,40 @@ mod tests {
         }
     }
 
+    fn names(path: &Path) -> Vec<String> {
+        open(path).unwrap().members.into_iter().map(|member| member.name).collect()
+    }
+
+    fn values(path: &Path, name: &str) -> Vec<u8> {
+        let archive = open(path).unwrap();
+        let member = archive.members.iter().find(|member| member.name == name).unwrap();
+        member.payload.read_vec().unwrap()
+    }
+
+    fn file(path: &Path) -> TorchFile {
+        match open(path).unwrap().inner {
+            Inner::Pytorch(file) => file,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+    }
+
+    fn pickle_of(path: &Path) -> Vec<u8> {
+        let mut zip = open_zip(path).unwrap();
+        let name = (0..zip.len())
+            .map(|index| zip.by_index(index).unwrap().name().to_string())
+            .find(|name| is_data_pkl(name))
+            .unwrap();
+        read_entry(&mut zip, &name, path).unwrap()
+    }
+
+    fn data_records(path: &Path) -> usize {
+        let zip = open_zip(path).unwrap();
+        zip.file_names().filter(|name| name.contains("/data/")).count()
+    }
+
     #[test]
-    fn only_a_flat_dict_of_tensors_can_be_rewritten() {
+    fn a_nested_checkpoint_is_rewritten_with_its_structure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m.pt");
         let tensor = OutTensor {
@@ -1124,18 +1810,126 @@ mod tests {
             payload: Payload::Bytes(vec![0; 8]),
         };
         write_archive(&path, &[tensor]).unwrap();
-        assert!(matches!(open(&path).unwrap().inner, Inner::Pytorch { flat: true }));
-        // {'state_dict': {...}, 'epoch': 3}
+        assert!(file(&path).refused.is_none());
+        // {'state_dict': {...}, 'epoch': 3, 'loss': -0.5, 'tags': ['a', None]}
         repickle(&path, |pickle| {
             let mut out = vec![0x80, 2, 0x7d, 0x28];
             put_unicode(&mut out, "state_dict");
             out.extend_from_slice(&pickle[2..pickle.len() - 1]);
             put_unicode(&mut out, "epoch");
-            out.extend_from_slice(&[0x4b, 3, 0x75, 0x2e]);
+            out.extend_from_slice(&[0x4b, 3]);
+            put_unicode(&mut out, "loss");
+            out.push(0x47);
+            out.extend_from_slice(&(-0.5f64).to_be_bytes());
+            put_unicode(&mut out, "tags");
+            out.extend_from_slice(&[0x5d, 0x28]);
+            put_unicode(&mut out, "a");
+            out.extend_from_slice(&[0x4e, 0x65, 0x75, 0x2e]);
             out
         });
+        let before = pickle_of(&path);
         let archive = open(&path).unwrap();
         assert_eq!(archive.members[0].name, "state_dict.w");
-        assert!(matches!(archive.inner, Inner::Pytorch { flat: false }));
+        let Inner::Pytorch(torch) = &archive.inner else { unreachable!() };
+        assert!(torch.refused.is_none());
+        // Writing the same tensors back gives the same pickle.
+        let same = dir.path().join("same.pt");
+        let tensors = [OutTensor {
+            name: "state_dict.w".into(),
+            dtype: "float32".into(),
+            shape: vec![2],
+            payload: archive.members[0].payload.clone(),
+        }];
+        let unchanged = BTreeSet::from(["state_dict.w".to_string()]);
+        rewrite_archive(torch, &path, &same, &tensors, &unchanged).unwrap();
+        assert_eq!(pickle_of(&same), before);
+        // A new name under state_dict goes into that dict.
+        let added = dir.path().join("added.pt");
+        let more = [
+            OutTensor {
+                name: "state_dict.w".into(),
+                dtype: "float32".into(),
+                shape: vec![2],
+                payload: archive.members[0].payload.clone(),
+            },
+            OutTensor {
+                name: "state_dict.b".into(),
+                dtype: "uint16".into(),
+                shape: vec![1],
+                payload: Payload::Bytes(vec![7, 0]),
+            },
+        ];
+        rewrite_archive(torch, &path, &added, &more, &unchanged).unwrap();
+        let reread = open(&added).unwrap();
+        assert_eq!(names(&added), ["state_dict.w", "state_dict.b"]);
+        assert_eq!(
+            reread.metadata,
+            [("epoch".to_string(), "3".to_string()), ("loss".into(), "-0.5".into())]
+        );
+        assert_eq!(values(&added, "state_dict.b"), [7, 0]);
+    }
+
+    #[test]
+    fn a_set_or_a_foreign_global_refuses_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.pt");
+        let tensor = OutTensor {
+            name: "w".into(),
+            dtype: "float32".into(),
+            shape: vec![2],
+            payload: Payload::Bytes(vec![0; 8]),
+        };
+        write_archive(&path, &[tensor]).unwrap();
+        repickle(&path, |pickle| {
+            let mut out = pickle[..pickle.len() - 2].to_vec();
+            put_unicode(&mut out, "seen");
+            out.extend_from_slice(&[0x8f, 0x75, 0x2e]);
+            out
+        });
+        assert_eq!(file(&path).refused.as_deref(), Some("a set"));
+    }
+
+    #[test]
+    fn a_rewrite_keeps_shared_storage_views_and_metadata_bits() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tensdataspecs_readonly/specs/test-vectors/small-pt-fp8.pt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fp8.pt");
+        let archive = open(&source).unwrap();
+        let Inner::Pytorch(torch) = &archive.inner else { unreachable!() };
+        assert!(torch.refused.is_none());
+        assert_eq!(data_records(&source), 5);
+        let keep: Vec<_> = archive
+            .members
+            .iter()
+            .filter(|member| member.name != "f8e5m2")
+            .map(|member| OutTensor {
+                name: member.name.clone(),
+                dtype: member.dtype.clone(),
+                shape: member.shape.clone(),
+                payload: member.payload.clone(),
+            })
+            .collect();
+        let unchanged = keep.iter().map(|tensor| tensor.name.clone()).collect();
+        rewrite_archive(torch, &source, &path, &keep, &unchanged).unwrap();
+        // tied_a, tied_b, and row1 still share one record; f8e5m2's is gone.
+        assert_eq!(data_records(&path), 4);
+        for tensor in &keep {
+            assert_eq!(values(&path, &tensor.name), tensor.payload.read_vec().unwrap(), "{}", tensor.name);
+        }
+        // Replacing tied_a gives it a record of its own; tied_b keeps the old one.
+        let replaced = dir.path().join("replaced.pt");
+        let mut changed = keep;
+        let index = changed.iter().position(|tensor| tensor.name == "tied_a").unwrap();
+        changed[index].payload = Payload::Bytes(vec![0; 16]);
+        let unchanged = changed
+            .iter()
+            .filter(|tensor| tensor.name != "tied_a")
+            .map(|tensor| tensor.name.clone())
+            .collect();
+        rewrite_archive(torch, &source, &replaced, &changed, &unchanged).unwrap();
+        assert_eq!(data_records(&replaced), 5);
+        assert_eq!(values(&replaced, "tied_a"), vec![0; 16]);
+        assert_eq!(values(&replaced, "tied_b"), values(&source, "tied_b"));
     }
 }

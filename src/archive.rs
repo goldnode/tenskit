@@ -51,10 +51,8 @@ pub enum Inner {
     Index(IndexFile),
     #[cfg(format_raw_sidecar)]
     Raw(crate::formats::rawtensor::RawFile),
-    /// `flat` is false when the checkpoint holds nested dicts or values that
-    /// are not tensors, which a rewrite would drop.
     #[cfg(format_pytorch)]
-    Pytorch { flat: bool },
+    Pytorch(crate::formats::pytorch::TorchFile),
     #[cfg(format_onnx)]
     Onnx,
 }

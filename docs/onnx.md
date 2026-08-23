@@ -59,13 +59,22 @@ tenspile does not write external data. A model of 2 GiB or more is refused (ONNX
 
 ## Editing a model
 
-`-r`, `-u`, and `--delete` rewrite only what they change. Everything else in the model is copied:
+`-r`, `-u`, and `--delete` rewrite only what they change (ONNX-009). Everything else in the model is copied:
 
-- graph nodes, inputs, outputs, value info, opsets, the producer, and other fields;
+- graph nodes, inputs, outputs, value info, functions, training info, quantization annotations, the producer, and fields tenspile does not know;
+- `ir_version` and `opset_import`, as stored (ONNX-013);
 - each initializer the edit does not touch, in its original encoding, including typed fields and external-data references.
 
-A replaced or added initializer is written with `raw_data`. A metadata update replaces `metadata_props`. Deleting an initializer also removes a graph output of the same name. Deleting one that a node still reads is refused, because the model would no longer run:
+A replaced or added initializer is written with `raw_data`. When its dtype is newer than the model's IR, `ir_version` is raised to the first IR that has it, and the edit says so. `--metadata k=v` sets that key in `metadata_props`; the other keys stay.
+
+When `-o` puts the model in another directory, each external-data file that a kept initializer names is copied beside it, so the reference still resolves (ONNX-003). An existing file of that name stops the edit.
+
+Deleting an initializer also removes the graph input, graph output, and `value_info` entry with its name (ONNX-010, ONNX-012). The delete is refused when the model still uses the name (ONNX-011, ONNX-012):
+
+- a node input, in the main graph or in a subgraph of an `If`, `Loop`, or `Scan` node, unless the subgraph defines the name itself;
+- a key of a training `initialization_binding` or `update_binding`;
+- a quantization annotation, as the tensor or as one of its scale or zero-point tensors.
 
 ```
-tenspile: initializer w is an input of a graph node; deleting it would break the model
+tenspile: initializer w is an input of a graph node; deleting it would break the model (ONNX-011)
 ```

@@ -28,8 +28,9 @@ pub struct TensorRec {
     pub nbytes: u64,
     pub fortran: bool,
     pub payload: Payload,
-    /// `attrs`, `native`, and `sha256` as stored, kept when an edit leaves
-    /// the tensor alone.
+    /// Entry fields other than the six that locate the bytes: `attrs`,
+    /// `native`, `sha256`, and any this reader does not know. An edit keeps
+    /// them on a tensor it leaves alone (RAW-011).
     pub extra: Map<String, Value>,
 }
 
@@ -40,11 +41,18 @@ pub struct RawFile {
     pub byte_order: String,
     pub alignment: u64,
     pub metadata: Map<String, Value>,
-    /// The optional provenance object.
-    pub source: Option<Value>,
+    /// Manifest fields other than the ones this reader uses: `source`,
+    /// `history`, and any it does not know. An edit keeps them (RAW-010).
+    pub extra: Map<String, Value>,
     pub tensors: Vec<TensorRec>,
     pub notes: Vec<String>,
 }
+
+/// The TensorEntry fields that locate a tensor's bytes; a writer sets them.
+const ENTRY_FIELDS: [&str; 6] = ["name", "dtype", "shape", "file", "offset", "nbytes"];
+
+/// The manifest fields a writer sets.
+const MANIFEST_FIELDS: [&str; 6] = ["format", "version", "byte_order", "alignment", "tensors", "metadata"];
 
 pub fn is_manifest_name(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(MANIFEST_SUFFIX)
@@ -231,9 +239,10 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
             }
         }
         ranges.push((file_name.to_string(), offset, nbytes));
-        let extra = ["attrs", "native", "sha256"]
-            .into_iter()
-            .filter_map(|key| tensor.get(key).map(|value| (key.to_string(), value.clone())))
+        let extra = tensor
+            .iter()
+            .filter(|(key, _)| !ENTRY_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         tensors.push(TensorRec {
             name,
@@ -253,7 +262,11 @@ pub fn read_file(path: &Path) -> Result<RawFile> {
         byte_order,
         alignment,
         metadata,
-        source: object.get("source").cloned(),
+        extra: object
+            .iter()
+            .filter(|(key, _)| !MANIFEST_FIELDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
         tensors,
         notes,
     })
@@ -311,7 +324,7 @@ pub struct OutTensor {
     pub shape: Vec<u64>,
     pub payload: Payload,
     pub fortran: bool,
-    /// Entry fields written as given: `attrs`, `native`, or `sha256`.
+    /// Entry fields written as given, such as `attrs`, `native`, or `sha256`.
     pub extra: Map<String, Value>,
 }
 
@@ -320,14 +333,14 @@ pub fn write_archive(
     metadata: &Map<String, Value>,
     tensors: &[OutTensor],
 ) -> Result<()> {
-    write_archive_with_source(manifest, metadata, None, tensors)
+    write_archive_with(manifest, metadata, &Map::new(), tensors)
 }
 
-/// `write_archive`, plus the manifest's `source` object.
-pub fn write_archive_with_source(
+/// `write_archive`, plus manifest fields such as `source` and `history`.
+pub fn write_archive_with(
     manifest: &Path,
     metadata: &Map<String, Value>,
-    source: Option<&Value>,
+    extra: &Map<String, Value>,
     tensors: &[OutTensor],
 ) -> Result<()> {
     if !is_manifest_name(
@@ -374,7 +387,11 @@ pub fn write_archive_with_source(
             "nbytes": nbytes,
         });
         if let Value::Object(fields) = &mut entry {
-            fields.extend(tensor.extra.clone());
+            for (key, value) in &tensor.extra {
+                if !ENTRY_FIELDS.contains(&key.as_str()) {
+                    fields.insert(key.clone(), value.clone());
+                }
+            }
         }
         entries.push(entry);
         offset += nbytes;
@@ -388,8 +405,10 @@ pub fn write_archive_with_source(
     if !metadata.is_empty() {
         document.insert("metadata".into(), Value::Object(metadata.clone()));
     }
-    if let Some(source) = source {
-        document.insert("source".into(), source.clone());
+    for (key, value) in extra {
+        if !MANIFEST_FIELDS.contains(&key.as_str()) {
+            document.insert(key.clone(), value.clone());
+        }
     }
     let mut body = serde_json::to_vec_pretty(&Value::Object(document))?;
     body.push(b'\n');

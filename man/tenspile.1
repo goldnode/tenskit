@@ -83,12 +83,19 @@ a rawtensor manifest with
 is verified, and big-endian or compressed data is decoded.
 A rewrite streams unchanged tensor bytes into a temporary file and renames it
 into place.
-It keeps what it does not change: safetensors and GGUF metadata, the graph of
-an ONNX model, npz members that are not arrays, and a rawtensor manifest's
+It keeps what it does not change: safetensors and GGUF metadata, the graph,
+opsets, and IR version of an ONNX model, the pickled structure and shared
+storages of a PyTorch checkpoint, npz members and their compression, and a
+rawtensor manifest's
 .I source
 and per-tensor fields.
-A PyTorch checkpoint with nested dicts or values that are not tensors is
-refused, because tenspile writes a flat state_dict.
+What it re-encodes is printed on stderr.
+A rawtensor edit is appended to the manifest's
+.IR history .
+Deleting an ONNX initializer that a node, a subgraph, a training binding, or a
+quantization annotation still names is refused.
+A PyTorch checkpoint holding a value tenspile cannot write back exactly, such
+as a set, is refused.
 .PP
 Comparison is
 .BR \%tensdiff (1).

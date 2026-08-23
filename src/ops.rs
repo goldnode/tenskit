@@ -819,7 +819,7 @@ fn modify(cli: &Cli, mode: Modify) -> Result<()> {
         #[cfg(format_raw_sidecar)]
         Inner::Raw(_) => edit_raw(cli, &archive, mode, &dest),
         #[cfg(format_pytorch)]
-        Inner::Pytorch { flat } => edit_pytorch(cli, &archive, mode, &dest, *flat),
+        Inner::Pytorch(file) => edit_pytorch(cli, &archive, mode, &dest, file),
         #[cfg(format_onnx)]
         Inner::Onnx => edit_onnx(cli, &archive, mode, &dest),
         _ => Err(msg("this format cannot be edited in this build")),
@@ -886,7 +886,7 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     ensure_parent(dest)?;
     // Arrays the edit leaves alone, and members that are not arrays, are
-    // copied as stored, header included.
+    // copied as stored, header and compression included (NPZ-008, NPZ-009).
     let (entries, _) = npz::read_entries(&archive.path)?;
     let mut members = Vec::with_capacity(planned.len());
     for item in &planned {
@@ -912,7 +912,12 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
             },
         });
     }
-    npz::write_archive(dest, &members)
+    // A replaced array keeps its member's compression, and a new one
+    // follows the archive: deflated when every member is (NPZ-009).
+    let all_deflated = npz::all_deflated(&archive.path)?;
+    npz::write_archive_with(dest, &members, &|key| {
+        all_deflated || entries.iter().any(|entry| entry.key == key && entry.compressed)
+    })
 }
 
 #[cfg(format_pytorch)]
@@ -944,16 +949,22 @@ fn write_onnx(dest: &Path, metadata: &[(String, String)], incoming: &[Planned]) 
 }
 
 #[cfg(format_pytorch)]
-fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path, flat: bool) -> Result<()> {
+fn edit_pytorch(
+    cli: &Cli,
+    archive: &Archive,
+    mode: Modify,
+    dest: &Path,
+    file: &crate::formats::pytorch::TorchFile,
+) -> Result<()> {
     let updates = string_updates(cli)?;
     if !updates.is_empty() {
         return Err(msg(
-            "a pytorch state_dict written here has no string metadata",
+            "a pytorch checkpoint has no string metadata that tenspile writes",
         ));
     }
-    if !flat {
+    if let Some(reason) = &file.refused {
         return Err(msg(format!(
-            "{} holds nested dicts or values that are not tensors, and tenspile writes a flat dict of tensors; a rewrite would drop them. Use tensconv to write a new state_dict on purpose",
+            "{} holds {reason}, which tenspile cannot write back (PT-011); use tensconv to write a new state_dict on purpose",
             archive.path.display()
         )));
     }
@@ -968,7 +979,41 @@ fn edit_pytorch(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path, flat: b
     }
     refuse_overwrite(dest, Some(&archive.path), cli.force)?;
     ensure_parent(dest)?;
-    write_pytorch(dest, &planned)
+    // Tensors that still hold the stored values keep their storage, view,
+    // and conj and neg bits; the pickled structure around them is kept.
+    let unchanged = unchanged_names(archive, &planned);
+    let tensors = planned
+        .iter()
+        .map(|item| crate::formats::pytorch::OutTensor {
+            name: item.name.clone(),
+            dtype: item.dtype.clone(),
+            shape: item.shape.clone(),
+            payload: item.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    let notes = crate::formats::pytorch::rewrite_archive(file, &archive.path, dest, &tensors, &unchanged)?;
+    for note in notes {
+        eprintln!("tenspile: {}: {note}", dest.display());
+    }
+    Ok(())
+}
+
+/// Names whose planned tensor is the stored one: same dtype, shape, and
+/// bytes source.
+#[cfg(any(format_onnx, format_pytorch))]
+fn unchanged_names(archive: &Archive, planned: &[Planned]) -> std::collections::BTreeSet<String> {
+    planned
+        .iter()
+        .filter(|item| {
+            archive.members.iter().any(|member| {
+                member.name == item.name
+                    && member.dtype == item.dtype
+                    && member.shape == item.shape
+                    && same_payload(&member.payload, &item.payload)
+            })
+        })
+        .map(|item| item.name.clone())
+        .collect()
 }
 
 #[cfg(format_onnx)]
@@ -988,21 +1033,7 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     ensure_parent(dest)?;
     // Initializers that still hold the stored bytes are copied as stored,
     // and the rest of the model (graph nodes, inputs, outputs) is kept.
-    let unchanged = planned
-        .iter()
-        .filter(|item| {
-            archive
-                .members
-                .iter()
-                .any(|member| {
-                    member.name == item.name
-                        && member.dtype == item.dtype
-                        && member.shape == item.shape
-                        && same_payload(&member.payload, &item.payload)
-                })
-        })
-        .map(|item| item.name.clone())
-        .collect();
+    let unchanged = unchanged_names(archive, &planned);
     let tensors = planned
         .iter()
         .map(|item| crate::formats::onnx::OutTensor {
@@ -1012,10 +1043,14 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
             payload: item.payload.clone(),
         })
         .collect::<Vec<_>>();
-    crate::formats::onnx::rewrite_archive(&archive.path, dest, &metadata, &tensors, &unchanged)
+    let notes = crate::formats::onnx::rewrite_archive(&archive.path, dest, &metadata, &tensors, &unchanged)?;
+    for note in notes {
+        eprintln!("tenspile: {}: {note}", dest.display());
+    }
+    Ok(())
 }
 
-#[cfg(any(format_onnx, format_npz, format_raw_sidecar))]
+#[cfg(any(format_onnx, format_npz, format_raw_sidecar, format_pytorch))]
 fn same_payload(left: &Payload, right: &Payload) -> bool {
     match (left, right) {
         (
@@ -1073,6 +1108,12 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
         refuse_overwrite(&data_path, None, cli.force)?;
     }
     ensure_parent(dest)?;
+    // A new or changed tensor gets a sha256 when every input tensor had one,
+    // so the file stays fully checkable (RAW-012).
+    let hashed = !file.tensors.is_empty()
+        && file.tensors.iter().all(|record| record.extra.contains_key("sha256"));
+    let mut replaced = Vec::new();
+    let mut added = Vec::new();
     let tensors = planned
         .iter()
         .map(|item| {
@@ -1083,7 +1124,8 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
                 &item.payload,
                 item.fortran,
             )?;
-            // A tensor the edit leaves alone keeps attrs, native, and sha256.
+            // A tensor the edit leaves alone keeps attrs, native, sha256,
+            // and any other entry field (RAW-011).
             if let Some(record) = file.tensors.iter().find(|record| {
                 record.name == item.name
                     && record.dtype == item.dtype
@@ -1091,11 +1133,55 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
                     && same_payload(&record.payload, &item.payload)
             }) {
                 out.extra = record.extra.clone();
+                return Ok(out);
+            }
+            if file.tensors.iter().any(|record| record.name == item.name) {
+                replaced.push(item.name.as_str());
+            } else {
+                added.push(item.name.as_str());
+            }
+            if hashed {
+                let digest = crate::sha256::hex(&item.payload.read_vec()?);
+                out.extra.insert("sha256".into(), Value::String(digest));
             }
             Ok(out)
         })
         .collect::<Result<Vec<_>>>()?;
-    crate::formats::rawtensor::write_archive_with_source(dest, &metadata, file.source.as_ref(), &tensors)
+    let deleted: Vec<&str> = file
+        .tensors
+        .iter()
+        .filter(|record| !planned.iter().any(|item| item.name == record.name))
+        .map(|record| record.name.as_str())
+        .collect();
+    // `source` stays as it was; the edit is appended to `history` (RAW-010).
+    let mut action = Vec::new();
+    for (verb, names) in [("replaced", &replaced), ("added", &added), ("deleted", &deleted)] {
+        if !names.is_empty() {
+            action.push(format!("{verb} {}", names.join(", ")));
+        }
+    }
+    if !updates.is_empty() {
+        let keys: Vec<&str> = updates.iter().map(|(key, _)| key.as_str()).collect();
+        action.push(format!("set metadata {}", keys.join(", ")));
+    }
+    let mut extra = file.extra.clone();
+    let entry = serde_json::json!({
+        "converter": concat!("tenspile ", env!("CARGO_PKG_VERSION")),
+        "action": if action.is_empty() { "rewrote the manifest".to_string() } else { action.join("; ") },
+    });
+    match extra.get_mut("history") {
+        Some(Value::Array(history)) => history.push(entry),
+        Some(_) => {
+            return Err(msg(format!(
+                "{} history is not an array (RAW-010)",
+                archive.path.display()
+            )))
+        }
+        None => {
+            extra.insert("history".into(), Value::Array(vec![entry]));
+        }
+    }
+    crate::formats::rawtensor::write_archive_with(dest, &metadata, &extra, &tensors)
 }
 
 #[cfg(format_raw_sidecar)]

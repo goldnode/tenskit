@@ -12,7 +12,12 @@ tenspile -i -f embed.rawtensor.json
 tenspile -tvf embed.rawtensor.json
 ```
 
-The manifest records `dtype: float32`. The bytes are in `embed.bin`, aligned to 64. Several tensors share that one `.bin`, with zero padding between them. Append, update, and delete rewrite the manifest and the `.bin`. The manifest's `source` object, and the `attrs`, `native`, and `sha256` fields of each tensor the edit leaves alone, are kept. String metadata is stored as a typed string value. Keys that start with `rawtensor.` are reserved.
+The manifest records `dtype: float32`. The bytes are in `embed.bin`, aligned to 64. Several tensors share that one `.bin`, with zero padding between them. Append, update, and delete rewrite the manifest and the `.bin`:
+
+- `source` is kept as it was, because it records where the data came from (RAW-010). So are manifest fields tenspile does not know.
+- Each edit appends `{"converter": "tenspile 0.1.0", "action": "replaced w; deleted b"}` to the `history` array (RAW-010).
+- A tensor the edit leaves alone keeps `attrs`, `native`, `sha256`, and any other field of its entry. A replaced or new tensor has none of them (RAW-011).
+- When every tensor in the input had `sha256`, a replaced or new tensor gets one too, so the whole file can still be checked (RAW-012). String metadata is stored as a typed string value. Keys that start with `rawtensor.` are reserved.
 
 ```
 tenspile -r -f embed.rawtensor.json --dtype F32 --shape 2 norm=norm.bin

@@ -206,8 +206,9 @@ pub enum NpzMemberBody {
     WholeZip { path: PathBuf, entry: String },
     /// An `.npy` file copied in full.
     WholeFile(PathBuf),
-    /// A member of another `.npz` copied under its own name, header
-    /// included; used for members an edit leaves alone, arrays or not.
+    /// A member of another `.npz` copied as stored, under its own name and
+    /// with its compression; used for members an edit leaves alone, arrays
+    /// or not (NPZ-008, NPZ-009).
     Verbatim { path: PathBuf, entry: String },
 }
 
@@ -216,7 +217,34 @@ pub struct NpzMember {
     pub body: NpzMemberBody,
 }
 
+/// Whether the archive has members and every one is deflated, in which case
+/// an edit deflates the members it adds (NPZ-009).
+pub fn all_deflated(path: &Path) -> Result<bool> {
+    let file = File::open(path).map_err(|err| io_err(path, err))?;
+    let mut archive = ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
+    let mut any = false;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|err| msg(format!("{}: {err}", path.display())))?;
+        if entry.is_dir() {
+            continue;
+        }
+        if entry.compression() == CompressionMethod::Stored {
+            return Ok(false);
+        }
+        any = true;
+    }
+    Ok(any)
+}
+
 pub fn write_archive(path: &Path, members: &[NpzMember]) -> Result<()> {
+    write_archive_with(path, members, &|_| false)
+}
+
+/// `deflate(key)` says whether to compress a member written here, as
+/// `np.savez_compressed` does. Verbatim members keep their own compression.
+pub fn write_archive_with(path: &Path, members: &[NpzMember], deflate: &dyn Fn(&str) -> bool) -> Result<()> {
     crate::io_util::check_unique_names(members.iter().map(|member| member.key.as_str()))?;
     crate::io_util::with_temp_file(path, |tmp| {
         let file = crate::io_util::create_new(tmp)?;
@@ -232,14 +260,26 @@ pub fn write_archive(path: &Path, members: &[NpzMember]) -> Result<()> {
             // np.savez writes ZIP64 records (force_zip64), so members over
             // 4 GiB are written the same way.
             let options = SimpleFileOptions::default()
-                .compression_method(CompressionMethod::Stored)
+                .compression_method(if deflate(&member.key) {
+                    CompressionMethod::Deflated
+                } else {
+                    CompressionMethod::Stored
+                })
                 .large_file(true);
-            let name = match &member.body {
-                NpzMemberBody::Verbatim { entry, .. } => entry.clone(),
-                _ => format!("{}.npy", member.key),
-            };
+            if let NpzMemberBody::Verbatim { path, entry } = &member.body {
+                let file = File::open(path).map_err(|err| io_err(path, err))?;
+                let mut source =
+                    ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
+                let stored = source
+                    .by_name(entry)
+                    .map_err(|err| msg(format!("{}: {err}", path.display())))?;
+                writer
+                    .raw_copy_file(stored)
+                    .map_err(|err| msg(format!("npz: {err}")))?;
+                continue;
+            }
             writer
-                .start_file(name, options)
+                .start_file(format!("{}.npy", member.key), options)
                 .map_err(|err| msg(format!("npz: {err}")))?;
             match &member.body {
                 NpzMemberBody::Rebuild {
@@ -251,9 +291,10 @@ pub fn write_archive(path: &Path, members: &[NpzMember]) -> Result<()> {
                     writer.write_all(&header)?;
                     payload.copy_to(&mut writer)?;
                 }
-                NpzMemberBody::WholeZip { path, entry } | NpzMemberBody::Verbatim { path, entry } => {
+                NpzMemberBody::WholeZip { path, entry } => {
                     copy_whole_entry(path, entry, &mut writer)?;
                 }
+                NpzMemberBody::Verbatim { .. } => unreachable!("copied above"),
                 NpzMemberBody::WholeFile(source) => {
                     let mut input = File::open(source).map_err(|err| io_err(source, err))?;
                     std::io::copy(&mut input, &mut writer)?;

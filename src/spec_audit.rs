@@ -394,6 +394,16 @@ fn pytorch_state_dict_with_build_and_untyped_storage_reads() {
     assert_eq!(archive.format, FormatName::Pytorch);
 }
 
+#[cfg(format_pytorch)]
+#[test]
+fn pytorch_fp8_conj_neg_and_shared_storage_read() {
+    check_review_fixture(
+        "small-pt-fp8.pt",
+        "pt8.",
+        &["f8e4m3", "f8e5m2", "c64_conj", "imag_neg", "tied_a", "tied_b", "row1"],
+    );
+}
+
 #[cfg(format_onnx)]
 #[test]
 fn onnx_typed_fields_are_packed_varints() {
@@ -847,6 +857,68 @@ fn an_npz_edit_keeps_members_it_does_not_touch() {
     assert_eq!(read_member(&path, "readme.txt"), b"hello");
     let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
     assert!(!archive.members.iter().any(|member| member.name == "s_f32"));
+    // The deflated blob stays deflated, and the stored arrays stay stored.
+    let methods = npz_methods(&path);
+    assert_eq!(methods["readme.txt"], zip::CompressionMethod::Deflated);
+    assert_eq!(methods["e_bf16.npy"], zip::CompressionMethod::Stored);
+}
+
+#[cfg(format_npz)]
+fn npz_methods(path: &std::path::Path) -> std::collections::BTreeMap<String, zip::CompressionMethod> {
+    let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    (0..archive.len())
+        .map(|index| {
+            let entry = archive.by_index(index).unwrap();
+            (entry.name().to_string(), entry.compression())
+        })
+        .collect()
+}
+
+#[cfg(format_npz)]
+#[test]
+fn an_npz_edit_deflates_new_members_when_every_member_is_deflated() {
+    // NPZ-009.
+    use std::io::{Read, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("packed.npz");
+    {
+        let mut source = zip::ZipArchive::new(fs::File::open(vectors().join("small.npz")).unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        for index in 0..source.len() {
+            let mut entry = source.by_index(index).unwrap();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(entry.name(), options).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let out = dir.path().join("out");
+    crate::run(&["-xf".into(), path.display().to_string(), "-C".into(), out.display().to_string(), "s_f32".into()]).unwrap();
+    let new = format!("t={}", out.join("s_f32.npy").display());
+    crate::run(&["-r".into(), "-f".into(), path.display().to_string(), new]).unwrap();
+    let methods = npz_methods(&path);
+    assert!(methods.contains_key("t.npy"));
+    assert!(methods.values().all(|method| *method == zip::CompressionMethod::Deflated), "{methods:?}");
+    let archive = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let find = |name: &str| archive.members.iter().find(|member| member.name == name).unwrap().payload.read_vec().unwrap();
+    assert_eq!(find("t"), find("s_f32"));
+    // In a mixed archive, a replaced array keeps its own method.
+    {
+        let file = fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut writer = zip::ZipWriter::new_append(file).unwrap();
+        let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("readme.txt", stored).unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.finish().unwrap();
+    }
+    let replace = format!("s_f32={}", out.join("s_f32.npy").display());
+    let added = format!("u={}", out.join("s_f32.npy").display());
+    crate::run(&["-u".into(), "-f".into(), path.display().to_string(), replace, added]).unwrap();
+    let methods = npz_methods(&path);
+    assert_eq!(methods["s_f32.npy"], zip::CompressionMethod::Deflated);
+    assert_eq!(methods["u.npy"], zip::CompressionMethod::Stored);
 }
 
 #[cfg(format_raw_sidecar)]
@@ -859,13 +931,33 @@ fn a_rawtensor_edit_keeps_source_and_untouched_entry_fields() {
     doc["source"] = serde_json::json!({"format": "gguf", "converter": "demo"});
     doc["tensors"][0]["attrs"] = serde_json::json!({"note": "keep"});
     doc["tensors"][0]["native"] = serde_json::json!({"format": "gguf", "type": 0});
+    doc["tensors"][0]["x_later"] = serde_json::json!(1);
+    doc["x_later"] = serde_json::json!("kept");
     fs::write(&manifest, serde_json::to_vec(&doc).unwrap()).unwrap();
     crate::run(&["--delete".into(), "-f".into(), manifest.display().to_string(), "s_f32".into()]).unwrap();
     let after: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    // RAW-010: source is not changed, unknown fields stay, and the edit is
+    // recorded in history.
     assert_eq!(after["source"], doc["source"]);
-    for key in ["attrs", "native", "sha256"] {
+    assert_eq!(after["x_later"], "kept");
+    assert_eq!(after["history"][0]["action"], "deleted s_f32");
+    assert!(after["history"][0]["converter"].as_str().unwrap().starts_with("tenspile "));
+    for key in ["attrs", "native", "sha256", "x_later"] {
         assert_eq!(after["tensors"][0][key], doc["tensors"][0][key], "{key}");
     }
     // RAW-008: the kept hashes still match the bytes.
+    archive::open(&manifest, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    // RAW-011 and RAW-012: a replaced tensor loses native, and gets a new
+    // sha256 because every input tensor had one.
+    let out = dir.path().join("out");
+    crate::run(&["-xf".into(), manifest.display().to_string(), "-C".into(), out.display().to_string(), "b_f16".into()]).unwrap();
+    let operand = format!("w_f32={}", out.join("b_f16.npy").display());
+    crate::run(&["-u".into(), "-f".into(), manifest.display().to_string(), operand]).unwrap();
+    let after: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    let w = &after["tensors"][0];
+    assert_eq!(w["name"], "w_f32");
+    assert!(w.get("native").is_none() && w.get("attrs").is_none() && w.get("x_later").is_none());
+    assert_eq!(w["sha256"], doc["tensors"][1]["sha256"]);
+    assert_eq!(after["history"][1]["action"], "replaced w_f32");
     archive::open(&manifest, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
 }
