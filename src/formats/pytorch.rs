@@ -154,43 +154,140 @@ fn is_c_order(shape: &[u64], strides: &[u64]) -> bool {
 
 struct NamedTensor {
     name: String,
+    /// Positions from the root: a dict's pair index, or a list or tuple
+    /// item index.
+    path: Vec<usize>,
     tensor: TensorRef,
 }
 
-fn flatten(
-    obj: &Obj,
-    prefix: &str,
-    out: &mut Vec<NamedTensor>,
-    meta: &mut Vec<(String, String)>,
-    notes: &mut Vec<String>,
-) {
-    let Obj::Dict { pairs, .. } = obj else {
-        notes.push("the pickled object is not a dict of tensors".into());
-        return;
-    };
-    for (key, value) in pairs {
-        let Obj::Str(key) = key else {
-            notes.push("skipped a pytorch dict key that is not a string".into());
-            continue;
-        };
-        let name = if prefix.is_empty() {
-            key.clone()
+/// The names in a pickled object (PT-012). A path of keys and indices is
+/// joined with `.`: a str key as is, an int key or a list or tuple index as
+/// its decimal text. A tensor under any other key type has no name; it is
+/// noted, not listed, and a rewrite keeps it as stored.
+#[derive(Default)]
+struct Walk {
+    tensors: Vec<NamedTensor>,
+    metadata: Vec<(String, String)>,
+    notes: Vec<String>,
+    /// Dicts that have a name, with their paths, for PT-013.
+    dicts: Vec<(String, Vec<usize>)>,
+}
+
+impl Walk {
+    fn of(root: &Obj) -> Walk {
+        let mut walk = Walk::default();
+        if matches!(root, Obj::Dict { .. } | Obj::List(_) | Obj::Tuple(_)) {
+            walk.visit(root, Some(String::new()), &mut Vec::new(), "root".into());
         } else {
-            format!("{prefix}.{key}")
+            walk.notes.push("the pickled object is not a dict of tensors".into());
+        }
+        walk
+    }
+
+    fn visit(&mut self, value: &Obj, name: Option<String>, path: &mut Vec<usize>, repr: String) {
+        let child = |key: Option<String>| match (&name, key) {
+            (Some(name), Some(key)) if name.is_empty() => Some(key),
+            (Some(name), Some(key)) => Some(format!("{name}.{key}")),
+            _ => None,
         };
         match value {
-            Obj::Tensor(tensor) => out.push(NamedTensor {
-                name,
-                tensor: tensor.clone(),
-            }),
-            Obj::Dict { .. } => flatten(value, &name, out, meta, notes),
-            Obj::Str(text) => meta.push((name, text.clone())),
-            Obj::Int(number) => meta.push((name, number.to_string())),
-            Obj::Float(number) => meta.push((name, number.to_string())),
-            Obj::Bool(flag) => meta.push((name, flag.to_string())),
+            Obj::Tensor(tensor) => match name {
+                Some(name) => self.tensors.push(NamedTensor {
+                    name,
+                    path: path.clone(),
+                    tensor: tensor.clone(),
+                }),
+                None => self.notes.push(format!(
+                    "the tensor at {repr} has no name, because a key on its path is not a str or int (PT-012); it is not listed, and an edit keeps it"
+                )),
+            },
+            Obj::Dict { pairs, .. } => {
+                if let Some(name) = &name {
+                    self.dicts.push((name.clone(), path.clone()));
+                }
+                for (index, (key, item)) in pairs.iter().enumerate() {
+                    let text = match key {
+                        Obj::Str(text) => Some(text.clone()),
+                        Obj::Int(number) => Some(number.to_string()),
+                        _ => None,
+                    };
+                    path.push(index);
+                    self.visit(item, child(text), path, format!("{repr}[{}]", key_repr(key)));
+                    path.pop();
+                }
+            }
+            Obj::List(items) | Obj::Tuple(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    path.push(index);
+                    self.visit(item, child(Some(index.to_string())), path, format!("{repr}[{index}]"));
+                    path.pop();
+                }
+            }
+            Obj::Str(text) => self.meta(name, text.clone()),
+            Obj::Int(number) => self.meta(name, number.to_string()),
+            Obj::Float(number) => self.meta(name, number.to_string()),
+            Obj::Bool(flag) => self.meta(name, flag.to_string()),
             Obj::None => {}
-            _ => notes.push(format!("{name} is not a tensor and was skipped")),
+            _ => {
+                if let Some(name) = name {
+                    self.notes.push(format!("{name} is not a tensor and was skipped"));
+                }
+            }
         }
+    }
+
+    fn meta(&mut self, name: Option<String>, value: String) {
+        if let Some(name) = name {
+            self.metadata.push((name, value));
+        }
+    }
+
+    fn duplicate(&self) -> Option<&str> {
+        let mut names = BTreeSet::new();
+        self.tensors
+            .iter()
+            .find(|named| !names.insert(named.name.as_str()))
+            .map(|named| named.name.as_str())
+    }
+}
+
+/// A key as Python would print it, for a note.
+fn key_repr(key: &Obj) -> String {
+    match key {
+        Obj::Str(text) => format!("{text:?}"),
+        Obj::Int(number) => number.to_string(),
+        Obj::Float(number) => number.to_string(),
+        Obj::Bool(true) => "True".into(),
+        Obj::Bool(false) => "False".into(),
+        Obj::None => "None".into(),
+        Obj::Tuple(_) => "(...)".into(),
+        _ => "?".into(),
+    }
+}
+
+/// The value at `path`.
+fn slot_mut<'a>(obj: &'a mut Obj, path: &[usize]) -> Option<&'a mut Obj> {
+    let Some((first, rest)) = path.split_first() else {
+        return Some(obj);
+    };
+    let next = match obj {
+        Obj::Dict { pairs, .. } => &mut pairs.get_mut(*first)?.1,
+        Obj::List(items) | Obj::Tuple(items) => items.get_mut(*first)?,
+        _ => return None,
+    };
+    slot_mut(next, rest)
+}
+
+/// Whether `path` passes through a list or tuple, whose later items would
+/// be renamed if one were removed.
+fn in_sequence(obj: &Obj, path: &[usize]) -> bool {
+    let Some((first, rest)) = path.split_first() else {
+        return false;
+    };
+    match obj {
+        Obj::Dict { pairs, .. } => pairs.get(*first).is_some_and(|(_, value)| in_sequence(value, rest)),
+        Obj::List(_) | Obj::Tuple(_) => true,
+        _ => false,
     }
 }
 
@@ -848,35 +945,74 @@ pub fn rewrite_archive(
         )));
     }
     let mut root = file.root.clone();
-    let mut found = Vec::new();
-    flatten(&root, "", &mut found, &mut Vec::new(), &mut Vec::new());
-    for named in &found {
-        if !tensors.iter().any(|tensor| tensor.name == named.name) {
-            remove_tensor(&mut root, &named.name);
+    let walk = Walk::of(&root);
+    let mut removed = Vec::new();
+    for named in &walk.tensors {
+        if tensors.iter().any(|tensor| tensor.name == named.name) {
+            continue;
         }
+        if in_sequence(&root, &named.path) {
+            return Err(msg(format!(
+                "{} is in a list or tuple; deleting it would rename the items after it",
+                named.name
+            )));
+        }
+        removed.push(named.path.clone());
     }
     for (index, tensor) in tensors.iter().enumerate() {
         if unchanged.contains(&tensor.name) {
             continue;
         }
-        match find_tensor(&mut root, &tensor.name) {
-            Some(slot) => {
-                // A replaced nn.Parameter stays a Parameter.
-                let parameter = match slot {
-                    Obj::Tensor(old) => old.parameter,
-                    _ => None,
-                };
-                *slot = Obj::Fresh { index, parameter };
-            }
-            None => insert_tensor(
-                &mut root,
-                &tensor.name,
-                Obj::Fresh {
-                    index,
-                    parameter: None,
-                },
-            ),
+        let fresh = |parameter| Obj::Fresh { index, parameter };
+        if let Some(named) = walk.tensors.iter().find(|named| named.name == tensor.name) {
+            let slot = slot_mut(&mut root, &named.path)
+                .ok_or_else(|| msg("internal error: a tensor path does not resolve"))?;
+            // A replaced tensor stays where it is, and an nn.Parameter
+            // stays a Parameter.
+            let parameter = match slot {
+                Obj::Tensor(old) => old.parameter,
+                _ => None,
+            };
+            *slot = fresh(parameter);
+            continue;
         }
+        // PT-013: the deepest named dict whose name and a '.' start the new
+        // name takes the rest as one key; otherwise the root dict does.
+        let target = walk
+            .dicts
+            .iter()
+            .filter(|(name, _)| {
+                !name.is_empty()
+                    && tensor.name.strip_prefix(name.as_str()).is_some_and(|rest| rest.starts_with('.'))
+            })
+            .max_by_key(|(name, path)| (path.len(), name.len()));
+        let (path, key) = match target {
+            Some((name, path)) => (path.clone(), tensor.name[name.len() + 1..].to_string()),
+            None => (Vec::new(), tensor.name.clone()),
+        };
+        match slot_mut(&mut root, &path) {
+            Some(Obj::Dict { pairs, .. }) => pairs.push((Obj::Str(key), fresh(None))),
+            _ => {
+                return Err(msg(format!(
+                    "{} has no dict to add {} to; its root is not a dict (PT-013)",
+                    source.display(),
+                    tensor.name
+                )))
+            }
+        }
+    }
+    // Remove the last positions first, so the earlier paths stay valid.
+    removed.sort_unstable_by(|left, right| right.cmp(left));
+    for path in removed {
+        let (last, parent) = path.split_last().ok_or_else(|| msg("internal error: an empty tensor path"))?;
+        if let Some(Obj::Dict { pairs, .. }) = slot_mut(&mut root, parent) {
+            pairs.remove(*last);
+        }
+    }
+    if let Some(name) = Walk::of(&root).duplicate() {
+        return Err(msg(format!(
+            "the edit would give two tensors the name {name} (PT-012)"
+        )));
     }
     let mut zip = open_zip(source)?;
     let mut records = Vec::new();
@@ -917,69 +1053,6 @@ pub fn rewrite_archive(
 fn open_zip(path: &Path) -> Result<ZipArchive<File>> {
     let file = File::open(path).map_err(|err| io_err(path, err))?;
     ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))
-}
-
-/// The tensor slot that `name` flattens from, as `flatten` names it.
-fn find_tensor<'a>(obj: &'a mut Obj, name: &str) -> Option<&'a mut Obj> {
-    let Obj::Dict { pairs, .. } = obj else {
-        return None;
-    };
-    for (key, value) in pairs.iter_mut() {
-        let Obj::Str(key) = key else {
-            continue;
-        };
-        if key == name && matches!(value, Obj::Tensor(_) | Obj::Fresh { .. }) {
-            return Some(value);
-        }
-        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
-            if let Some(found) = find_tensor(value, rest) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn remove_tensor(obj: &mut Obj, name: &str) -> bool {
-    let Obj::Dict { pairs, .. } = obj else {
-        return false;
-    };
-    for index in 0..pairs.len() {
-        let (Obj::Str(key), value) = &mut pairs[index] else {
-            continue;
-        };
-        if key == name && matches!(value, Obj::Tensor(_) | Obj::Fresh { .. }) {
-            pairs.remove(index);
-            return true;
-        }
-        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
-            let rest = rest.to_string();
-            if remove_tensor(value, &rest) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Add a new tensor to the deepest dict whose path prefixes `name`, or to
-/// the root.
-fn insert_tensor(obj: &mut Obj, name: &str, value: Obj) {
-    let Obj::Dict { pairs, .. } = obj else {
-        return;
-    };
-    for (key, child) in pairs.iter_mut() {
-        let Obj::Str(key) = key else {
-            continue;
-        };
-        if let Some(rest) = name.strip_prefix(key.as_str()).and_then(|rest| rest.strip_prefix('.')) {
-            if matches!(child, Obj::Dict { .. }) {
-                insert_tensor(child, rest, value);
-                return;
-            }
-        }
-    }
-    pairs.push((Obj::Str(name.into()), value));
 }
 
 /// Why `obj` cannot be pickled back as it was read, if it cannot.
@@ -1487,19 +1560,22 @@ pub fn open(path: &Path) -> Result<Archive> {
     let prefix = pkl_name.trim_end_matches("data.pkl").to_string();
     let pickle = read_entry(&mut zip, &pkl_name, path)?;
     let obj = unpickle(&pickle)?;
-    let mut found = Vec::new();
-    let mut metadata = Vec::new();
-    let mut notes = Vec::new();
-    flatten(&obj, "", &mut found, &mut metadata, &mut notes);
+    let Walk {
+        tensors: found,
+        metadata,
+        mut notes,
+        ..
+    } = Walk::of(&obj);
     if found.is_empty() {
         return Err(msg(format!("{} pickle has no tensors", path.display())));
     }
+    // PT-012: an ambiguous name is listed twice, and the file is not edited.
     let mut names = BTreeSet::new();
     let refused = unreproducible(&obj).or_else(|| {
         found
             .iter()
             .find(|named| !names.insert(named.name.as_str()))
-            .map(|named| format!("two entries named {}", named.name))
+            .map(|named| format!("two tensors named {} (PT-012)", named.name))
     });
     let byteorder =
         record_text(&mut zip, &format!("{prefix}byteorder")).unwrap_or_else(|| "little".into());
@@ -1682,12 +1758,32 @@ fn gather(span: &[u8], shape: &[u64], strides: &[u64], itemsize: usize) -> Vec<u
     out
 }
 
-/// Negate every element, or with `imag_only` every imaginary part, by
-/// flipping the IEEE sign bit: the top bit of each little-endian value's
-/// last byte. torch sets the conj bit only on complex tensors, and the neg
-/// bit on the float views of them.
+/// Negate every element, or with `imag_only` every imaginary part, as
+/// torch resolves the bit (PT-010). Floats and complex parts flip the IEEE
+/// sign bit, the top bit of each little-endian value's last byte. int8 to
+/// int64 and uint8 negate in two's complement with wraparound. torch cannot
+/// resolve the bit on other dtypes, so they are refused.
 fn negate(bytes: &mut [u8], dtype: &str, imag_only: bool) -> Result<()> {
     let bit = if imag_only { "conj" } else { "neg" };
+    let integer = match dtype {
+        "int8" | "uint8" => Some(1),
+        "int16" => Some(2),
+        "int32" => Some(4),
+        "int64" => Some(8),
+        _ => None,
+    };
+    if let (Some(width), false) = (integer, imag_only) {
+        for value in bytes.chunks_exact_mut(width) {
+            // Two's complement: invert, then add one with carry.
+            let mut carry = true;
+            for byte in value.iter_mut() {
+                let (sum, overflow) = (!*byte).overflowing_add(u8::from(carry));
+                *byte = sum;
+                carry = overflow;
+            }
+        }
+        return Ok(());
+    }
     let (width, complex) = match dtype {
         "float16" | "bfloat16" => (2, false),
         "float32" => (4, false),
@@ -1696,7 +1792,7 @@ fn negate(bytes: &mut [u8], dtype: &str, imag_only: bool) -> Result<()> {
         "complex128" => (8, true),
         other => {
             return Err(msg(format!(
-                "pytorch {bit} bit on a {other} tensor is not supported (PT-010)"
+                "pytorch {bit} bit on a {other} tensor, which torch cannot resolve either (PT-010)"
             )))
         }
     };
@@ -1864,9 +1960,134 @@ mod tests {
         assert_eq!(names(&added), ["state_dict.w", "state_dict.b"]);
         assert_eq!(
             reread.metadata,
-            [("epoch".to_string(), "3".to_string()), ("loss".into(), "-0.5".into())]
+            [
+                ("epoch".to_string(), "3".to_string()),
+                ("loss".into(), "-0.5".into()),
+                ("tags.0".into(), "a".into())
+            ]
         );
         assert_eq!(values(&added, "state_dict.b"), [7, 0]);
+    }
+
+    /// `w` as a v2 rebuild of a 2-element float32 storage `key`.
+    fn tensor_pickle(out: &mut Vec<u8>, key: &str) {
+        let tensor = fresh_ref(
+            &OutTensor {
+                name: "w".into(),
+                dtype: "float32".into(),
+                shape: vec![2],
+                payload: Payload::Bytes(vec![0; 8]),
+            },
+            key.into(),
+        )
+        .unwrap();
+        put_tensor(out, &tensor).unwrap();
+    }
+
+    /// A checkpoint from `body`, which pickles the root object using storage
+    /// "0" for every tensor.
+    fn checkpoint(dir: &Path, body: impl Fn(&mut Vec<u8>)) -> std::path::PathBuf {
+        let path = dir.join("c.pt");
+        let tensor = OutTensor {
+            name: "w".into(),
+            dtype: "float32".into(),
+            shape: vec![2],
+            payload: Payload::Bytes(vec![0; 8]),
+        };
+        write_archive(&path, &[tensor]).unwrap();
+        repickle(&path, |_| {
+            let mut out = vec![0x80, 2];
+            body(&mut out);
+            out.push(0x2e);
+            out
+        });
+        path
+    }
+
+    fn rewrite(path: &Path, dest: &Path, keep: &[&str], add: &[&str]) -> Result<Vec<String>> {
+        let archive = open(path).unwrap();
+        let Inner::Pytorch(torch) = &archive.inner else { unreachable!() };
+        let mut tensors: Vec<OutTensor> = archive
+            .members
+            .iter()
+            .filter(|member| keep.contains(&member.name.as_str()))
+            .map(|member| OutTensor {
+                name: member.name.clone(),
+                dtype: member.dtype.clone(),
+                shape: member.shape.clone(),
+                payload: member.payload.clone(),
+            })
+            .collect();
+        let unchanged = tensors.iter().map(|tensor| tensor.name.clone()).collect();
+        tensors.extend(add.iter().map(|name| OutTensor {
+            name: name.to_string(),
+            dtype: "float32".into(),
+            shape: vec![1],
+            payload: Payload::Bytes(vec![0; 4]),
+        }));
+        rewrite_archive(torch, path, dest, &tensors, &unchanged)
+    }
+
+    #[test]
+    fn int_keys_and_list_items_are_named_and_other_keys_are_not() {
+        // PT-012: {'opt': {0: w}, 'list': [w, w], None: w}
+        let dir = tempfile::tempdir().unwrap();
+        let path = checkpoint(dir.path(), |out| {
+            out.extend_from_slice(&[0x7d, 0x28]);
+            put_unicode(out, "opt");
+            out.extend_from_slice(&[0x7d, 0x4b, 0]);
+            tensor_pickle(out, "0");
+            out.push(0x73);
+            put_unicode(out, "list");
+            out.extend_from_slice(&[0x5d, 0x28]);
+            tensor_pickle(out, "0");
+            tensor_pickle(out, "0");
+            out.push(0x65);
+            out.push(0x4e);
+            tensor_pickle(out, "0");
+            out.push(0x75);
+        });
+        let archive = open(&path).unwrap();
+        assert_eq!(names(&path), ["opt.0", "list.0", "list.1"]);
+        assert!(archive.notes.iter().any(|note| note.contains("root[None]")), "{:?}", archive.notes);
+        // Deleting a list item would rename the next one.
+        let dest = dir.path().join("d.pt");
+        let err = rewrite(&path, &dest, &["opt.0", "list.1"], &[]).unwrap_err().to_string();
+        assert!(err.contains("list or tuple"), "{err}");
+        // PT-013: opt.x goes into opt, and the unnamed tensor is kept.
+        rewrite(&path, &dest, &["opt.0", "list.0", "list.1"], &["opt.x", "top"]).unwrap();
+        assert_eq!(names(&dest), ["opt.0", "opt.x", "list.0", "list.1", "top"]);
+        assert!(open(&dest).unwrap().notes.iter().any(|note| note.contains("root[None]")));
+        // opt.0 deleted from a dict is fine.
+        rewrite(&path, &dest, &["list.0", "list.1"], &[]).unwrap();
+        assert_eq!(names(&dest), ["list.0", "list.1"]);
+    }
+
+    #[test]
+    fn a_list_root_or_an_ambiguous_name_refuses_the_edit() {
+        // A list root has no dict to add a new tensor to (PT-013).
+        let dir = tempfile::tempdir().unwrap();
+        let path = checkpoint(dir.path(), |out| {
+            out.extend_from_slice(&[0x5d, 0x28]);
+            tensor_pickle(out, "0");
+            out.push(0x65);
+        });
+        let dest = dir.path().join("d.pt");
+        let err = rewrite(&path, &dest, &["0"], &["x"]).unwrap_err().to_string();
+        assert!(err.contains("PT-013"), "{err}");
+        // {'a.b': w, 'a': {'b': w}}: refused as a whole (PT-012).
+        let path = checkpoint(dir.path(), |out| {
+            out.extend_from_slice(&[0x7d, 0x28]);
+            put_unicode(out, "a.b");
+            tensor_pickle(out, "0");
+            put_unicode(out, "a");
+            out.push(0x7d);
+            put_unicode(out, "b");
+            tensor_pickle(out, "0");
+            out.push(0x73);
+            out.push(0x75);
+        });
+        assert!(file(&path).refused.unwrap().contains("PT-012"));
     }
 
     #[test]
@@ -1931,5 +2152,22 @@ mod tests {
         assert_eq!(data_records(&replaced), 5);
         assert_eq!(values(&replaced, "tied_a"), vec![0; 16]);
         assert_eq!(values(&replaced, "tied_b"), values(&source, "tied_b"));
+    }
+
+    #[test]
+    fn the_neg_bit_negates_integers_with_wraparound() {
+        // PT-010: int8 -128 stays -128, uint8 1 becomes 255.
+        let mut int8 = vec![0x80, 1, 0];
+        negate(&mut int8, "int8", false).unwrap();
+        assert_eq!(int8, [0x80, 0xff, 0]);
+        let mut uint8 = vec![1];
+        negate(&mut uint8, "uint8", false).unwrap();
+        assert_eq!(uint8, [255]);
+        let mut int32 = 5i32.to_le_bytes().to_vec();
+        negate(&mut int32, "int32", false).unwrap();
+        assert_eq!(i32::from_le_bytes(int32.try_into().unwrap()), -5);
+        for dtype in ["bool", "uint16", "float8_e4m3fn"] {
+            assert!(negate(&mut vec![0; 2], dtype, false).is_err(), "{dtype}");
+        }
     }
 }
