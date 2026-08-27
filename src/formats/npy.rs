@@ -149,8 +149,15 @@ fn descr_itemsize(descr: &str) -> Option<u64> {
 }
 
 pub fn write_header(descr: &str, shape: &[u64]) -> Result<Vec<u8>> {
+    write_header_ordered(descr, shape, false)
+}
+
+/// A header whose `fortran_order` is `fortran`: the bytes that follow are
+/// column-major, as stored.
+pub fn write_header_ordered(descr: &str, shape: &[u64], fortran: bool) -> Result<Vec<u8>> {
     let shape_text = python_shape(shape);
-    let dict = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_text}, }}");
+    let order = if fortran { "True" } else { "False" };
+    let dict = format!("{{'descr': '{descr}', 'fortran_order': {order}, 'shape': {shape_text}, }}");
     // NumPy pads with spaces and a final newline so the data starts on a
     // 64-byte boundary. A remainder of 0 still takes a full extra pad, which
     // keeps the newline from overwriting the dict.
@@ -280,7 +287,17 @@ pub fn write_file(
     shape: &[u64],
     payload: impl FnOnce(&mut File) -> Result<()>,
 ) -> Result<()> {
-    let header = write_header(descr, shape)?;
+    write_file_ordered(path, descr, shape, false, payload)
+}
+
+pub fn write_file_ordered(
+    path: &Path,
+    descr: &str,
+    shape: &[u64],
+    fortran: bool,
+    payload: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
+    let header = write_header_ordered(descr, shape, fortran)?;
     crate::io_util::atomic_write(path, |file| {
         file.write_all(&header)?;
         payload(file)

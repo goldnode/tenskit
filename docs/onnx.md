@@ -65,16 +65,42 @@ tenspile does not write external data. A model of 2 GiB or more is refused (ONNX
 - `ir_version` and `opset_import`, as stored (ONNX-013);
 - each initializer the edit does not touch, in its original encoding, including typed fields and external-data references.
 
-A replaced or added initializer is written with `raw_data`. When its dtype is newer than the model's IR, `ir_version` is raised to the first IR that has it, and the edit says so. `--metadata k=v` sets that key in `metadata_props`; the other keys stay.
+A replaced or added initializer is written with `raw_data`. When its dtype is newer than the model's IR, `ir_version` is raised to the first IR that has it, and the edit says so (ONNX-014):
 
-When `-o` puts the model in another directory, each external-data file that a kept initializer names is copied beside it, so the reference still resolves (ONNX-003). An existing file of that name stops the edit.
+| dtype | lowest IR |
+| --- | --- |
+| bfloat16 | 4 |
+| the four float8 types | 9 |
+| int4, uint4 | 10 |
+| float4_e2m1fn | 11 |
+| float8_e8m0fnu | 12 |
+| int2, uint2 | 13 |
+| float6 types | 14 |
+| every other dtype | 1, so an IR 3 model stays IR 3 |
+
+onnx 1.23.2's checker does not test this yet, but newer checkers do, so the IR is raised anyway. `--metadata k=v` sets that key in `metadata_props`; the other keys stay.
+
+When `-o` puts the model in another directory, each external-data file that a kept initializer names is copied beside it, so the reference still resolves (ONNX-003). A file of that name that is already there is used if it holds the same bytes. Otherwise the edit stops and leaves it alone, because other models may share it (ONNX-015):
+
+```
+$ tenspile -u -f ext.onnx -o moved/ext.onnx W=w_new.npy
+tenspile: moved/ext.onnx: copied external data ext.data beside the new model (ONNX-015)
+$ tenspile -u -f ext.onnx -o moved/ext2.onnx W=w_new.npy
+tenspile: moved/ext2.onnx: uses the identical external data ext.data already beside the new model (ONNX-015)
+```
 
 Deleting an initializer also removes the graph input, graph output, and `value_info` entry with its name (ONNX-010, ONNX-012). The delete is refused when the model still uses the name (ONNX-011, ONNX-012):
 
 - a node input, in the main graph or in a subgraph of an `If`, `Loop`, or `Scan` node, unless the subgraph defines the name itself;
+- a node input in a training `initialization` or `algorithm` graph, which can read the main graph's initializers;
 - a key of a training `initialization_binding` or `update_binding`;
 - a quantization annotation, as the tensor or as one of its scale or zero-point tensors.
 
+A model whose `If` node reads `S` only inside its `then_branch`:
+
 ```
-tenspile: initializer w is an input of a graph node; deleting it would break the model (ONNX-011)
+$ tenspile --delete -f model.onnx S
+tenspile: initializer S is an input of a graph node; deleting it would break the model (ONNX-011)
 ```
+
+Edits were checked with onnx 1.23.2: every edited model passes `onnx.checker.check_model(full_check=True)`, and apart from the edit it is the same `ModelProto`.

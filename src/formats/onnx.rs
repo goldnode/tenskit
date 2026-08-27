@@ -676,23 +676,53 @@ pub fn rewrite_archive(
     if !external.is_empty() && !same_dir(from, to) {
         for location in &external {
             let target = relative_child(to, location)?;
+            let origin = relative_child(from, location)?;
+            // ONNX-015: a file already there may be shared with other
+            // models. It is used only when it is the same file, byte for
+            // byte, and never overwritten.
             if target.exists() {
-                return Err(msg(format!(
-                    "{} exists; the edited model would reference it in place of {}'s external data",
-                    target.display(),
-                    source.display()
-                )));
+                if !same_file_bytes(&origin, &target)? {
+                    return Err(msg(format!(
+                        "{} exists and differs from {}; the edited model would read the wrong external data (ONNX-015)",
+                        target.display(),
+                        origin.display()
+                    )));
+                }
+                notes.push(format!("uses the identical external data {location} already beside the new model (ONNX-015)"));
+                continue;
             }
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|err| io_err(parent, err))?;
             }
-            let origin = relative_child(from, location)?;
             std::fs::copy(&origin, &target).map_err(|err| io_err(&origin, err))?;
-            notes.push(format!("copied external data {location} beside the new model (ONNX-009)"));
+            notes.push(format!("copied external data {location} beside the new model (ONNX-015)"));
         }
     }
     finish(path, &out)?;
     Ok(notes)
+}
+
+/// Whether two files hold the same bytes. Comparing whole files covers a
+/// `checksum`, which is the SHA1 of the whole file (ONNX-015).
+fn same_file_bytes(left: &Path, right: &Path) -> Result<bool> {
+    use std::io::Read;
+    let open = |path: &Path| File::open(path).map_err(|err| io_err(path, err));
+    let (mut a, mut b) = (open(left)?, open(right)?);
+    let size = |file: &File, path: &Path| file.metadata().map(|meta| meta.len()).map_err(|err| io_err(path, err));
+    if size(&a, left)? != size(&b, right)? {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let n = a.read(&mut x).map_err(|err| io_err(left, err))?;
+        if n == 0 {
+            return Ok(true);
+        }
+        b.read_exact(&mut y[..n]).map_err(|err| io_err(right, err))?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 fn same_dir(left: &Path, right: &Path) -> bool {
@@ -744,16 +774,30 @@ fn check_removals(model: &[u8], removed: &BTreeSet<String>) -> Result<()> {
                     }
                 }
             }
-            // TrainingInfoProto: initialization_binding (3) and
-            // update_binding (4) keys name initializers.
+            // TrainingInfoProto: the initialization (1) and algorithm (2)
+            // graphs see the main graph's initializers, and the
+            // initialization_binding (3) and update_binding (4) keys name
+            // them.
             Field::Bytes { id: 20, data, .. } => {
                 for entry in fields(data, 0)? {
-                    if let Field::Bytes { id: 3 | 4, data, .. } = entry {
-                        if let Some((name, _)) = string_pair(data)?.filter(|(key, _)| removed.contains(key)) {
-                            return Err(msg(format!(
-                                "initializer {name} is bound by the model's training_info; deleting it would break the model (ONNX-011)"
-                            )));
+                    match entry {
+                        Field::Bytes { id: 1 | 2, data, .. } => {
+                            let mut reads = BTreeSet::new();
+                            subgraph_reads(data, &mut reads)?;
+                            if let Some(name) = reads.intersection(removed).next() {
+                                return Err(msg(format!(
+                                    "initializer {name} is read by a training graph; deleting it would break the model (ONNX-011)"
+                                )));
+                            }
                         }
+                        Field::Bytes { id: 3 | 4, data, .. } => {
+                            if let Some((name, _)) = string_pair(data)?.filter(|(key, _)| removed.contains(key)) {
+                                return Err(msg(format!(
+                                    "initializer {name} is bound by the model's training_info; deleting it would break the model (ONNX-011)"
+                                )));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1231,6 +1275,14 @@ mod tests {
         model_with(&path, &[], &model_extra);
         let err = delete_b(&path, &dest).unwrap_err().to_string();
         assert!(err.contains("training_info"), "{err}");
+        // A training algorithm graph that reads b (ONNX-011, IR 7).
+        let mut training = Vec::new();
+        bytes_field(&mut training, 2, &branch);
+        let mut model_extra = Vec::new();
+        bytes_field(&mut model_extra, 20, &training);
+        model_with(&path, &[], &model_extra);
+        let err = delete_b(&path, &dest).unwrap_err().to_string();
+        assert!(err.contains("training graph"), "{err}");
         // A quantization annotation.
         let mut pair = Vec::new();
         bytes_field(&mut pair, 1, b"SCALE_TENSOR");
@@ -1276,9 +1328,18 @@ mod tests {
         let unchanged: BTreeSet<String> = ["w".to_string()].into();
         let moved = dir.path().join("out/m.onnx");
         std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
-        let notes = rewrite_archive(&path, &moved, &[], &[kept], &unchanged).unwrap();
-        assert!(notes[0].contains("w.bin"), "{notes:?}");
+        let notes = rewrite_archive(&path, &moved, &[], std::slice::from_ref(&kept), &unchanged).unwrap();
+        assert!(notes[0].contains("copied") && notes[0].contains("w.bin"), "{notes:?}");
         let reread = open(&moved).unwrap();
         assert_eq!(reread.members[0].payload.read_vec().unwrap(), vec![0u8; 8]);
+        // ONNX-015: an identical file already there is used, a different
+        // one stops the edit and is left alone.
+        let again = dir.path().join("out/m2.onnx");
+        let notes = rewrite_archive(&path, &again, &[], std::slice::from_ref(&kept), &unchanged).unwrap();
+        assert!(notes[0].contains("identical"), "{notes:?}");
+        std::fs::write(dir.path().join("out/w.bin"), [1u8; 8]).unwrap();
+        let err = rewrite_archive(&path, &again, &[], &[kept], &unchanged).unwrap_err().to_string();
+        assert!(err.contains("ONNX-015"), "{err}");
+        assert_eq!(std::fs::read(dir.path().join("out/w.bin")).unwrap(), [1u8; 8]);
     }
 }

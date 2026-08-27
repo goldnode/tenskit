@@ -592,7 +592,7 @@ fn single_encoding(cli: &Cli, path: Option<&Path>, member: &Member) -> Result<Fo
         }
     }
     #[cfg(format_npy)]
-    if !member.fortran && numpy_descr(&member.dtype).is_ok() {
+    if numpy_descr(&member.dtype).is_ok() {
         return Ok(FormatName::Npy);
     }
     #[cfg(format_raw_sidecar)]
@@ -608,7 +608,8 @@ fn single_encoding(cli: &Cli, path: Option<&Path>, member: &Member) -> Result<Fo
 }
 
 fn planned_export(archive: &Archive, member: &Member, pack: Pack) -> Result<Planned> {
-    if member.fortran {
+    // A fortran-order array goes to .npy as stored, with fortran_order set.
+    if member.fortran && !matches!(pack, Pack::Npy) {
         return Err(msg(format!(
             "member {} is fortran-order; tenspile does not transpose it, and rawtensor bytes are C order (RAW-009)",
             member.name
@@ -2091,7 +2092,7 @@ fn numpy_descr(dtype_name: &str) -> Result<String> {
 #[cfg(format_npy)]
 fn write_npy(path: &Path, item: &Planned) -> Result<()> {
     let descr = numpy_descr(&item.dtype)?;
-    npy::write_file(path, &descr, &item.shape, |file| item.payload.copy_to(file))
+    npy::write_file_ordered(path, &descr, &item.shape, item.fortran, |file| item.payload.copy_to(file))
 }
 
 #[cfg(format_npz)]

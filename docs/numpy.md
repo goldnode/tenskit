@@ -18,7 +18,7 @@ tenspile -u -f embed.npy --dtype F32 --shape 2 norm.bin
 
 `version:` on `-i` is the file's major.minor. `descr` is the NumPy header field.
 
-Fortran order can be listed. Import into safetensors stops with `is fortran-order; tenspile does not transpose it`. Extract to `.npy`, `.npz`, or safetensors stops the same way. `--format raw` stops as well, because rawtensor bytes are C order (RAW-009). A big-endian descr such as `>f4` or `>c8` is read as its little-endian dtype and the bytes are swapped on the way in; a complex value swaps each part. numpy never writes the native order `=`; a hand-written `=f4` is read as `<f4` with a note (NPY-013). An object dtype (`|O`) is refused on open.
+Fortran order can be listed. Import into safetensors stops with `is fortran-order; tenspile does not transpose it`. Extract to `.npy` writes the array as stored, with `fortran_order: True`, so `tenspile -xf` works on any `np.savez` archive. Extract to `.npz` or safetensors stops with the same message. `--format raw` stops as well, because rawtensor bytes are C order (RAW-009). A big-endian descr such as `>f4` or `>c8` is read as its little-endian dtype and the bytes are swapped on the way in; a complex value swaps each part. numpy never writes the native order `=`; a hand-written `=f4` is read as `<f4` with a note (NPY-013). An object dtype (`|O`) is refused on open.
 
 A structured descr is listed as that descr text. Import into safetensors stops because the descr has no safetensors dtype. bfloat16 saved by NumPy is a void descr such as `<V2`. The spec treats that as ambiguous, so tenspile does not guess that it is `bfloat16`. The bytes can still be listed.
 

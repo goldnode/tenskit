@@ -961,3 +961,28 @@ fn a_rawtensor_edit_keeps_source_and_untouched_entry_fields() {
     assert_eq!(after["history"][1]["action"], "replaced w_f32");
     archive::open(&manifest, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
 }
+
+#[cfg(all(format_npz, format_npy))]
+#[test]
+fn a_fortran_order_member_extracts_to_npy_as_stored() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.npz");
+    let data: Vec<u8> = (0..6u8).collect();
+    {
+        let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        writer.start_file("f.npy", zip::write::SimpleFileOptions::default()).unwrap();
+        writer
+            .write_all(&crate::formats::npy::write_header_ordered("|u1", &[2, 3], true).unwrap())
+            .unwrap();
+        writer.write_all(&data).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = dir.path().join("x");
+    crate::run(&["-xf".into(), path.display().to_string(), "-C".into(), out.display().to_string()]).unwrap();
+    let extracted = archive::open(&out.join("f.npy"), None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let member = &extracted.members[0];
+    assert!(member.fortran);
+    assert_eq!(member.shape, vec![2, 3]);
+    assert_eq!(member.payload.read_vec().unwrap(), data);
+}
