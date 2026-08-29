@@ -30,7 +30,7 @@ s_f32	float32	[]	4	2496	1	-	-
 dtypes are canonical ids. `offset` is where the tensor's bytes start in the zip, inside its `data/<key>` record.
 
 - **Names:** a tensor's name is its path in the pickled object, joined with `.` (PT-012). A string key is used as it is, and an integer key or a list index is its number. So `{'state_dict': {'w': …}}` lists as `state_dict.w`, and an Adam optimizer's state lists as `optimizer.state.0.exp_avg`.
-- **Unnamed tensors:** a tensor reached through any other kind of key, such as `None` or a tuple, has no name. A note shows its path, it is not listed, and an edit keeps it as stored.
+- **Unnamed tensors:** a tensor reached through any other kind of key, such as `None` or a tuple, has no name. A note gives its path, dtype, and shape, for example `the tensor at root[None] (float32 [2]) has no name`. It is not listed or extracted, and an edit keeps it as stored.
 - **Other values:** a string, number, or bool is shown as metadata under its path, such as `optimizer.param_groups.0.lr=0.001`. `None` is left out. Anything else is skipped with a note.
 - **Shared storage:** tensors that share storage, such as tied weights, are listed once each.
 - **Byte order:** a big-endian checkpoint (`byteorder` record `big`) is byteswapped on the way in (PT-006).
@@ -82,18 +82,17 @@ tenspile: a pytorch state_dict written here has no string metadata
 - each tensor the edit leaves alone, with its storage, offset, strides, conj and neg bits, and `nn.Parameter` wrapper;
 - one `data/` record per storage, so tied weights stay tied. Replacing one name of a tied pair gives that name a storage of its own.
 
-A new name goes into the deepest dict whose name, followed by `.`, starts it (PT-013). The rest of the name is one key, dots included: `state_dict.extra` lands inside `state_dict` as `extra`, and `state_dict.layer.9.w` as `layer.9.w`. Otherwise it is a new top-level key. No new nested dict is made, nothing is added to a list or tuple, and `_metadata` is left alone, because `load_state_dict` needs no entry for a new key. A checkpoint whose root is a list has no dict to add to, so adding is refused. Deleting a tensor inside a list or tuple is refused too, because the items after it would change names. A replaced tensor is written with `_rebuild_tensor_v2`, or `_rebuild_tensor_v3` for the dtypes listed above.
+A new name goes into the deepest dict whose name, followed by `.`, starts it (PT-013). The rest of the name is one key, dots included: `state_dict.extra` lands inside `state_dict` as `extra`, and `state_dict.layer.9.w` as `layer.9.w`. Otherwise it is a new top-level key. No new nested dict is made, nothing is added to a list or tuple, and `_metadata` is left alone, because `load_state_dict` needs no entry for a new key. A checkpoint whose root is a list has no dict to add to, so adding is refused. Deleting a tensor inside a list or tuple is refused too, even the last item, because the items after it would change names and code may index the list by position. Replacing it in place is allowed. Deleting a dict key removes only that key, and a dict left empty stays. A replaced tensor is written with `_rebuild_tensor_v2`, or `_rebuild_tensor_v3` for the dtypes listed above.
 
 Deleting `f8e5m2` keeps the shared storage and the views:
 
 ```
 $ tenspile --delete -f small-pt-fp8.pt -o fp8b.pt f8e5m2
-tenspile: fp8b.pt: left out .format_version, so torch reads each record's offset from its header (PT-009)
 $ tensdiff small-pt-fp8.pt fp8b.pt
 only in small-pt-fp8.pt: f8e5m2
 ```
 
-The edit prints what it re-encoded: `.format_version` is always left out (PT-009), and a compressed storage is stored uncompressed (PT-005).
+The edit prints what it re-encodes: a compressed storage is stored uncompressed (PT-005). `.format_version` is always left out (PT-009) without a message. torch uses it only to decide how to find record offsets, so no loaded value changes.
 
 A checkpoint that holds something tenspile cannot write back exactly is refused rather than changed: a set, a dtype or storage class stored as a value, a tensor with backward hooks or extra state, or the old `_rebuild_tensor` call. So is a file where two paths give one name, such as `{'a.b': t1, 'a': {'b': t2}}` (PT-012), and an edit that would create such a name.
 
@@ -101,7 +100,6 @@ A training checkpoint with its optimizer keeps everything else when one weight i
 
 ```
 $ tenspile -u -f ckpt.pt model.0.bias=new_bias.npy
-tenspile: ckpt.pt: left out .format_version, so torch reads each record's offset from its header (PT-009)
 $ python3 -c "import torch; c = torch.load('ckpt.pt', weights_only=True); print(list(c), c['optimizer']['param_groups'][0]['lr'])"
 ['model', 'optimizer', 'epoch', 'best', 'note'] 0.001
 ```

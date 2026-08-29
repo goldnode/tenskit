@@ -198,7 +198,9 @@ impl Walk {
                     tensor: tensor.clone(),
                 }),
                 None => self.notes.push(format!(
-                    "the tensor at {repr} has no name, because a key on its path is not a str or int (PT-012); it is not listed, and an edit keeps it"
+                    "the tensor at {repr} ({} {}) has no name, because a key on its path is not a str or int (PT-012); it is not listed, and an edit keeps it",
+                    tensor.dtype,
+                    dtype::format_shape(&tensor.shape)
                 )),
             },
             Obj::Dict { pairs, .. } => {
@@ -1040,14 +1042,9 @@ pub fn rewrite_archive(
         source: Some(source),
         records,
     };
-    let mut notes = write_zip(dest, &root, tensors, &layout)?;
-    if zip.by_name(&format!("{}.format_version", file.prefix)).is_ok() {
-        notes.push(
-            "left out .format_version, so torch reads each record's offset from its header (PT-009)"
-                .into(),
-        );
-    }
-    Ok(notes)
+    // .format_version is left out without a note: PT-009 drops it, and it
+    // changes no loaded value (CONV-009).
+    write_zip(dest, &root, tensors, &layout)
 }
 
 fn open_zip(path: &Path) -> Result<ZipArchive<File>> {
@@ -2049,10 +2046,13 @@ mod tests {
         });
         let archive = open(&path).unwrap();
         assert_eq!(names(&path), ["opt.0", "list.0", "list.1"]);
-        assert!(archive.notes.iter().any(|note| note.contains("root[None]")), "{:?}", archive.notes);
+        assert!(archive.notes.iter().any(|note| note.contains("root[None] (float32 [2])")), "{:?}", archive.notes);
         // Deleting a list item would rename the next one.
         let dest = dir.path().join("d.pt");
         let err = rewrite(&path, &dest, &["opt.0", "list.1"], &[]).unwrap_err().to_string();
+        assert!(err.contains("list or tuple"), "{err}");
+        // The last item too, though it renames nothing (PT-013).
+        let err = rewrite(&path, &dest, &["opt.0", "list.0"], &[]).unwrap_err().to_string();
         assert!(err.contains("list or tuple"), "{err}");
         // PT-013: opt.x goes into opt, and the unnamed tensor is kept.
         rewrite(&path, &dest, &["opt.0", "list.0", "list.1"], &["opt.x", "top"]).unwrap();
