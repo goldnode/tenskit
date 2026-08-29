@@ -1403,7 +1403,8 @@ fn push_f32(
 
 fn metadata_notes(map: &Map<String, Value>) -> Vec<String> {
     let mut notes = Vec::new();
-    if map.get("rope_scaling").is_some() {
+    // `"rope_scaling": null` means no scaling, so there is nothing to copy.
+    if map.get("rope_scaling").is_some_and(|value| !value.is_null()) {
         notes.push(
             "rope_scaling was left in config.json; the nested GGUF keys are not copied".into(),
         );
@@ -1947,5 +1948,12 @@ mod tests {
         let raw = crate::archive::open(&back, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let Inner::Raw(file) = &raw.inner else { panic!() };
         assert_eq!(file.metadata, metadata);
+    }
+
+    #[test]
+    fn a_null_rope_scaling_is_not_reported() {
+        let config = |text: &str| serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone();
+        assert!(metadata_notes(&config(r#"{"rope_scaling": null}"#)).is_empty());
+        assert_eq!(metadata_notes(&config(r#"{"rope_scaling": {"type": "linear", "factor": 2.0}}"#)).len(), 1);
     }
 }

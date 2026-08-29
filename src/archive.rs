@@ -145,16 +145,14 @@ fn annotate_packs(archive: &mut Archive) {
             member.detail = Some(note.to_string());
         }
     }
+    // Only a numpy void descr such as `<V2` is what MLX reads as bfloat16.
     #[cfg(format_mlx)]
-    if archive
-        .members
-        .iter()
-        .any(|member| member.dtype.contains('V'))
-        || archive
-            .metadata
-            .iter()
-            .any(|(_, value)| value.contains('V'))
-    {
+    if archive.members.iter().any(|member| {
+        member
+            .dtype
+            .trim_start_matches(['<', '>', '|', '='])
+            .starts_with('V')
+    }) {
         if let Some(note) = crate::formats::mlx::void_note("<V2") {
             archive.notes.push(note.to_string());
         }

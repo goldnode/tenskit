@@ -986,3 +986,18 @@ fn a_fortran_order_member_extracts_to_npy_as_stored() {
     assert_eq!(member.shape, vec![2, 3]);
     assert_eq!(member.payload.read_vec().unwrap(), data);
 }
+
+#[cfg(all(format_mlx, format_npz, format_safetensors))]
+#[test]
+fn the_mlx_void_note_is_only_for_a_void_descr() {
+    let note = |archive: &crate::archive::Archive| archive.notes.iter().any(|note| note.contains("MLX would read"));
+    let npz = archive::open(&vectors().join("small.npz"), None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    assert!(note(&npz));
+    // A capital V in a metadata value, such as a chat template, is not a dtype.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.safetensors");
+    let source = format!("w={}:w_f32", vectors().join("small.safetensors").display());
+    crate::run(&["-cf".into(), path.display().to_string(), source, "--metadata".into(), "template=Very".into()]).unwrap();
+    let safe = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    assert!(!note(&safe), "{:?}", safe.notes);
+}
