@@ -26,6 +26,9 @@ pub struct Request {
 }
 
 pub fn run(request: &Request) -> Result<Vec<String>> {
+    if request.quantize.is_some() {
+        return quantize_file(request);
+    }
     crate::io_util::refuse_existing(&request.output, request.force)?;
     let resolved = archive::resolve_user_path(&request.source, request.force_single)?;
     let archive = archive::open(&resolved.path, None, DEFAULT_MAX_HEADER, None, None)?;
@@ -120,6 +123,9 @@ pub(crate) fn dequant_archive(
             "the tensor names look like a {guess} pack, but there is no config.json quantization_config; dequant needs it"
         )));
     }
+    warnings.push(
+        "nothing in the source is quantized; float tensors were written as float32 and the rest copied".into(),
+    );
     float_copy(archive)
 }
 
@@ -2081,11 +2087,7 @@ pub fn quant_main(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         QuantCommand::Run(request) => {
-            let warnings = if request.quantize.is_some() {
-                quantize_file(&request)?
-            } else {
-                run(&request)?
-            };
+            let warnings = run(&request)?;
             for warning in warnings {
                 eprintln!("tensquant: {warning}");
             }
@@ -2130,6 +2132,14 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
                     values: Vec::new(),
                 },
             ));
+        }
+        // Requantizing loses more than quantizing once, so it is refused,
+        // as llama-quantize does without --allow-requantize.
+        if dtype::canon_kind(canonical) == Some("block") {
+            return Err(msg(format!(
+                "tensor {} is already quantized ({}); dequantize the file with tensquant --dequant first",
+                member.name, member.dtype
+            )));
         }
         let is_float = matches!(canonical, "float32" | "float16" | "bfloat16");
         // Other element types are copied as they are.
@@ -2188,6 +2198,16 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
                 unresolved.join(", ")
             ),
         );
+    }
+    // The source's metadata is carried as tensconv carries it: a GGUF's
+    // keys keep their types, and other formats' keys get their prefix. The
+    // quantizer's own file_type and quantization_version replace the
+    // source's, since quantizing changes them.
+    let source = crate::convert::source_metadata(&archive);
+    for (key, value) in crate::convert::gguf_metadata(&archive, source, &mut warnings) {
+        if !metadata.iter().any(|(existing, _)| *existing == key) {
+            metadata.push((key, value));
+        }
     }
     write_dense(&request.output, &metadata, &dense)?;
     Ok(warnings)

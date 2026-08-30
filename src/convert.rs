@@ -938,7 +938,7 @@ fn write_target(
 /// Source metadata with types: GGUF keys keep theirs, other formats are
 /// string maps. `general.alignment` describes the source file's layout and
 /// is not carried over.
-fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
+pub(crate) fn source_metadata(archive: &Archive) -> Vec<(String, MetaValue)> {
     #[cfg(format_gguf)]
     if let Inner::Gguf(file) = &archive.inner {
         return file
@@ -1035,7 +1035,7 @@ fn format_id(format: FormatName) -> &'static str {
 /// `<format id>.metadata.gguf.<key>`. Any other key goes under
 /// `<format id>.metadata.<key>` (CONV-008): as a STRING, or for
 /// raw-sidecar with its own type when GGUF has it.
-fn gguf_metadata(
+pub(crate) fn gguf_metadata(
     archive: &Archive,
     source: Vec<(String, MetaValue)>,
     warnings: &mut Vec<String>,

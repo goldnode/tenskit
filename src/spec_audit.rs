@@ -1001,3 +1001,49 @@ fn the_mlx_void_note_is_only_for_a_void_descr() {
     let safe = archive::open(&path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
     assert!(!note(&safe), "{:?}", safe.notes);
 }
+
+#[cfg(all(format_gguf, format_safetensors))]
+#[test]
+fn quantizing_a_gguf_keeps_its_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("q8.gguf");
+    let quantize = |source: std::path::PathBuf| {
+        crate::quant::run(&crate::quant::Request {
+            source,
+            output: out.clone(),
+            format: None,
+            quantize: Some("q8_0".into()),
+            force_single: false,
+            force: false,
+        })
+    };
+    // small.gguf holds quantized tensors, which are not quantized again.
+    let err = quantize(vectors().join("small.gguf")).unwrap_err().to_string();
+    assert!(err.contains("already quantized"), "{err}");
+    // An unquantized GGUF with metadata: small.safetensors converted, named.
+    let plain = dir.path().join("plain.gguf");
+    let path = |path: &std::path::Path| path.display().to_string();
+    crate::convert::run(&crate::convert::Request {
+        source: vectors().join("small.safetensors"),
+        output: plain.clone(),
+        format: None,
+        rename: false,
+        names_only: false,
+        force_single: false,
+        force: false,
+    })
+    .unwrap();
+    crate::run(&["-u".into(), "-f".into(), path(&plain), "--metadata".into(), "general.name=demo".into()]).unwrap();
+    quantize(plain.clone()).unwrap();
+    let open = |path: &std::path::Path| archive::open(path, None, crate::cli::DEFAULT_MAX_HEADER, None, None).unwrap();
+    let (source, written) = (open(&plain), open(&out));
+    assert!(source.metadata.iter().any(|(key, _)| key == "general.name"));
+    for (key, value) in &source.metadata {
+        let found = written.metadata.iter().find(|(other, _)| other == key).map(|(_, value)| value);
+        if key == "general.file_type" {
+            assert_eq!(found.map(String::as_str), Some("7"));
+        } else {
+            assert_eq!(found, Some(value), "{key}");
+        }
+    }
+}

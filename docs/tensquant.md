@@ -120,7 +120,23 @@ A module with `.scales` but no entry has its settings inferred, as mlx-lm's `inf
 $ tensquant --quantize q8_0 -o model-q8.gguf model/
 ```
 
-The output is always GGUF, and the tensor names are kept as stored. `general.file_type` is the requested type, MOSTLY_Q8_0 (7) or MOSTLY_Q4_0 (2) (GGUF-025). K-quants and IQ types are not written.
+The output is always GGUF, and the tensor names are kept as stored. `general.file_type` is the requested type, MOSTLY_Q8_0 (7) or MOSTLY_Q4_0 (2) (GGUF-025). The source's other metadata is carried as `tensconv` carries it, so a GGUF source keeps its architecture and hyperparameters. K-quants and IQ types are not written.
+
+A tensor that is already quantized is not quantized again, because that loses more than quantizing once. As with llama.cpp's `llama-quantize`, the command stops:
+
+```
+$ tensquant --quantize q4_0 -o model-q4.gguf model-q8.gguf
+tensquant: tensor output.weight is already quantized (Q8_0); dequantize the file with tensquant --dequant first
+```
+
+For a file that llama.cpp can load, rename first and then quantize the GGUF. Quantizing a Hugging Face directory directly keeps the Hugging Face names:
+
+```
+$ tensconv --rename -o model.gguf model/
+$ tensquant --quantize q8_0 -o model-q8.gguf model.gguf
+```
+
+Neither command writes a tokenizer (`tokenizer.ggml.*`), which llama.cpp needs before it can run the model.
 
 Which tensors are quantized follows llama.cpp's `convert_hf_to_gguf.py` (GGUF-024). These stay F32:
 

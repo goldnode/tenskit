@@ -271,7 +271,7 @@ fn check_coverage(tensors: &[TensorEntry], data_len: u64) -> Result<()> {
     }
     if cursor != data_len {
         return Err(msg(format!(
-            "safetensors data is {data_len} bytes and the tensors cover {cursor}"
+            "safetensors data is {data_len} bytes and the tensors cover {cursor}; the file may be truncated or damaged"
         )));
     }
     Ok(())
