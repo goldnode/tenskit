@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+/// `outln!` for command output. A closed pipe, as with `| head`, ends the
+/// process quietly with status 141, as a shell reports a command that SIGPIPE stopped.
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        $crate::io_util::out_line(format_args!($($arg)*))
+    };
+}
+
 mod archive;
 mod cli;
 mod convert;
@@ -36,11 +44,11 @@ pub fn version_line(command: &str) -> String {
 pub fn run(args: &[String]) -> Result<i32> {
     match cli::parse(args)? {
         cli::Parsed::Help => {
-            println!("{}", cli::help_text());
+            outln!("{}", cli::help_text());
             Ok(0)
         }
         cli::Parsed::Version => {
-            println!("{}", cli::version_text());
+            outln!("{}", cli::version_text());
             Ok(0)
         }
         cli::Parsed::Run(command) => ops::execute(command),

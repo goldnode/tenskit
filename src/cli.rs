@@ -479,7 +479,6 @@ Examples:
   tenspile -cf out.safetensors embed=embed.npy --metadata format=pt
   tenspile -uf model.safetensors norm=new_norm.npy
   tenspile --delete -f model.safetensors optimizer.step
-  tensdiff left.safetensors right.gguf
 "
 }
 
@@ -504,6 +503,11 @@ mod tests {
         assert_eq!(cli.op, Op::List);
         assert!(cli.verbose);
         assert_eq!(cli.file.unwrap(), PathBuf::from("model.safetensors"));
+    }
+
+    #[test]
+    fn help_shows_no_other_command() {
+        assert!(!help_text().contains("tensdiff left"));
     }
 
     #[test]

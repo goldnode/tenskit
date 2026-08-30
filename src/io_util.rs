@@ -179,3 +179,15 @@ mod tests {
         assert!(relative_child(Path::new("."), "../secret").is_err());
     }
 }
+
+/// Writes one line to stdout. See `outln!`.
+pub fn out_line(args: std::fmt::Arguments) {
+    let mut out = io::stdout().lock();
+    if let Err(err) = writeln!(out, "{args}") {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(141);
+        }
+        let _ = writeln!(io::stderr(), "failed writing to stdout: {err}");
+        std::process::exit(1);
+    }
+}

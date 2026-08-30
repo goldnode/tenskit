@@ -101,9 +101,9 @@ pub fn compare(
     let findings = findings_of(&left_archive, &right_archive, match_names)?;
     let same = !findings.iter().any(Finding::is_difference);
     if json_out {
-        println!("{}", render_json(&findings, same));
+        outln!("{}", render_json(&findings, same));
     } else if !findings.is_empty() {
-        println!("{}", render_text(&findings, fold));
+        outln!("{}", render_text(&findings, fold));
     }
     Ok(if same { 0 } else { 1 })
 }
@@ -767,11 +767,11 @@ fn render_json(findings: &[Finding], same: bool) -> String {
 pub fn diff_main(args: &[String]) -> Result<i32> {
     match parse_diff(args)? {
         DiffCommand::Help => {
-            println!("{}", diff_help());
+            outln!("{}", diff_help());
             Ok(0)
         }
         DiffCommand::Version => {
-            println!("{}", crate::version_line("tensdiff"));
+            outln!("{}", crate::version_line("tensdiff"));
             Ok(0)
         }
         DiffCommand::Run {

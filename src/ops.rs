@@ -109,7 +109,7 @@ fn list(cli: &Cli) -> Result<()> {
     let archive = open_source(cli)?;
     let selected = select(&archive, &cli.operands)?;
     if cli.json {
-        println!("{}", json_document(&archive, &selected)?);
+        outln!("{}", json_document(&archive, &selected)?);
         return Ok(());
     }
     print_members(&selected, member_style(cli));
@@ -125,23 +125,23 @@ fn info(cli: &Cli) -> Result<()> {
     }
     let members: Vec<&Member> = archive.members.iter().collect();
     if cli.json {
-        println!("{}", json_document(&archive, &members)?);
+        outln!("{}", json_document(&archive, &members)?);
         return Ok(());
     }
-    println!("format: {}", archive.format.as_str());
-    println!("version: {}", archive.version);
-    println!("path: {}", archive.path.display());
-    println!("members: {}", archive.members.len());
-    println!("data_bytes: {}", archive.data_bytes);
+    outln!("format: {}", archive.format.as_str());
+    outln!("version: {}", archive.version);
+    outln!("path: {}", archive.path.display());
+    outln!("members: {}", archive.members.len());
+    outln!("data_bytes: {}", archive.data_bytes);
     if archive.metadata.is_empty() {
-        println!("metadata: none");
+        outln!("metadata: none");
     } else {
-        println!("metadata:");
+        outln!("metadata:");
         for (key, value) in &archive.metadata {
-            println!("  {key}={}", short_value(value));
+            outln!("  {key}={}", short_value(value));
         }
     }
-    println!("dtypes:");
+    outln!("dtypes:");
     let mut totals: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for member in &archive.members {
         let slot = totals.entry(member.dtype.as_str()).or_insert((0, 0));
@@ -149,14 +149,14 @@ fn info(cli: &Cli) -> Result<()> {
         slot.1 = slot.1.saturating_add(member.numel.unwrap_or(0));
     }
     if totals.is_empty() {
-        println!("  none");
+        outln!("  none");
     } else {
         for (dtype, (count, params)) in totals {
-            println!("  {dtype}\t{count}\t{params}");
+            outln!("  {dtype}\t{count}\t{params}");
         }
     }
     for note in &archive.notes {
-        println!("note: {note}");
+        outln!("note: {note}");
     }
     if cli.verbose || cli.columns || cli.fold {
         print_members(&members, member_style(cli));
@@ -223,20 +223,20 @@ fn print_members(members: &[&Member], style: MemberStyle) {
     match style {
         MemberStyle::Names => {
             for member in members {
-                println!("{}", member.name);
+                outln!("{}", member.name);
             }
             return;
         }
         MemberStyle::Columns { fold } => {
             let text = crate::listing::render_columns(members, fold);
             if !text.is_empty() {
-                println!("{text}");
+                outln!("{text}");
             }
             return;
         }
         MemberStyle::Tabs => {}
     }
-    println!("name\tdtype\tshape\tbytes\toffset\tparams\tshard\tdetail");
+    outln!("name\tdtype\tshape\tbytes\toffset\tparams\tshard\tdetail");
     for member in members {
         let params = member
             .numel
@@ -244,7 +244,7 @@ fn print_members(members: &[&Member], style: MemberStyle) {
             .unwrap_or_else(|| "-".to_string());
         let shard = member.shard.as_deref().unwrap_or("-");
         let detail = member.detail.as_deref().unwrap_or("-");
-        println!(
+        outln!(
             "{}\t{}\t{}\t{}\t{}\t{params}\t{shard}\t{detail}",
             member.name,
             member.dtype,
@@ -336,9 +336,9 @@ fn extract(cli: &Cli) -> Result<()> {
     let selected = select(&archive, &cli.operands)?;
     let jobs = extract_jobs(cli, &archive, &selected)?;
     if cli.dry_run {
-        println!("dry-run: extract {}", archive.path.display());
+        outln!("dry-run: extract {}", archive.path.display());
         for job in &jobs {
-            println!("{}", job_path(job).display());
+            outln!("{}", job_path(job).display());
         }
         return Ok(());
     }
@@ -752,7 +752,7 @@ fn create(cli: &Cli) -> Result<()> {
         )));
     }
     if cli.dry_run {
-        println!("dry-run: create {}", dest.display());
+        outln!("dry-run: create {}", dest.display());
         print_plan(&incoming, &metadata);
         return Ok(());
     }
@@ -842,9 +842,9 @@ fn edit_gguf(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
         return Err(msg("internal error: expected a GGUF archive"));
     };
     if cli.dry_run {
-        println!("dry-run: update metadata in {}", dest.display());
+        outln!("dry-run: update metadata in {}", dest.display());
         for (key, value) in &updates {
-            println!("metadata {key}={}", value.display());
+            outln!("metadata {key}={}", value.display());
         }
         return Ok(());
     }
@@ -859,7 +859,7 @@ fn edit_safe(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
     let metadata = merge_strings(&archive.metadata, &updates);
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         print_plan(&planned, &metadata);
         return Ok(());
     }
@@ -880,7 +880,7 @@ fn edit_npz(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
         return Err(msg("writing an npz archive with no arrays is not supported"));
     }
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         print_plan(&planned, &[]);
         return Ok(());
     }
@@ -974,7 +974,7 @@ fn edit_pytorch(
         return Err(msg("writing a pytorch checkpoint with no tensors is not supported"));
     }
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         print_plan(&planned, &[]);
         return Ok(());
     }
@@ -1026,7 +1026,7 @@ fn edit_onnx(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<
         return Err(msg("writing an ONNX file with no initializers is not supported"));
     }
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         print_plan(&planned, &metadata);
         return Ok(());
     }
@@ -1094,7 +1094,7 @@ fn edit_raw(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result<(
     let metadata = crate::formats::rawtensor::merge_metadata(&file.metadata, &updates)?;
     let planned = plan_members(cli, &archive.members, mode, &updates)?;
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         let shown = crate::formats::rawtensor::display_metadata(&metadata);
         print_plan(&planned, &shown);
         return Ok(());
@@ -1232,7 +1232,7 @@ fn edit_single_file(
         return Err(msg(format!("a {kind} holds one tensor")));
     }
     if cli.dry_run {
-        println!("dry-run: write {}", dest.display());
+        outln!("dry-run: write {}", dest.display());
         print_plan(&incoming, &[]);
         return Ok(());
     }
@@ -1320,15 +1320,15 @@ fn edit_index(cli: &Cli, archive: &Archive, mode: Modify, dest: &Path) -> Result
     }
 
     if cli.dry_run {
-        println!("dry-run: update {}", dest.display());
+        outln!("dry-run: update {}", dest.display());
         for shard in &rewritten {
-            println!("rewrite {shard}");
+            outln!("rewrite {shard}");
         }
         for shard in &dropped {
-            println!("drop {shard}");
+            outln!("drop {shard}");
         }
         for (key, value) in &updates {
-            println!("metadata {key}={value}");
+            outln!("metadata {key}={value}");
         }
         return Ok(());
     }
@@ -1544,7 +1544,7 @@ fn from_member(member: &Member) -> Planned {
 
 fn print_plan(planned: &[Planned], metadata: &[(String, String)]) {
     for item in planned {
-        println!(
+        outln!(
             "{} {} {} {}",
             item.name,
             item.dtype,
@@ -1553,7 +1553,7 @@ fn print_plan(planned: &[Planned], metadata: &[(String, String)]) {
         );
     }
     for (key, value) in metadata {
-        println!("metadata {key}={value}");
+        outln!("metadata {key}={value}");
     }
 }
 

@@ -2079,11 +2079,11 @@ fn output_format(path: &Path, explicit: Option<FormatName>) -> Result<FormatName
 pub fn quant_main(args: &[String]) -> Result<i32> {
     match parse_quant(args)? {
         QuantCommand::Help => {
-            println!("{}", quant_help());
+            outln!("{}", quant_help());
             Ok(0)
         }
         QuantCommand::Version => {
-            println!("{}", crate::version_line("tensquant"));
+            outln!("{}", crate::version_line("tensquant"));
             Ok(0)
         }
         QuantCommand::Run(request) => {

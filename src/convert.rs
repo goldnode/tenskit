@@ -1615,11 +1615,11 @@ fn clip_permute(tensor: &mut Tensor) -> Result<()> {
 pub fn convert_main(args: &[String]) -> Result<i32> {
     match parse_convert(args)? {
         ConvertCommand::Help => {
-            println!("{}", convert_help());
+            outln!("{}", convert_help());
             Ok(0)
         }
         ConvertCommand::Version => {
-            println!("{}", crate::version_line("tensconv"));
+            outln!("{}", crate::version_line("tensconv"));
             Ok(0)
         }
         ConvertCommand::Run(request) => {
