@@ -236,7 +236,16 @@ Read this
 file even when
 .I config.json
 is in the same directory.
-It applies only to the path written immediately after it.
+It applies only to the one path after it.
+With
+.BR \-f ,
+it may go before or after
+.BR \-f :
+.B \-\-force\-single\-file \-f
+.I path
+or
+.B \-f \-\-force\-single\-file
+.IR path .
 .TP
 .BR \-n ", " \-\-dry\-run
 Print the plan and do not write.

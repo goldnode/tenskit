@@ -4,7 +4,7 @@
 
 A directory is that weight set. One `*.safetensors.index.json` is opened. With no index, one `*.safetensors` that is not a shard name (`model-00001-of-00005.safetensors`) is opened. Several of either, or none, is an error. `-i` notes the other files in the directory, such as `config.json` and `tokenizer.json`. Those files are not parsed.
 
-A `.safetensors` path whose directory contains `config.json` stops, because the file is likely one piece of that set. Pass the directory, or put `--force-single-file` immediately before that path to read the one file. The flag does not apply to the next path. An index path is already the whole weight set, so `config.json` beside it does not stop the command.
+A `.safetensors` path whose directory contains `config.json` stops, because the file is likely one piece of that set. Pass the directory, or put `--force-single-file` immediately before that path to read the one file. The flag does not apply to the next path. With `tenspile -f`, the flag may go before or after `-f`: `--force-single-file -f PATH` and `-f --force-single-file PATH` are the same. An index path is already the whole weight set, so `config.json` beside it does not stop the command.
 
 The index is the sharding section of [safetensors.yaml](../tensdataspecs_readonly/specs/formats/safetensors.yaml). `version: index` is tenspile's label. Each shard is a [safetensors](safetensors.md) file. Extract formats are in [Import and export](import-export.md).
 

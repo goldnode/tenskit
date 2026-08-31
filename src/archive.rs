@@ -589,9 +589,10 @@ pub fn resolve_user_path(path: &Path, force_single: bool) -> Result<ResolvedPath
             .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         return Err(msg(format!(
-            "{} is likely part of a larger set of files because config.json is in {}. Pass that directory, or put --force-single-file immediately before this path.",
+            "{} is likely part of a larger set of files because config.json is in {}. Pass that directory instead, or, to read only this file, write --force-single-file just before its path, for example --force-single-file {}.",
             path.display(),
-            dir.display()
+            dir.display(),
+            path.display()
         )));
     }
     Ok(ResolvedPath {

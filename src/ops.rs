@@ -257,11 +257,24 @@ fn print_members(members: &[&Member], style: MemberStyle) {
 
 /// A metadata value for the text listing: long values such as a GGUF
 /// vocabulary are cut to their first 120 characters. `--json` prints them whole.
+/// A cut array gives its item count, then the length of its full JSON text.
 fn short_value(value: &str) -> String {
     const SHOWN: usize = 120;
-    match value.char_indices().nth(SHOWN) {
-        Some((end, _)) => format!("{}… ({} bytes)", &value[..end], value.len()),
-        None => value.to_string(),
+    let Some((end, _)) = value.char_indices().nth(SHOWN) else {
+        return value.to_string();
+    };
+    let items = value
+        .starts_with('[')
+        .then(|| serde_json::from_str::<Vec<Value>>(value).ok())
+        .flatten();
+    match items {
+        Some(items) => format!(
+            "{}… ({} items; {} bytes as JSON)",
+            &value[..end],
+            items.len(),
+            value.len()
+        ),
+        None => format!("{}… ({} bytes)", &value[..end], value.len()),
     }
 }
 
@@ -2162,4 +2175,19 @@ fn ends_with(path: &Path, suffix: &str) -> bool {
     path.file_name()
         .and_then(|text| text.to_str())
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(suffix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_value;
+
+    #[test]
+    fn a_cut_array_gives_its_item_count() {
+        let long: Vec<String> = (0..200).map(|n| n.to_string()).collect();
+        let value = serde_json::to_string(&long).unwrap();
+        let shown = short_value(&value);
+        assert!(shown.ends_with(&format!("(200 items; {} bytes as JSON)", value.len())), "{shown}");
+        let text = "x".repeat(130);
+        assert_eq!(short_value(&text), format!("{}… (130 bytes)", "x".repeat(120)));
+    }
 }

@@ -196,7 +196,16 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                     force_next = true;
                 }
                 "file" => {
-                    file_marked = Some(marked(&mut force_next, take("file")?));
+                    let mut value = take("file")?;
+                    if value == "--force-single-file" && inline.is_none() {
+                        force_next = true;
+                        index += 1;
+                        value = args
+                            .get(index)
+                            .cloned()
+                            .ok_or_else(|| msg("--file needs a value"))?;
+                    }
+                    file_marked = Some(marked(&mut force_next, value));
                 }
                 "directory" => directory = PathBuf::from(take("directory")?),
                 "output" => output = Some(PathBuf::from(take("output")?)),
@@ -246,7 +255,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
             let rest: String = chars[cursor + 1..].iter().collect();
             let needs_value = matches!(ch, 'f' | 'C' | 'o');
             if needs_value {
-                let value = if rest.is_empty() {
+                let mut value = if rest.is_empty() {
                     index += 1;
                     args.get(index)
                         .cloned()
@@ -254,6 +263,15 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 } else {
                     rest
                 };
+                // `-f --force-single-file PATH` marks PATH, as `--force-single-file -f PATH` does.
+                if ch == 'f' && value == "--force-single-file" {
+                    force_next = true;
+                    index += 1;
+                    value = args
+                        .get(index)
+                        .cloned()
+                        .ok_or_else(|| msg("-f needs a value"))?;
+                }
                 match ch {
                     'f' => file_marked = Some(marked(&mut force_next, value)),
                     'C' => directory = PathBuf::from(value),
@@ -460,7 +478,9 @@ Options:
   --force                   Overwrite an existing output file.
   --force-single-file PATH  Read this .safetensors file even when config.json
                             is in the same directory. It applies only to the
-                            path written immediately after it.
+                            one path after it. With -f, it may go before or
+                            after -f: --force-single-file -f PATH or
+                            -f --force-single-file PATH.
   -n, --dry-run             Print the plan and do not write.
   -h, --help                Show this help.
   --version                 Show the version.
@@ -503,6 +523,22 @@ mod tests {
         assert_eq!(cli.op, Op::List);
         assert!(cli.verbose);
         assert_eq!(cli.file.unwrap(), PathBuf::from("model.safetensors"));
+    }
+
+    #[test]
+    fn force_single_file_may_follow_dash_f() {
+        for list in [
+            &["-t", "-f", "--force-single-file", "m.safetensors"][..],
+            &["-t", "--force-single-file", "-f", "m.safetensors"][..],
+            &["-tf", "--force-single-file", "m.safetensors"][..],
+            &["-t", "--file", "--force-single-file", "m.safetensors"][..],
+        ] {
+            let Parsed::Run(cli) = parse(&args(list)).unwrap() else {
+                panic!("expected a command");
+            };
+            assert_eq!(cli.file.unwrap(), PathBuf::from("m.safetensors"), "{list:?}");
+            assert!(cli.file_force_single, "{list:?}");
+        }
     }
 
     #[test]
