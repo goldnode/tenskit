@@ -60,6 +60,9 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             )?;
         }
         rename_tensors(&mut tensors, &arch, layers, &mut warnings)?;
+        if target == FormatName::Gguf && !request.names_only {
+            keep_f32_roles(&mut tensors, &mut warnings)?;
+        }
         if target == FormatName::Gguf {
             if let Some(map) = &hparams {
                 warnings.extend(metadata_notes(map));
@@ -244,15 +247,23 @@ fn apply_values(
         qwen35_values(tensors, hparams, dir)?;
         return Ok(());
     }
-    let pending = if converter.unexpanded.is_empty() {
-        "the method was not expanded".to_string()
-    } else {
-        converter.unexpanded.join("; ")
-    };
-    Err(msg(format!(
-        "value changes for {arch} ({}) are not in the spec: {pending}",
+    let mut text = format!(
+        "cannot convert {arch} ({}) with --rename yet. llama.cpp's converter may change \
+         some tensor values for this model, and the spec does not yet say which, so the \
+         result could load and still answer wrongly. --names-only renames without changing \
+         any value, at your own risk.",
         converter.class
-    )))
+    );
+    if converter.unexpanded.is_empty() {
+        text.push_str(" The spec has not expanded this converter's tensor method.");
+    } else {
+        text.push_str(" The steps the spec has not expanded, as llama.cpp's Python source:");
+        for step in &converter.unexpanded {
+            text.push_str("\n  ");
+            text.push_str(step);
+        }
+    }
+    Err(msg(text))
 }
 
 fn llama_permute(tensors: &mut [Tensor], hparams: Option<&Map<String, Value>>) -> Result<()> {
@@ -696,6 +707,41 @@ fn rename_tensors(
                 tensor.name
             )),
         }
+    }
+    Ok(())
+}
+
+/// GGUF-024 steps 2 and 3: convert_hf_to_gguf writes norms, 1-D tensors,
+/// biases, and a few roles as F32, and llama.cpp's CPU backend cannot
+/// multiply by a BF16 norm. An F16 or BF16 tensor in those roles is widened
+/// to F32, which is exact. Other dtypes are left as they are.
+fn keep_f32_roles(tensors: &mut [Tensor], warnings: &mut Vec<String>) -> Result<()> {
+    let mut widened = 0;
+    for tensor in tensors.iter_mut() {
+        if !crate::quant::keeps_f32(&tensor.name, tensor.shape.len()) {
+            continue;
+        }
+        let raw = match tensor.canonical.as_str() {
+            "bfloat16" => bf16_to_f32(&tensor.bytes.read_vec()?)?,
+            "float16" => tensor
+                .bytes
+                .read_vec()?
+                .chunks_exact(2)
+                .flat_map(|pair| {
+                    crate::ggml_dequant::f16_to_f32(u16::from_le_bytes([pair[0], pair[1]]))
+                        .to_le_bytes()
+                })
+                .collect(),
+            _ => continue,
+        };
+        tensor.bytes = Payload::Bytes(raw);
+        tensor.canonical = "float32".to_string();
+        widened += 1;
+    }
+    if widened > 0 {
+        warnings.push(format!(
+            "widened {widened} norm, bias, and 1-D tensors to F32, as llama.cpp's converter writes them (GGUF-024)"
+        ));
     }
     Ok(())
 }
@@ -1797,6 +1843,32 @@ mod tests {
     }
 
     #[cfg(all(format_safetensors, format_gguf))]
+    #[test]
+    fn renamed_norms_and_biases_become_f32_for_llama_cpp() {
+        let tensor = |name: &str, canonical: &str, shape: Vec<u64>, bytes: Vec<u8>| Tensor {
+            name: name.into(),
+            canonical: canonical.into(),
+            shape,
+            bytes: Payload::Bytes(bytes),
+        };
+        // bf16 1.5 is 0x3fc0, f16 -2.0 is 0xc000.
+        let mut tensors = vec![
+            tensor("blk.0.attn_norm.weight", "bfloat16", vec![2], vec![0xc0, 0x3f, 0xc0, 0x3f]),
+            tensor("blk.0.attn_k.bias", "float16", vec![1], vec![0x00, 0xc0]),
+            tensor("blk.0.attn_k.weight", "bfloat16", vec![1, 2], vec![0xc0, 0x3f, 0xc0, 0x3f]),
+            tensor("blk.0.ffn_norm.weight", "float32", vec![1], 1.0f32.to_le_bytes().to_vec()),
+        ];
+        let mut warnings = Vec::new();
+        keep_f32_roles(&mut tensors, &mut warnings).unwrap();
+        assert_eq!(tensors[0].canonical, "float32");
+        assert_eq!(tensors[0].bytes.read_vec().unwrap(), [1.5f32.to_le_bytes(), 1.5f32.to_le_bytes()].concat());
+        assert_eq!(tensors[1].canonical, "float32");
+        assert_eq!(tensors[1].bytes.read_vec().unwrap(), (-2.0f32).to_le_bytes());
+        assert_eq!(tensors[2].canonical, "bfloat16");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("widened 2 "), "{warnings:?}");
+    }
+
     #[test]
     fn a_dense_safetensors_file_round_trips_through_gguf() {
         let dir = tempfile::tempdir().unwrap();

@@ -111,7 +111,8 @@ How the architecture and its changes are chosen:
 - Value changes run unless `--names-only` is set. A converter record with `complete: true` applies its listed branch: `+ 1`, unsqueeze, squeeze, the clip `view`/`permute`, `-exp`, and the recorded renames. The expression text is never evaluated. Any other expression stops the conversion and prints it.
 - LLaMA permutes the rows of `q_proj` and `k_proj` weights and biases when the converter has `undo_permute`. That is why `tensdiff --match-names` reports their values as different.
 - Qwen3.5 applies the V-head reorder, `A_log` as `-exp`, norms other than `linear_attn.norm.weight` as `weight + 1`, and the `conv1d` squeeze. Full-attention Q and K are not permuted, and the reorder is skipped when the linear head counts match.
-- Any other architecture whose record is `complete: false` stops, and names the `unexpanded` arms.
+- Any other architecture whose record is `complete: false` stops. The message explains why, suggests `--names-only`, and lists the `unexpanded` steps one per line, as the spec quotes them from llama.cpp's Python source.
+- Into GGUF, the tensors llama.cpp's converter writes as F32 are widened to F32 when they are F16 or BF16 (GGUF-024 steps 2 and 3): rank 1 and below, `*_norm.weight`, names that do not end in `.weight`, such as biases, and a few roles such as `ffn_gate_inp`. The widen is exact. llama.cpp's CPU backend cannot multiply by a BF16 norm, so a file without it stops with `binary_op: unsupported types`. One warning gives the count. `--names-only` skips this too.
 
 `--names-only` renames and skips every value change, which is useful for inspecting the mapping.
 

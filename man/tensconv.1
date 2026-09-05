@@ -48,6 +48,12 @@ FP8 and FP4 types that fit in F16 widen to F16.
 E8M0 widens to F32.
 A type the target cannot store stops the command.
 Narrowing is not done.
+With
+.B \-\-rename
+into GGUF, unless
+.BR \-\-names\-only ,
+F16 and BF16 norms, biases, and other 1-D tensors are widened to F32,
+as llama.cpp's converter writes them (GGUF-024).
 Quantized blocks are not written here.
 .BR \%tensquant (1)
 dequantizes them.

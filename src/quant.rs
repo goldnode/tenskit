@@ -2260,7 +2260,7 @@ impl F32Roles {
 /// 1 and below, `*_norm.weight`, every name that does not end in `.weight`,
 /// `.lora_a`, or `.lora_b`, and a fixed list of roles. The roles are matched
 /// by name whatever the architecture.
-fn keeps_f32(name: &str, rank: usize) -> bool {
+pub(crate) fn keeps_f32(name: &str, rank: usize) -> bool {
     const ROLES: &[&str] = &[
         "ffn_gate_inp", "ffn_gate_inp_shexp", "position_embd", "token_types", "ssm_conv1d",
         "shortconv.conv", "time_mix_first", "time_mix_w1", "time_mix_w2", "time_mix_decay_w1",
