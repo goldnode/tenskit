@@ -107,7 +107,8 @@ pub fn execute(cli: Cli) -> Result<i32> {
 
 fn list(cli: &Cli) -> Result<()> {
     let archive = open_source(cli)?;
-    let selected = select(&archive, &cli.operands)?;
+    let mut selected = select(&archive, &cli.operands)?;
+    sort_members(cli, &mut selected);
     if cli.json {
         outln!("{}", json_document(&archive, &selected)?);
         return Ok(());
@@ -123,7 +124,8 @@ fn info(cli: &Cli) -> Result<()> {
             archive.notes.push(note);
         }
     }
-    let members: Vec<&Member> = archive.members.iter().collect();
+    let mut members: Vec<&Member> = archive.members.iter().collect();
+    sort_members(cli, &mut members);
     if cli.json {
         outln!("{}", json_document(&archive, &members)?);
         return Ok(());
@@ -207,6 +209,12 @@ fn quantization_note_text(method: &str, bits: Option<u64>, group: Option<u64>) -
         text.push_str(&format!(" group {group}"));
     }
     text
+}
+
+fn sort_members(cli: &Cli, members: &mut [&Member]) {
+    if cli.sort {
+        members.sort_by(|left, right| crate::listing::name_order(&left.name, &right.name));
+    }
 }
 
 fn member_style(cli: &Cli) -> MemberStyle {

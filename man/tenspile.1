@@ -14,6 +14,7 @@ tenspile \- inspect and edit tensor containers
 .RB [ \-v ]
 .RB [ \-\-columns ]
 .RB [ \-\-fold ]
+.RB [ \-\-sort ]
 .RB [ \-f ]
 .I archive
 .RI [ key
@@ -170,7 +171,22 @@ is one copy of each leaf, not the sum, and the offset is
 A gap, or a second number in the name, stays on its own line.
 Applies to list or info.
 .B tensdiff \-\-fold
-folds a diff the same way.
+folds a diff the same way..TP
+.B \-\-sort
+List members sorted by name instead of in file order.
+Names are compared one dot-separated segment at a time.
+A segment that is all digits sorts by its number, before any other segment,
+so
+.I layers.2
+comes before
+.IR layers.10 .
+Other segments sort by their bytes.
+Applies to list, and to info with
+.BR \-v ,
+.BR \-\-columns ,
+.BR \-\-fold ,
+or
+.BR \-\-json .
 .TP
 .BR \-C ", " \-\-directory " \fIdir\fR"
 Directory for extracted files.

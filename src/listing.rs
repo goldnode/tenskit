@@ -1,6 +1,7 @@
 //! Console listing. `-v` stays tab-separated. `--columns` aligns a table and
 //! `--fold` collapses consecutive identical layers into a range.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::archive::Member;
@@ -20,6 +21,41 @@ struct Row {
     params: String,
     shard: String,
     detail: String,
+}
+
+/// `--sort` order, segment by segment at each `.`. An all-digit segment sorts
+/// by its number and before any other segment; other segments sort by bytes.
+/// layers.2 sorts before layers.10, and a tie such as 2 and 02 falls back to bytes.
+pub fn name_order(left: &str, right: &str) -> Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) => {
+                let order = match (digits(a), digits(b)) {
+                    (true, true) => {
+                        let short_a = a.trim_start_matches('0');
+                        let short_b = b.trim_start_matches('0');
+                        short_a.len().cmp(&short_b.len()).then_with(|| short_a.cmp(short_b))
+                    }
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => Ordering::Equal,
+                }
+                .then_with(|| a.cmp(b));
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+fn digits(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Aligned listing. `fold` merges a consecutive run of one numeric name segment
@@ -548,5 +584,35 @@ model.layers.0.self_attn.
         let text = render_columns(&refs, true);
         assert!(text.contains("model.layers.[0-1].experts."));
         assert!(!text.contains("experts.[0-1]"));
+    }
+
+    #[test]
+    fn numeric_segments_sort_by_number() {
+        let mut names = vec![
+            "model.layers.10.mlp.weight",
+            "model.norm.weight",
+            "model.layers.2.mlp.weight",
+            "model.layers.2.attn.weight",
+            "model.embed.weight",
+            "model.layers.02.mlp.weight",
+            "model.layers.1a.weight",
+            "model.layers.b.weight",
+            "model",
+        ];
+        names.sort_by(|a, b| name_order(a, b));
+        assert_eq!(
+            names,
+            [
+                "model",
+                "model.embed.weight",
+                "model.layers.02.mlp.weight",
+                "model.layers.2.attn.weight",
+                "model.layers.2.mlp.weight",
+                "model.layers.10.mlp.weight",
+                "model.layers.1a.weight",
+                "model.layers.b.weight",
+                "model.norm.weight",
+            ]
+        );
     }
 }

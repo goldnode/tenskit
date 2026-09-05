@@ -108,6 +108,7 @@ pub struct Cli {
     pub verbose: bool,
     pub columns: bool,
     pub fold: bool,
+    pub sort: bool,
     pub directory: PathBuf,
     pub output: Option<PathBuf>,
     pub format: Option<FormatName>,
@@ -131,6 +132,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut verbose = false;
     let mut columns = false;
     let mut fold = false;
+    let mut sort = false;
     let mut directory = PathBuf::from(".");
     let mut output: Option<PathBuf> = None;
     let mut format: Option<FormatName> = None;
@@ -224,6 +226,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 "verbose" => verbose = true,
                 "columns" => columns = true,
                 "fold" => fold = true,
+                "sort" => sort = true,
                 "dry-run" => dry_run = true,
                 "force" => force = true,
                 "delete" => set_op(&mut op, Op::Delete)?,
@@ -322,6 +325,7 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         verbose,
         columns,
         fold,
+        sort,
         directory,
         output,
         format,
@@ -435,7 +439,7 @@ tenspile — inspect and edit tensor containers
 
 Usage:
   tenspile -c [-f] ARCHIVE [KEY=FILE ...]
-  tenspile -t [-v] [--columns] [--fold] [-f] ARCHIVE [KEY ...]
+  tenspile -t [-v] [--columns] [--fold] [--sort] [-f] ARCHIVE [KEY ...]
   tenspile -x [-f] ARCHIVE [KEY ...]
   tenspile -r [-f] ARCHIVE KEY=FILE ...
   tenspile -u [-f] ARCHIVE KEY=FILE ...
@@ -463,6 +467,10 @@ Options:
                             Implies --columns. model.layers.[3-5] is one
                             copy per layer. A gap stays on its own line.
                             tensdiff --fold folds a diff the same way.
+  --sort                    List members sorted by name instead of in file
+                            order. Name segments split at dots; a segment
+                            that is all digits sorts by its number, so
+                            layers.2 comes before layers.10. -t and -i -v.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are

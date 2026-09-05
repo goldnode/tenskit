@@ -66,7 +66,7 @@ note: shapes are ggml ne[] (innermost first); a conversion reverses them
 
 Each `dtypes` row is the type, the number of tensors, and their total element count. A `note` is something the reader noticed. It is often a spec rule id that you can look up under `tensdataspecs_readonly/specs`.
 
-For a large model, `--fold` collapses repeated layers into one block. The [tensconv](tensconv.md) page shows one.
+For a large model, `--fold` collapses repeated layers into one block. `--sort` lists the members by name, with layer numbers in numeric order, instead of in file order. The [tensconv](tensconv.md) page shows one.
 
 ## Pull tensors out
 
