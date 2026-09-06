@@ -898,7 +898,7 @@ fn rename_tensors(
     Ok(())
 }
 
-/// GGUF-024 steps 2 and 3: convert_hf_to_gguf writes norms, 1-D tensors,
+/// GGUF-029, after GGUF-024 steps 2 and 3: convert_hf_to_gguf writes norms, 1-D tensors,
 /// biases, and a few roles as F32, and llama.cpp's CPU backend cannot
 /// multiply by a BF16 norm. An F16 or BF16 tensor in those roles is widened
 /// to F32, which is exact. Other dtypes are left as they are.
@@ -927,7 +927,7 @@ fn keep_f32_roles(tensors: &mut [Tensor], warnings: &mut Vec<String>) -> Result<
     }
     if widened > 0 {
         warnings.push(format!(
-            "widened {widened} norm, bias, and 1-D tensors to F32, as llama.cpp's converter writes them (GGUF-024)"
+            "widened {widened} norm, bias, and 1-D tensors to F32 so llama.cpp can run them (GGUF-029)"
         ));
     }
     Ok(())
@@ -1139,6 +1139,9 @@ fn write_target(
                     Some(_) => {}
                     None => metadata.push((key, value)),
                 }
+            }
+            if rename {
+                tokenizer_note(&metadata, warnings);
             }
             write_dense(path, &metadata, &dense)
         }
@@ -1359,6 +1362,20 @@ fn npz_out(tensors: &[Tensor]) -> Result<Vec<crate::formats::npz::NpzMember>> {
 }
 
 #[cfg(format_gguf)]
+/// GGUF-033 and GGUF-034: llama.cpp needs tokenizer.ggml.model to load a
+/// model. Building the tokenizer keys is not transcribed (GGUF-Q5), so a file
+/// without them is written and the user is told.
+pub(crate) fn tokenizer_note(metadata: &[(String, MetaValue)], warnings: &mut Vec<String>) {
+    if metadata.iter().any(|(key, _)| key == "tokenizer.ggml.model") {
+        return;
+    }
+    warnings.push(
+        "the output has no tokenizer.ggml.* keys, so llama.cpp will not load it until they are \
+         added, for example from another GGUF of the same model (GGUF-033, GGUF-034)"
+            .to_string(),
+    );
+}
+
 fn gguf_out(
     tensors: &[Tensor],
     hparams: Option<&Map<String, Value>>,
@@ -2309,5 +2326,19 @@ mod tests {
         extra_tensor_note(&phi, Some(&config(r#"{"rope_scaling": {"long_factor": [1.0]}}"#)), &mut notes);
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("rope_factors_long"), "{notes:?}");
+    }
+
+    #[test]
+    fn a_gguf_without_a_tokenizer_model_is_reported() {
+        let mut warnings = Vec::new();
+        tokenizer_note(&[], &mut warnings);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("GGUF-033"));
+        let mut warnings = Vec::new();
+        tokenizer_note(
+            &[("tokenizer.ggml.model".into(), MetaValue::String("gpt2".into()))],
+            &mut warnings,
+        );
+        assert!(warnings.is_empty());
     }
 }

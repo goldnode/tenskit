@@ -2209,6 +2209,9 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
             metadata.push((key, value));
         }
     }
+    if archive.format == FormatName::Gguf {
+        crate::convert::tokenizer_note(&metadata, &mut warnings);
+    }
     write_dense(&request.output, &metadata, &dense)?;
     Ok(warnings)
 }

@@ -136,7 +136,7 @@ $ tensconv --rename -o model.gguf model/
 $ tensquant --quantize q8_0 -o model-q8.gguf model.gguf
 ```
 
-Neither command writes a tokenizer (`tokenizer.ggml.*`), which llama.cpp needs before it can run the model.
+Neither command builds a tokenizer (`tokenizer.ggml.*`), which llama.cpp needs before it can load the model (GGUF-033); the spec has not transcribed how llama.cpp's converter builds one (GGUF-Q5). A GGUF source's tokenizer keys are copied. When the output has no `tokenizer.ggml.model`, both commands warn.
 
 Which tensors are quantized follows llama.cpp's `convert_hf_to_gguf.py` (GGUF-024). These stay F32:
 
