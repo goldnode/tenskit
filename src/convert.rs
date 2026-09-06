@@ -49,7 +49,14 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         let class = config.as_ref().and_then(hf_class);
         let converter = select_converter(&arch, class.as_deref())?;
         let layers = language_layers(hparams.as_ref());
+        skip_base_suffixes(&mut tensors, &mut warnings);
         if !request.names_only {
+            let transcribed_elsewhere = converter.undo_permute || arch == "qwen35";
+            if !transcribed_elsewhere {
+                check_hooks(&arch, &converter)?;
+                apply_filter(&mut tensors, &arch, &converter, hparams.as_ref(), &mut warnings)?;
+            }
+            extra_tensor_note(&converter, hparams.as_ref(), &mut warnings);
             apply_values(
                 &mut tensors,
                 &arch,
@@ -264,6 +271,135 @@ fn apply_values(
         }
     }
     Err(msg(text))
+}
+
+/// `modify_tensors_base.tensor_loop`: ModelBase.prepare_tensors skips these
+/// names before any converter sees them.
+fn skip_base_suffixes(tensors: &mut Vec<Tensor>, warnings: &mut Vec<String>) {
+    let suffixes = gguf_names::base_drop_suffixes();
+    tensors.retain(|tensor| {
+        let skip = suffixes.iter().any(|suffix| tensor.name.ends_with(suffix.as_str()));
+        if skip {
+            warnings.push(format!(
+                "left out {}, which llama.cpp's converter skips for every model",
+                tensor.name
+            ));
+        }
+        !skip
+    });
+}
+
+/// GGUF-030: a hook other than generate_extra_tensors changes the tensor set
+/// in code the spec does not transcribe.
+fn check_hooks(arch: &str, converter: &ConverterRecord) -> Result<()> {
+    let other: Vec<&str> = converter
+        .hooks
+        .iter()
+        .map(String::as_str)
+        .filter(|hook| *hook != "generate_extra_tensors")
+        .collect();
+    if other.is_empty() {
+        return Ok(());
+    }
+    Err(msg(format!(
+        "cannot convert {arch} ({}) with --rename yet. llama.cpp's converter changes the set of \
+         tensors for this model in code the spec does not describe ({}), so the result could \
+         load and still answer wrongly. --names-only renames without changing any value, at \
+         your own risk.",
+        converter.class,
+        other.join(", ")
+    )))
+}
+
+/// GGUF-030: the converter's filter_tensors. A complete one drops the source
+/// tensors its conditions name; an incomplete one stops the conversion.
+fn apply_filter(
+    tensors: &mut Vec<Tensor>,
+    arch: &str,
+    converter: &ConverterRecord,
+    hparams: Option<&Map<String, Value>>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(filter) = &converter.filter else {
+        return Ok(());
+    };
+    if !filter.complete {
+        return Err(msg(format!(
+            "cannot convert {arch} ({}) with --rename yet. llama.cpp's converter leaves out some \
+             tensors for this model (filter_tensors), and the spec does not yet say which. \
+             --names-only renames without changing any value, at your own risk.",
+            converter.class
+        )));
+    }
+    let class = hf_arch_from_hparams(hparams);
+    let mut kept = Vec::with_capacity(tensors.len());
+    for tensor in tensors.drain(..) {
+        let mut dropped = false;
+        for when in &filter.drop_when {
+            if when_matches(when, &tensor.name, class.as_deref())? {
+                dropped = true;
+                break;
+            }
+        }
+        if dropped {
+            warnings.push(format!(
+                "left out {}, as llama.cpp's {} converter does",
+                tensor.name, converter.class
+            ));
+        } else {
+            kept.push(tensor);
+        }
+    }
+    *tensors = kept;
+    Ok(())
+}
+
+/// GGUF-030: tensors that generate_extra_tensors computes from config.json are
+/// not written. One warning, under the condition the spec gives where it gives one.
+fn extra_tensor_note(
+    converter: &ConverterRecord,
+    hparams: Option<&Map<String, Value>>,
+    warnings: &mut Vec<String>,
+) {
+    if !converter.hooks.iter().any(|hook| hook == "generate_extra_tensors") {
+        return;
+    }
+    let rope = hparams
+        .and_then(|map| map.get("rope_scaling"))
+        .and_then(Value::as_object);
+    let has = |key: &str| rope.is_some_and(|map| map.get(key).is_some_and(|value| !value.is_null()));
+    let added = match converter.class.as_str() {
+        "Phi3MiniModel" if has("long_factor") => Some("rope_factors_long and rope_factors_short"),
+        "MiniCPM3Model" if has("long_factor") || has("short_factor") => {
+            Some("rope_factors_long and rope_factors_short")
+        }
+        "ExaoneModel" | "Exaone4Model"
+            if rope
+                .and_then(|map| map.get("rope_type"))
+                .and_then(Value::as_str)
+                == Some("llama3") =>
+        {
+            Some("rope_freqs")
+        }
+        "Phi3MiniModel" | "MiniCPM3Model" | "ExaoneModel" | "Exaone4Model" => None,
+        _ => {
+            warnings.push(format!(
+                "llama.cpp's {} converter may also compute tensors from config.json \
+                 (generate_extra_tensors); the spec does not say when, and tensconv does not \
+                 write them (GGUF-030)",
+                converter.class
+            ));
+            None
+        }
+    };
+    if let Some(added) = added {
+        warnings.push(format!(
+            "llama.cpp's {} converter would also write {added}, computed from config.json \
+             rope_scaling. tensconv does not write them. llama.cpp still loads the file, but \
+             runs RoPE without the factors, so its answers can differ (GGUF-030)",
+            converter.class
+        ));
+    }
 }
 
 fn llama_permute(tensors: &mut [Tensor], hparams: Option<&Map<String, Value>>) -> Result<()> {
@@ -546,6 +682,42 @@ fn split_top_or(when: &str) -> Vec<&str> {
 }
 
 fn clause_matches(clause: &str, name: &str, hf_arch: Option<&str>) -> Result<bool> {
+    let clause = clause.trim();
+    if let Some(inner) = clause.strip_prefix('(').and_then(|text| text.strip_suffix(')')) {
+        if balanced(inner) {
+            return clause_matches(inner, name, hf_arch);
+        }
+    }
+    if let Some(rest) = clause.strip_prefix("not ") {
+        return Ok(!clause_matches(rest, name, hf_arch)?);
+    }
+    // filter_tensors on an (name, data) item tests item[0], the name.
+    if clause.contains("item[0]") {
+        return clause_matches(&clause.replace("item[0]", "name"), name, hf_arch);
+    }
+    if let Some(rest) = clause.strip_prefix("name ==") {
+        return Ok(name == quoted(rest.trim())?);
+    }
+    if let Some(list) = clause
+        .strip_prefix("any((p in name for p in [")
+        .and_then(|rest| rest.strip_suffix("]))"))
+    {
+        let mut hit = false;
+        for part in list.split(',') {
+            hit |= name.contains(&quoted(part.trim())?);
+        }
+        return Ok(hit);
+    }
+    if let Some(rest) = clause.strip_prefix("name.startswith((") {
+        let body = rest
+            .strip_suffix("))")
+            .ok_or_else(|| msg(format!("unrecognized condition {clause}")))?;
+        let mut hit = false;
+        for part in body.split(',').filter(|part| !part.trim().is_empty()) {
+            hit |= name.starts_with(&quoted(part.trim())?);
+        }
+        return Ok(hit);
+    }
     if let Some(rest) = clause.strip_prefix("name.endswith(") {
         let inner = rest
             .strip_suffix(')')
@@ -565,6 +737,21 @@ fn clause_matches(clause: &str, name: &str, hf_arch: Option<&str>) -> Result<boo
         return Ok(hf_arch == Some(literal.as_str()));
     }
     Err(msg(format!("unrecognized condition {clause}")))
+}
+
+fn balanced(text: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in text.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
 }
 
 fn endswith_any(name: &str, inner: &str) -> bool {
@@ -2027,5 +2214,100 @@ mod tests {
         let config = |text: &str| serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone();
         assert!(metadata_notes(&config(r#"{"rope_scaling": null}"#)).is_empty());
         assert_eq!(metadata_notes(&config(r#"{"rope_scaling": {"type": "linear", "factor": 2.0}}"#)).len(), 1);
+    }
+
+    #[test]
+    fn every_drop_condition_in_the_spec_parses() {
+        let value: Value = serde_json::from_str(include_str!(
+            "../tensdataspecs_readonly/specs/tables/gguf-tensor-roles.json"
+        ))
+        .unwrap();
+        let mut conditions = Vec::new();
+        fn walk(value: &Value, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    if let Some(list) = map
+                        .get("filter_tensors")
+                        .and_then(|filter| filter.get("drop_when"))
+                        .and_then(Value::as_array)
+                    {
+                        out.extend(list.iter().filter_map(|item| item.as_str().map(str::to_string)));
+                    }
+                    map.values().for_each(|item| walk(item, out));
+                }
+                Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+                _ => {}
+            }
+        }
+        walk(&value, &mut conditions);
+        assert!(!conditions.is_empty());
+        for when in &conditions {
+            when_matches(when, "model.layers.0.mlp.weight", None)
+                .unwrap_or_else(|err| panic!("{when}: {err}"));
+        }
+        let cases = [
+            ("name == 'lm_head.weight'", "lm_head.weight", true),
+            ("name == 'lm_head.weight'", "lm_head.weightx", false),
+            ("not name.startswith('model.vision.')", "model.vision.x", false),
+            ("not name.startswith('model.vision.')", "model.text.x", true),
+            ("name.startswith(('lm_head.', 'mtp'))", "mtp.0", true),
+            ("item[0].startswith('mtp.')", "mtp.1", true),
+            ("any((p in name for p in ['codebook_offsets', 'depth_linear']))", "a.depth_linear.w", true),
+            ("not name.startswith('language_model.') or '_mot_gen' in name", "language_model.a_mot_gen", true),
+            ("not name.startswith('language_model.') or '_mot_gen' in name", "language_model.a", false),
+        ];
+        for (when, name, expected) in cases {
+            assert_eq!(when_matches(when, name, None).unwrap(), expected, "{when} on {name}");
+        }
+    }
+
+    #[test]
+    fn converters_follow_gguf_030() {
+        let record = |class: &str, hooks: &[&str], filter: Option<(bool, &[&str])>| ConverterRecord {
+            class: class.into(),
+            hf_architectures: Vec::new(),
+            undo_permute: false,
+            complete: true,
+            unexpanded: Vec::new(),
+            branches: Vec::new(),
+            filter: filter.map(|(complete, drop)| gguf_names::TensorFilter {
+                complete,
+                drop_when: drop.iter().map(|item| item.to_string()).collect(),
+            }),
+            hooks: hooks.iter().map(|item| item.to_string()).collect(),
+        };
+        assert!(check_hooks("phi3", &record("Phi3MiniModel", &["generate_extra_tensors"], None)).is_ok());
+        let err = check_hooks("x", &record("X", &["generate_extra_tensors", "prepare_tensors"], None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("(prepare_tensors)"), "{err}");
+
+        let tensor = |name: &str| Tensor {
+            name: name.into(),
+            canonical: "float32".into(),
+            shape: vec![1],
+            bytes: Payload::Bytes(vec![0; 4]),
+        };
+        let mut tensors = vec![tensor("lm_head.weight"), tensor("model.norm.weight")];
+        let mut warnings = Vec::new();
+        let gemma = record("GemmaModel", &[], Some((true, &["name == 'lm_head.weight'"])));
+        apply_filter(&mut tensors, "gemma", &gemma, None, &mut warnings).unwrap();
+        assert_eq!(tensors.len(), 1);
+        assert_eq!(tensors[0].name, "model.norm.weight");
+        let open = record("LFM2Model", &[], Some((false, &[])));
+        assert!(apply_filter(&mut tensors, "lfm2", &open, None, &mut warnings).is_err());
+
+        let mut base = vec![tensor("h.0.attention.masked_bias"), tensor("h.0.attn.c_attn.weight")];
+        skip_base_suffixes(&mut base, &mut warnings);
+        assert_eq!(base.len(), 1);
+
+        let config = |text: &str| serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone();
+        let phi = record("Phi3MiniModel", &["generate_extra_tensors"], None);
+        let mut notes = Vec::new();
+        extra_tensor_note(&phi, Some(&config(r#"{"rope_scaling": null}"#)), &mut notes);
+        assert!(notes.is_empty());
+        extra_tensor_note(&phi, Some(&config(r#"{"rope_scaling": {"long_factor": [1.0]}}"#)), &mut notes);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("rope_factors_long"), "{notes:?}");
     }
 }

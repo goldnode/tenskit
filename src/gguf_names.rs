@@ -241,6 +241,33 @@ pub struct ConverterRecord {
     pub complete: bool,
     pub unexpanded: Vec<String>,
     pub branches: Vec<TensorBranch>,
+    /// `filter_tensors`, own or inherited. None when the record has none.
+    pub filter: Option<TensorFilter>,
+    /// `tensor_hooks` method names: code outside `modify_tensors` that
+    /// changes the tensor set (GGUF-030).
+    pub hooks: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TensorFilter {
+    pub complete: bool,
+    pub drop_when: Vec<String>,
+}
+
+/// `modify_tensors_base.tensor_loop.drop_suffixes`: names that
+/// `ModelBase.prepare_tensors` skips before `modify_tensors`.
+pub fn base_drop_suffixes() -> Vec<String> {
+    let value: Value = serde_json::from_str(ROLES_JSON).unwrap_or(Value::Null);
+    value
+        .pointer("/modify_tensors_base/tensor_loop/drop_suffixes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
@@ -296,6 +323,33 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let filter = item.get("filter_tensors").map(|filter| TensorFilter {
+                complete: filter
+                    .get("complete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                drop_when: filter
+                    .get("drop_when")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+            let mut hooks: Vec<String> = item
+                .get("tensor_hooks")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|hook| hook.get("method")?.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            hooks.dedup();
             Some(ConverterRecord {
                 class,
                 hf_architectures,
@@ -303,6 +357,8 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                 complete,
                 unexpanded,
                 branches,
+                filter,
+                hooks,
             })
         })
         .collect()
