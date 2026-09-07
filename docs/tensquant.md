@@ -149,6 +149,17 @@ Hugging Face names are first resolved to their GGUF role, using `config.json` `a
 
 A matrix whose innermost size is not a multiple of 32 cannot be split into blocks. It is written F16 with a warning, as llama.cpp does, and `general.file_type` still names the requested type (GGUF-027). Integer tensors are copied.
 
+### Compared with llama-quantize
+
+tensquant follows `convert_hf_to_gguf.py`, not `llama-quantize`, so it does not claim to match llama-quantize's output (GGUF-032). The blocks of a tensor both tools quantize to the same type are the same reference packing. The differences are in which tensors are quantized, and to what (GGUF-031):
+
+- llama-quantize gives the output tensor a higher type: `output.weight`, or `token_embd.weight` when the model shares its input and output embeddings. With Q4_0 it asks for Q6_K, which becomes Q8_0 when the row width is not a multiple of 256. tensquant writes Q4_0, and warns with the type llama-quantize would use.
+- In a model with 8 experts, llama-quantize writes `attn_v`, `attn_qkv`, `attn_kv_b`, and `attn_k` as Q8_0 at Q4_0. tensquant warns with the count.
+- llama-quantize leaves every tensor it does not quantize in its stored type, so a BF16 norm stays BF16. tensquant writes the GGUF-024 tensors as F32, which every llama.cpp backend can run (GGUF-028).
+- llama-quantize's list of tensors it never quantizes differs from GGUF-024's in other details. Among them are `altup`, `laurel`, and some vision tensors.
+
+At Q8_0, the output-tensor and expert rules change nothing, so only the last two points apply.
+
 ## See also
 
 [tensconv](tensconv.md) for conversions without quantization, and `man tensquant`.

@@ -1047,3 +1047,43 @@ fn quantizing_a_gguf_keeps_its_metadata() {
         }
     }
 }
+
+#[cfg(format_gguf)]
+#[test]
+fn q4_0_says_where_llama_quantize_would_differ() {
+    use crate::formats::gguf::{write_dense, DenseTensor, MetaValue};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("plain.gguf");
+    let f32_tensor = |name: &str, ne: Vec<u64>| DenseTensor {
+        name: name.into(),
+        ggml_type: 0,
+        payload: crate::payload::Payload::Bytes(vec![0; (ne.iter().product::<u64>() * 4) as usize]),
+        ne,
+    };
+    write_dense(
+        &source,
+        &[
+            ("general.architecture".into(), MetaValue::String("llama".into())),
+            ("llama.expert_count".into(), MetaValue::U32(8)),
+        ],
+        &[
+            f32_tensor("token_embd.weight", vec![256, 2]),
+            f32_tensor("blk.0.attn_k.weight", vec![32, 2]),
+            f32_tensor("blk.0.ffn_up.weight", vec![32, 2]),
+        ],
+    )
+    .unwrap();
+    let warnings = crate::quant::run(&crate::quant::Request {
+        source,
+        output: dir.path().join("q4.gguf"),
+        format: None,
+        quantize: Some("q4_0".into()),
+        force_single: false,
+        force: false,
+    })
+    .unwrap();
+    let joined = warnings.join("\n");
+    assert!(joined.contains("token_embd.weight is written Q4_0; llama-quantize would write it Q6_K"), "{joined}");
+    assert!(joined.contains("1 attention tensors are written Q4_0"), "{joined}");
+    assert!(joined.contains("GGUF-033"), "{joined}");
+}

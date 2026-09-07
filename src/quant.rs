@@ -2096,6 +2096,55 @@ pub fn quant_main(args: &[String]) -> Result<i32> {
     }
 }
 
+/// GGUF-032: tensquant writes every eligible tensor as the requested type,
+/// and says where llama-quantize would choose another (GGUF-031 B1 and B2).
+/// Q8_0 output has no such tensor, so only Q4_0 is checked.
+fn llama_quantize_differences(archive: &Archive, dense: &[DenseTensor]) -> Vec<String> {
+    const Q4_0: u32 = 2;
+    let meta = |key: &str| {
+        archive
+            .metadata
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let arch = meta("general.architecture").unwrap_or("");
+    let output_names: &[&str] = if dense.iter().any(|tensor| tensor.name == "output.weight") {
+        &["output.weight"]
+    } else {
+        &["token_embd.weight", "per_layer_token_embd.weight"]
+    };
+    let mut notes = Vec::new();
+    for tensor in dense {
+        if tensor.ggml_type != Q4_0 || !output_names.contains(&tensor.name.as_str()) {
+            continue;
+        }
+        // B1 asks for Q6_K; the fallback makes it Q8_0 when ne[0] does not fit 256.
+        let theirs = if arch == "falcon" || tensor.ne[0] % 256 != 0 { "Q8_0" } else { "Q6_K" };
+        notes.push(format!(
+            "{} is written Q4_0; llama-quantize would write it {theirs}, as the output tensor (GGUF-031, GGUF-032)",
+            tensor.name
+        ));
+    }
+    if meta(&format!("{arch}.expert_count")) == Some("8") {
+        let attention = dense
+            .iter()
+            .filter(|tensor| tensor.ggml_type == Q4_0)
+            .filter(|tensor| {
+                ["attn_v", "attn_qkv", "attn_kv_b", "attn_k"]
+                    .iter()
+                    .any(|role| tensor.name.contains(role))
+            })
+            .count();
+        if attention > 0 {
+            notes.push(format!(
+                "{attention} attention tensors are written Q4_0; with 8 experts llama-quantize would write attn_v, attn_qkv, attn_kv_b, and attn_k as Q8_0 (GGUF-031, GGUF-032)"
+            ));
+        }
+    }
+    notes
+}
+
 fn quantize_file(request: &Request) -> Result<Vec<String>> {
     let kind = request.quantize.as_deref().unwrap_or("");
     let (block_type, file_type) = match kind {
@@ -2187,6 +2236,9 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
             ne,
             payload: Payload::Bytes(payload),
         });
+    }
+    if block_type == 2 {
+        warnings.extend(llama_quantize_differences(&archive, &dense));
     }
     if !unresolved.is_empty() {
         warnings.insert(
