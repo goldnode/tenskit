@@ -51,11 +51,15 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         let layers = language_layers(hparams.as_ref());
         skip_base_suffixes(&mut tensors, &mut warnings);
         if !request.names_only {
-            let transcribed_elsewhere = converter.undo_permute || arch == "qwen35";
-            if !transcribed_elsewhere {
+            let transcription = hand_transcription(&arch, &converter);
+            if transcription == Some(Transcription::Llama) {
+                llama_scope(&mut tensors, config.as_ref(), class.as_deref())?;
+            }
+            if transcription.is_none() {
                 check_hooks(&arch, &converter)?;
                 apply_filter(&mut tensors, &arch, &converter, hparams.as_ref(), &mut warnings)?;
             }
+            apply_global_filters(&mut tensors, &converter, &mut warnings)?;
             extra_tensor_note(&converter, hparams.as_ref(), &mut warnings);
             apply_values(
                 &mut tensors,
@@ -228,6 +232,62 @@ fn select_converter(arch: &str, class: Option<&str>) -> Result<ConverterRecord> 
     )))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transcription {
+    Llama,
+    Qwen35,
+}
+
+/// GGUF-030: the two converters the spec transcribes by hand, each only for
+/// its own architecture. LlamaModel follows hf_tensor_names_to_gguf and
+/// section 6; Qwen3_5TextModel follows qwen35_tensor_names_to_gguf. Every
+/// other converter, Qwen3_5MoeTextModel and the other undo_permute classes
+/// included, gets the table checks.
+fn hand_transcription(arch: &str, converter: &ConverterRecord) -> Option<Transcription> {
+    match (arch, converter.class.as_str()) {
+        ("llama", "LlamaModel") => Some(Transcription::Llama),
+        ("qwen35", "Qwen3_5TextModel") => Some(Transcription::Qwen35),
+        _ => None,
+    }
+}
+
+/// The scope of the LLaMA transcription (hf_tensor_names_to_gguf): a dense
+/// checkpoint that is not an EAGLE-3 draft. On that path LlamaModel deletes a
+/// `text_model.` segment, and prefixes `model.` when architectures[0] is
+/// LlamaModel, before lookup.
+fn llama_scope(tensors: &mut [Tensor], config: Option<&Value>, class: Option<&str>) -> Result<()> {
+    let draft = config.is_some_and(|config| {
+        config.get("draft_vocab_size").is_some()
+            && config.get("num_hidden_layers").and_then(Value::as_u64) == Some(1)
+    });
+    if draft {
+        return Err(msg(
+            "cannot convert an EAGLE-3 draft with --rename: llama.cpp's LlamaModel converter \
+             changes its tensors in ways the spec does not describe (GGUF-030)",
+        ));
+    }
+    if let Some(tensor) = tensors
+        .iter()
+        .find(|tensor| tensor.name.contains("block_sparse_moe.experts"))
+    {
+        return Err(msg(format!(
+            "cannot convert a mixture-of-experts LLaMA checkpoint with --rename: {} needs the \
+             expert merge that llama.cpp's LlamaModel converter does, which the spec does not \
+             describe (GGUF-030)",
+            tensor.name
+        )));
+    }
+    for tensor in tensors.iter_mut() {
+        if tensor.name.contains("text_model.") {
+            tensor.name = tensor.name.replace("text_model.", "");
+        }
+        if class == Some("LlamaModel") {
+            tensor.name = format!("model.{}", tensor.name);
+        }
+    }
+    Ok(())
+}
+
 fn apply_values(
     tensors: &mut [Tensor],
     arch: &str,
@@ -242,17 +302,10 @@ fn apply_values(
         }
         return Ok(());
     }
-    if converter.undo_permute {
-        llama_permute(tensors, hparams)?;
-        warnings.push(format!(
-            "{}: LLaMA Q/K rows were permuted; other unexpanded arms were left alone",
-            converter.class
-        ));
-        return Ok(());
-    }
-    if arch == "qwen35" {
-        qwen35_values(tensors, hparams, dir)?;
-        return Ok(());
+    match hand_transcription(arch, converter) {
+        Some(Transcription::Llama) => return llama_permute(tensors, hparams),
+        Some(Transcription::Qwen35) => return qwen35_values(tensors, hparams, dir),
+        None => {}
     }
     let mut text = format!(
         "cannot convert {arch} ({}) with --rename yet. llama.cpp's converter may change \
@@ -345,6 +398,35 @@ fn apply_filter(
             warnings.push(format!(
                 "left out {}, as llama.cpp's {} converter does",
                 tensor.name, converter.class
+            ));
+        } else {
+            kept.push(tensor);
+        }
+    }
+    *tensors = kept;
+    Ok(())
+}
+
+/// GGUF-030, round 8: after the class's own filters, the global filters that
+/// `global_filters_after` names. TextModel's drop test is applied here;
+/// ModelBase's rewrites are part of the name lookup.
+fn apply_global_filters(
+    tensors: &mut Vec<Tensor>,
+    converter: &ConverterRecord,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if !converter.global_filters_after.iter().any(|name| name == "TextModel") {
+        return Ok(());
+    }
+    let when = gguf_names::text_model_drop_when()
+        .ok_or_else(|| msg("the spec's TextModel filter is not in the expected form"))?;
+    let mut kept = Vec::with_capacity(tensors.len());
+    for tensor in tensors.drain(..) {
+        let local = tensor.name.strip_prefix("model.").unwrap_or(&tensor.name);
+        if when_matches(&when, local, None)? {
+            warnings.push(format!(
+                "left out {}, which llama.cpp's converter drops from a text model",
+                tensor.name
             ));
         } else {
             kept.push(tensor);
@@ -2258,6 +2340,7 @@ mod tests {
         }
         walk(&value, &mut conditions);
         assert!(!conditions.is_empty());
+        conditions.push(gguf_names::text_model_drop_when().expect("TextModel drop test"));
         for when in &conditions {
             when_matches(when, "model.layers.0.mlp.weight", None)
                 .unwrap_or_else(|err| panic!("{when}: {err}"));
@@ -2292,6 +2375,7 @@ mod tests {
                 drop_when: drop.iter().map(|item| item.to_string()).collect(),
             }),
             hooks: hooks.iter().map(|item| item.to_string()).collect(),
+            global_filters_after: Vec::new(),
         };
         assert!(check_hooks("phi3", &record("Phi3MiniModel", &["generate_extra_tensors"], None)).is_ok());
         let err = check_hooks("x", &record("X", &["generate_extra_tensors", "prepare_tensors"], None))
@@ -2340,5 +2424,66 @@ mod tests {
             &mut warnings,
         );
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn the_llama_transcription_keeps_to_its_scope() {
+        let record = |class: &str| ConverterRecord {
+            class: class.into(),
+            hf_architectures: Vec::new(),
+            undo_permute: true,
+            complete: false,
+            unexpanded: Vec::new(),
+            branches: Vec::new(),
+            filter: None,
+            hooks: Vec::new(),
+            global_filters_after: Vec::new(),
+        };
+        assert_eq!(hand_transcription("llama", &record("LlamaModel")), Some(Transcription::Llama));
+        assert_eq!(hand_transcription("granite", &record("GraniteModel")), None);
+        assert_eq!(hand_transcription("qwen35moe", &record("Qwen3_5MoeTextModel")), None);
+        let tensor = |name: &str| Tensor {
+            name: name.into(),
+            canonical: "float32".into(),
+            shape: vec![1],
+            bytes: Payload::Bytes(vec![0; 4]),
+        };
+        let mut tensors = vec![tensor("text_model.layers.0.mlp.up_proj.weight")];
+        llama_scope(&mut tensors, None, Some("LlamaModel")).unwrap();
+        assert_eq!(tensors[0].name, "model.layers.0.mlp.up_proj.weight");
+        let draft: Value = serde_json::from_str(r#"{"draft_vocab_size": 32000, "num_hidden_layers": 1}"#).unwrap();
+        assert!(llama_scope(&mut tensors, Some(&draft), None).is_err());
+        let mut moe = vec![tensor("model.layers.0.block_sparse_moe.experts.0.w1.weight")];
+        assert!(llama_scope(&mut moe, None, None).is_err());
+    }
+
+    #[test]
+    fn a_text_model_drops_vision_tensors() {
+        let tensor = |name: &str| Tensor {
+            name: name.into(),
+            canonical: "float32".into(),
+            shape: vec![1],
+            bytes: Payload::Bytes(vec![0; 4]),
+        };
+        let mut converter = gguf_names::converter_records("qwen2")
+            .into_iter()
+            .find(|record| record.class == "Qwen2Model")
+            .unwrap();
+        assert!(converter.global_filters_after.iter().any(|name| name == "TextModel"));
+        let mut tensors = vec![
+            tensor("model.visual.blocks.0.attn.qkv.weight"),
+            tensor("model.vision_tower.x.weight"),
+            tensor("model.layers.0.mlp.up_proj.weight"),
+            tensor("mlp.0.weight"),
+            tensor("model.mlp_proj.weight"),
+        ];
+        let mut warnings = Vec::new();
+        apply_global_filters(&mut tensors, &converter, &mut warnings).unwrap();
+        let names: Vec<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+        assert_eq!(names, ["model.layers.0.mlp.up_proj.weight"]);
+        converter.global_filters_after.clear();
+        let mut kept = vec![tensor("model.visual.x")];
+        apply_global_filters(&mut kept, &converter, &mut warnings).unwrap();
+        assert_eq!(kept.len(), 1);
     }
 }

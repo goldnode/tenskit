@@ -246,12 +246,32 @@ pub struct ConverterRecord {
     /// `tensor_hooks` method names: code outside `modify_tensors` that
     /// changes the tensor set (GGUF-030).
     pub hooks: Vec<String>,
+    /// `global_filters_after`: the global filters that run after the class's
+    /// own chain, such as TextModel's drop test.
+    pub global_filters_after: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TensorFilter {
+    /// Covers the whole chain (round 8).
     pub complete: bool,
+    /// The drop tests of the method and of every method in its `chain`.
     pub drop_when: Vec<String>,
+}
+
+/// `global_filters.TextModel`: the drop test, run on the name with a leading
+/// `model.` removed for the test only.
+pub fn text_model_drop_when() -> Option<String> {
+    let value: Value = serde_json::from_str(ROLES_JSON).ok()?;
+    let filter = value.pointer("/global_filters/TextModel")?;
+    let strip = filter.get("local_name_before_drop_test")?;
+    if strip.get("when")?.as_str()? != "name.startswith('model.')"
+        || strip.get("expr")?.as_str()? != "name[len('model.'):]"
+        || filter.get("complete")?.as_bool() != Some(true)
+    {
+        return None;
+    }
+    Some(filter.get("drop_when")?.as_str()?.to_string())
 }
 
 /// `modify_tensors_base.tensor_loop.drop_suffixes`: names that
@@ -323,12 +343,8 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let filter = item.get("filter_tensors").map(|filter| TensorFilter {
-                complete: filter
-                    .get("complete")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                drop_when: filter
+            let drops = |method: &Value| -> Vec<String> {
+                method
                     .get("drop_when")
                     .and_then(Value::as_array)
                     .map(|items| {
@@ -337,8 +353,39 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                             .filter_map(|item| item.as_str().map(str::to_string))
                             .collect()
                     })
-                    .unwrap_or_default(),
-            });
+                    .unwrap_or_default()
+            };
+            let filter = item
+                .get("filter_tensors")
+                .filter(|filter| !filter.is_null())
+                .map(|filter| {
+                    let mut drop_when = drops(filter);
+                    for link in filter
+                        .get("chain")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        drop_when.extend(drops(link));
+                    }
+                    TensorFilter {
+                        complete: filter
+                            .get("complete")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        drop_when,
+                    }
+                });
+            let global_filters_after = item
+                .get("global_filters_after")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut hooks: Vec<String> = item
                 .get("tensor_hooks")
                 .and_then(Value::as_array)
@@ -359,6 +406,7 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                 branches,
                 filter,
                 hooks,
+                global_filters_after,
             })
         })
         .collect()
