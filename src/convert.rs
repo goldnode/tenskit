@@ -29,6 +29,9 @@ struct Tensor {
     canonical: String,
     shape: Vec<u64>,
     bytes: Payload,
+    /// A value change widened this BF16 tensor to F32 first, as llama.cpp's
+    /// prepare_tensors does; it goes back to BF16 unless it keeps F32.
+    from_bf16: bool,
 }
 
 pub fn run(request: &Request) -> Result<Vec<String>> {
@@ -71,9 +74,11 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             )?;
         }
         rename_tensors(&mut tensors, &arch, layers, &mut warnings)?;
-        if target == FormatName::Gguf && !request.names_only {
+        let gguf_values = target == FormatName::Gguf && !request.names_only;
+        if gguf_values {
             keep_f32_roles(&mut tensors, &mut warnings)?;
         }
+        narrow_after_values(&mut tensors, gguf_values);
         if target == FormatName::Gguf {
             if let Some(map) = &hparams {
                 warnings.extend(metadata_notes(map));
@@ -153,6 +158,7 @@ fn load_tensors(archive: &Archive) -> Result<Vec<Tensor>> {
             canonical: canonical.to_string(),
             shape,
             bytes: member.payload.clone(),
+            from_bf16: false,
         });
     }
     Ok(out)
@@ -1881,7 +1887,45 @@ fn elem_width(canonical: &str) -> Result<usize> {
     Ok((bits / 8) as usize)
 }
 
+/// llama.cpp's ModelBase.prepare_tensors turns a tensor that is not F16 or
+/// F32 into F32 before modify_tensors changes its values, so `w + 1` on a
+/// BF16 norm is exact. An F16 tensor stays F16 for the arithmetic.
+fn widen_for_values(tensor: &mut Tensor) -> Result<()> {
+    if tensor.canonical == "bfloat16" {
+        tensor.bytes = Payload::Bytes(bf16_to_f32(&tensor.bytes.read_vec()?)?);
+        tensor.canonical = "float32".to_string();
+        tensor.from_bf16 = true;
+    }
+    Ok(())
+}
+
+/// After the GGUF-029 widen: a BF16 tensor whose values were computed in F32
+/// returns to BF16 unless it is written F32, as llama.cpp's --outtype bf16
+/// rounds it once.
+fn narrow_after_values(tensors: &mut [Tensor], keep_f32: bool) {
+    for tensor in tensors.iter_mut() {
+        if !tensor.from_bf16 || tensor.canonical != "float32" {
+            continue;
+        }
+        if keep_f32 && crate::quant::keeps_f32(&tensor.name, tensor.shape.len()) {
+            continue;
+        }
+        let raw = tensor.bytes.read_vec().unwrap_or_default();
+        let narrowed: Vec<u8> = raw
+            .chunks_exact(4)
+            .flat_map(|chunk| {
+                let value = f32::from_le_bytes(chunk.try_into().unwrap());
+                crate::ggml_dequant::f32_to_bf16(value).to_le_bytes()
+            })
+            .collect();
+        tensor.bytes = Payload::Bytes(narrowed);
+        tensor.canonical = "bfloat16".to_string();
+        tensor.from_bf16 = false;
+    }
+}
+
 fn add_scalar(tensor: &mut Tensor, add: f64) -> Result<()> {
+    widen_for_values(tensor)?;
     let data = tensor.bytes.read_vec()?;
     let next = map_floats(&tensor.canonical, &data, |value| value + add as f32)?;
     tensor.bytes = Payload::Bytes(next);
@@ -1889,6 +1933,7 @@ fn add_scalar(tensor: &mut Tensor, add: f64) -> Result<()> {
 }
 
 fn neg_exp(tensor: &mut Tensor) -> Result<()> {
+    widen_for_values(tensor)?;
     let data = tensor.bytes.read_vec()?;
     let next = map_floats(&tensor.canonical, &data, |value| -value.exp())?;
     tensor.bytes = Payload::Bytes(next);
@@ -1911,16 +1956,6 @@ fn map_floats(canonical: &str, data: &[u8], op: impl Fn(f32) -> f32) -> Result<V
                 let value =
                     crate::ggml_dequant::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
                 out.extend_from_slice(&crate::ggml_dequant::f32_to_f16(op(value)).to_le_bytes());
-            }
-            Ok(out)
-        }
-        "bfloat16" => {
-            let mut out = Vec::with_capacity(data.len());
-            for chunk in data.chunks_exact(2) {
-                let bits = u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16;
-                let value = op(f32::from_bits(bits));
-                let stored = crate::ggml_dequant::f32_to_bf16(value);
-                out.extend_from_slice(&stored.to_le_bytes());
             }
             Ok(out)
         }
@@ -2174,12 +2209,44 @@ mod tests {
             canonical: "float32".into(),
             shape: vec![1],
             bytes: Payload::Bytes(1.5f32.to_le_bytes().to_vec()),
+            from_bf16: false,
         };
         let converter = select_converter("gemma", Some("GemmaForCausalLM")).unwrap();
         assert!(converter.complete);
         apply_branches(&mut tensor, "gemma", &converter, None).unwrap();
         let value = f32::from_le_bytes(tensor.bytes.read_vec().unwrap().try_into().unwrap());
         assert!((value - 2.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_bf16_norm_gains_one_in_f32() {
+        // bf16 0x3c01 is 2^-7 * (1 + 1/128); plus 1 is not a bf16 value.
+        let small = f32::from_bits(0x3c01_0000);
+        let tensor = |name: &str, shape: Vec<u64>| Tensor {
+            name: name.into(),
+            canonical: "bfloat16".into(),
+            shape,
+            bytes: Payload::Bytes(vec![0x01, 0x3c]),
+            from_bf16: false,
+        };
+        let converter = select_converter("gemma", Some("GemmaForCausalLM")).unwrap();
+        let mut norm = tensor("model.layers.0.input_layernorm.weight", vec![1]);
+        apply_branches(&mut norm, "gemma", &converter, None).unwrap();
+        norm.name = "blk.0.attn_norm.weight".into();
+        let mut other = tensor("blk.0.attn_k.weight", vec![1, 1]);
+        add_scalar(&mut other, 1.0).unwrap();
+        let mut tensors = vec![norm, other];
+        narrow_after_values(&mut tensors, true);
+        assert_eq!(tensors[0].canonical, "float32");
+        assert_eq!(tensors[0].bytes.read_vec().unwrap(), (small + 1.0).to_le_bytes());
+        assert_eq!(tensors[1].canonical, "bfloat16");
+        assert_eq!(tensors[1].bytes.read_vec().unwrap(), crate::ggml_dequant::f32_to_bf16(small + 1.0).to_le_bytes());
+        // Into safetensors nothing is kept F32, so the norm returns to BF16 too.
+        let mut norm = tensor("model.norm.weight", vec![1]);
+        add_scalar(&mut norm, 1.0).unwrap();
+        let mut tensors = vec![norm];
+        narrow_after_values(&mut tensors, false);
+        assert_eq!(tensors[0].canonical, "bfloat16");
     }
 
     #[cfg(all(format_safetensors, format_gguf))]
@@ -2190,6 +2257,7 @@ mod tests {
             canonical: canonical.into(),
             shape,
             bytes: Payload::Bytes(bytes),
+            from_bf16: false,
         };
         // bf16 1.5 is 0x3fc0, f16 -2.0 is 0xc000.
         let mut tensors = vec![
@@ -2445,6 +2513,7 @@ mod tests {
             canonical: "float32".into(),
             shape: vec![1],
             bytes: Payload::Bytes(vec![0; 4]),
+            from_bf16: false,
         };
         let mut tensors = vec![tensor("lm_head.weight"), tensor("model.norm.weight")];
         let mut warnings = Vec::new();
@@ -2505,6 +2574,7 @@ mod tests {
             canonical: "float32".into(),
             shape: vec![1],
             bytes: Payload::Bytes(vec![0; 4]),
+            from_bf16: false,
         };
         let mut tensors = vec![tensor("text_model.layers.0.mlp.up_proj.weight")];
         llama_scope(&mut tensors, None, Some("LlamaModel")).unwrap();
@@ -2522,6 +2592,7 @@ mod tests {
             canonical: "float32".into(),
             shape: vec![1],
             bytes: Payload::Bytes(vec![0; 4]),
+            from_bf16: false,
         };
         let mut converter = gguf_names::converter_records("qwen2")
             .into_iter()

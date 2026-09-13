@@ -19,6 +19,8 @@ The output is safetensors, `.npy` (one tensor), or `.npz`. What happens to each 
 - **Plain float tensors (F16, BF16, F32):** widened to float32.
 - **Integer and bool tensors:** copied unchanged, because float32 cannot hold every int32 or int64 value.
 
+Each float32 tensor is written to a spill file beside the output, `.<output name>.tensquant-spill`, as soon as it is computed, and the output is then assembled from it. Memory holds about one tensor at a time: the largest tensor plus, for a Hugging Face pack, the packed source. Dequantizing Qwen2.5-0.5B Q8_0 into 2.5 GB of float32 peaks at about 0.7 GB. The disk needs room for the output twice while tensquant runs; the spill file is removed when it exits, also after an error.
+
 ```
 $ tensquant --dequant -o dequant.safetensors small.gguf
 $ tenspile -t --columns -f dequant.safetensors

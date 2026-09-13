@@ -34,17 +34,97 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
     let archive = archive::open(&resolved.path, None, DEFAULT_MAX_HEADER, None, None)?;
     let config = read_config(resolved.path.parent().unwrap_or(Path::new(".")))?;
     let mut warnings = Vec::new();
-    let tensors = dequant_archive(&archive, config.as_ref(), &mut warnings)?;
     let target = output_format(&request.output, request.format)?;
+    refuse_gguf_output(target)?;
+    // Each tensor goes to a spill file beside the output as soon as it is
+    // dequantized, so memory holds one tensor rather than the whole model.
+    let mut out = Floats::spill(&request.output)?;
+    dequant_into(&archive, config.as_ref(), &mut warnings, &mut out)?;
+    let tensors = out.finish()?;
     write_f32(&request.output, target, &tensors)?;
     Ok(warnings)
+}
+
+/// Where dequantized tensors go: kept in memory, or written one by one to a
+/// spill file that is removed when the sink is dropped.
+pub(crate) struct Floats {
+    tensors: Vec<FloatTensor>,
+    spill: Option<Spill>,
+}
+
+struct Spill {
+    path: PathBuf,
+    file: Option<std::io::BufWriter<fs::File>>,
+    at: u64,
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        self.file = None;
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Floats {
+    #[cfg(test)]
+    pub(crate) fn memory() -> Floats {
+        Floats { tensors: Vec::new(), spill: None }
+    }
+
+    fn spill(output: &Path) -> Result<Floats> {
+        let name = output
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "out".into());
+        let path = output.with_file_name(format!(".{name}.tensquant-spill"));
+        let file = fs::File::create(&path).map_err(|err| {
+            msg(format!("cannot write beside {}: {err}", output.display()))
+        })?;
+        Ok(Floats {
+            tensors: Vec::new(),
+            spill: Some(Spill { path, file: Some(std::io::BufWriter::new(file)), at: 0 }),
+        })
+    }
+
+    fn push(&mut self, mut tensor: FloatTensor) -> Result<()> {
+        if let (Some(spill), None) = (self.spill.as_mut(), &tensor.kept) {
+            use std::io::Write;
+            let file = spill.file.as_mut().ok_or_else(|| msg("the spill file is closed"))?;
+            for value in &tensor.values {
+                file.write_all(&value.to_le_bytes())
+                    .map_err(|err| crate::error::io_err(&spill.path, err))?;
+            }
+            let len = tensor.values.len() as u64 * 4;
+            tensor.kept = Some((
+                dtype::safe_dtype("float32")?,
+                Payload::Range { path: spill.path.clone(), offset: spill.at, len },
+            ));
+            tensor.values = Vec::new();
+            spill.at += len;
+        }
+        self.tensors.push(tensor);
+        Ok(())
+    }
+
+    /// The tensors, with the spill file flushed so its ranges can be read.
+    /// The spill file stays until `self` is dropped.
+    fn finish(&mut self) -> Result<Vec<FloatTensor>> {
+        if let Some(spill) = self.spill.as_mut() {
+            use std::io::Write;
+            if let Some(file) = spill.file.as_mut() {
+                file.flush().map_err(|err| crate::error::io_err(&spill.path, err))?;
+            }
+        }
+        Ok(std::mem::take(&mut self.tensors))
+    }
 }
 
 pub(crate) struct FloatTensor {
     pub(crate) name: String,
     pub(crate) shape: Vec<u64>,
     pub(crate) values: Vec<f32>,
-    /// An integer or bool tensor copied as stored; `values` is then empty.
+    /// An integer or bool tensor copied as stored, or float32 values already
+    /// written to the spill file; `values` is then empty.
     pub(crate) kept: Option<(dtype::SafeDtype, Payload)>,
 }
 
@@ -66,14 +146,26 @@ fn plain_tensor(archive: &Archive, member: &Member) -> Result<FloatTensor> {
     Ok(tensor)
 }
 
+#[cfg(test)]
 pub(crate) fn dequant_archive(
     archive: &Archive,
     config: Option<&Value>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<FloatTensor>> {
+    let mut out = Floats::memory();
+    dequant_into(archive, config, warnings, &mut out)?;
+    out.finish()
+}
+
+fn dequant_into(
+    archive: &Archive,
+    config: Option<&Value>,
+    warnings: &mut Vec<String>,
+    out: &mut Floats,
+) -> Result<()> {
     refuse_unsupported(archive, config)?;
     if archive.members.iter().any(|member| is_block(&member.dtype)) {
-        return dequant_ggml(archive);
+        return dequant_ggml(archive, out);
     }
     let names: Vec<&str> = archive
         .members
@@ -89,21 +181,23 @@ pub(crate) fn dequant_archive(
         .and_then(Value::as_str)
         .is_some_and(|version| version.eq_ignore_ascii_case("gemm"));
     match method {
-        Some("gptq") if !gemm_version => return dequant_gptq(archive, quant.as_ref()),
-        Some("gptq" | "awq") => return dequant_awq(archive, quant.as_ref()),
-        Some("bitsandbytes") => return dequant_bnb(archive, quant.as_ref()),
-        Some("compressed-tensors") => return dequant_compressed(archive, quant.as_ref(), warnings),
+        Some("gptq") if !gemm_version => return dequant_gptq(archive, quant.as_ref(), out),
+        Some("gptq" | "awq") => return dequant_awq(archive, quant.as_ref(), out),
+        Some("bitsandbytes") => return dequant_bnb(archive, quant.as_ref(), out),
+        Some("compressed-tensors") => {
+            return dequant_compressed(archive, quant.as_ref(), warnings, out)
+        }
         Some(other) if mlx_config(config).is_none() => {
             return Err(msg(format!("quant_method {other} has no dequant here")))
         }
         _ => {}
     }
     if mlx_config(config).is_some() {
-        return dequant_mlx(archive, config);
+        return dequant_mlx(archive, config, out);
     }
     // bitsandbytes stores its own state beside each weight (BNB-005).
     if names.iter().any(|name| name.contains(".quant_state.bitsandbytes__")) {
-        return dequant_bnb(archive, None);
+        return dequant_bnb(archive, None, out);
     }
     // conversion-considerations.md section 3: names alone do not identify a
     // pack, and bits, group size, and zero convention are not in the tensors.
@@ -126,7 +220,7 @@ pub(crate) fn dequant_archive(
     warnings.push(
         "nothing in the source is quantized; float tensors were written as float32 and the rest copied".into(),
     );
-    float_copy(archive)
+    float_copy(archive, out)
 }
 
 fn refuse_unsupported(archive: &Archive, config: Option<&Value>) -> Result<()> {
@@ -179,11 +273,10 @@ fn is_block(dtype: &str) -> bool {
         .is_some_and(|id| dtype::canon_kind(id) == Some("block"))
 }
 
-fn dequant_ggml(archive: &Archive) -> Result<Vec<FloatTensor>> {
+fn dequant_ggml(archive: &Archive, out: &mut Floats) -> Result<()> {
     let Inner::Gguf(file) = &archive.inner else {
         return Err(msg("quantized ggml types were found outside a GGUF file"));
     };
-    let mut out = Vec::new();
     for member in &archive.members {
         let tensor = file
             .tensors
@@ -195,7 +288,7 @@ fn dequant_ggml(archive: &Archive) -> Result<Vec<FloatTensor>> {
             .and_then(dtype::canon_kind)
             .is_some_and(|kind| matches!(kind, "int" | "uint" | "bool"))
         {
-            out.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
             continue;
         }
         let raw = member.payload.read_vec()?;
@@ -215,12 +308,12 @@ fn dequant_ggml(archive: &Archive) -> Result<Vec<FloatTensor>> {
             name: member.name.clone(),
             shape,
             values,
-        });
+        })?;
     }
-    Ok(out)
+    Ok(())
 }
 
-fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<Vec<FloatTensor>> {
+fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>, out: &mut Floats) -> Result<()> {
     let bits = config_bits(quant, "GPTQ")?;
     if bits == 3 {
         return Err(msg("GPTQ 3-bit unpack is named but not transcribed"));
@@ -244,7 +337,6 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
     };
     let packed = pack_prefixes(archive, "qweight");
     let mut groups: BTreeMap<String, Gptq> = BTreeMap::new();
-    let mut plain = Vec::new();
     for member in &archive.members {
         let split = member
             .name
@@ -254,7 +346,7 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
                     && matches!(*suffix, "qweight" | "qzeros" | "scales" | "g_idx" | "bias")
             });
         let Some((prefix, suffix)) = split else {
-            plain.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
             continue;
         };
         let slot = groups.entry(prefix.to_string()).or_default();
@@ -267,7 +359,6 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
             _ => {}
         }
     }
-    let mut out = plain;
     for (prefix, group) in groups {
         let missing = |name: &str| msg(format!("{prefix}.{name} is missing"));
         let qweight = group.qweight.ok_or_else(|| missing("qweight"))?;
@@ -286,13 +377,13 @@ fn dequant_gptq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result
             name: format!("{prefix}.weight"),
             shape: vec![out_features, in_features],
             values,
-        });
+        })?;
         if let Some(mut bias) = group.bias {
             bias.name = format!("{prefix}.bias");
-            out.push(bias);
+            out.push(bias)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Module prefixes that have a `<prefix>.<suffix>` tensor. A bias or scale
@@ -393,7 +484,7 @@ pub fn unpack_gptq(
     Ok(out)
 }
 
-fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<Vec<FloatTensor>> {
+fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>, out: &mut Floats) -> Result<()> {
     // AWQ-006: version is case-insensitive and defaults to gemm.
     if let Some(version) = quant.and_then(|map| map.get("version")).and_then(Value::as_str) {
         if !version.eq_ignore_ascii_case("gemm") {
@@ -412,13 +503,12 @@ fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
         as usize;
     let packed = pack_prefixes(archive, "qweight");
     let mut groups: BTreeMap<String, Awq> = BTreeMap::new();
-    let mut plain = Vec::new();
     for member in &archive.members {
         let split = member.name.rsplit_once('.').filter(|(prefix, suffix)| {
             packed.contains(*prefix) && matches!(*suffix, "qweight" | "qzeros" | "scales" | "bias")
         });
         let Some((prefix, suffix)) = split else {
-            plain.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
             continue;
         };
         let slot = groups.entry(prefix.to_string()).or_default();
@@ -430,7 +520,6 @@ fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
             _ => {}
         }
     }
-    let mut out = plain;
     for (prefix, tensors) in groups {
         let missing = |name: &str| msg(format!("{prefix}.{name} is missing"));
         let qweight = tensors.qweight.ok_or_else(|| missing("qweight"))?;
@@ -447,13 +536,13 @@ fn dequant_awq(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
             name: format!("{prefix}.weight"),
             shape: vec![out_f, in_f],
             values,
-        });
+        })?;
         if let Some(mut bias) = tensors.bias {
             bias.name = format!("{prefix}.bias");
-            out.push(bias);
+            out.push(bias)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[derive(Default)]
@@ -532,10 +621,9 @@ pub fn unpack_awq(
 /// quantized. The logical shape comes from that JSON (BNB-006). Without a
 /// quant_state, `<m>.absmax` beside `<m>.weight` is read with the config's
 /// quant type and blocksize, and the shape is the unpacked length.
-fn dequant_bnb(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<Vec<FloatTensor>> {
+fn dequant_bnb(archive: &Archive, quant: Option<&Map<String, Value>>, out: &mut Floats) -> Result<()> {
     let members = index(archive);
     let mut used = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
     for member in &archive.members {
         let Some(module) = member.name.strip_suffix(".weight") else {
             continue;
@@ -597,18 +685,18 @@ fn dequant_bnb(archive: &Archive, quant: Option<&Map<String, Value>>) -> Result<
             name: weight.to_string(),
             shape,
             values,
-        });
+        })?;
         used.insert(weight.to_string());
     }
-    if out.is_empty() {
+    if used.is_empty() {
         return Err(msg("bitsandbytes dequant found no weight with its absmax"));
     }
     for member in &archive.members {
         if !used.contains(&member.name) {
-            out.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 struct BnbState {
@@ -795,13 +883,13 @@ fn dequant_compressed(
     archive: &Archive,
     quant: Option<&Map<String, Value>>,
     warnings: &mut Vec<String>,
-) -> Result<Vec<FloatTensor>> {
+    out: &mut Floats,
+) -> Result<()> {
     let quant = quant.ok_or_else(|| msg("compressed-tensors dequant needs quantization_config"))?;
     let modules = module_paths(archive);
     let schemes = CtSchemes::from_config(quant, &modules, warnings)?;
     let members = index(archive);
     let mut used = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
     for member in &archive.members {
         // CT-009: a module is quantized when its scheme parameters are
         // stored, whatever the targets say: weight_packed for pack-quantized,
@@ -875,17 +963,17 @@ fn dequant_compressed(
             name: format!("{module}.weight"),
             shape,
             values,
-        });
+        })?;
         for suffix in ["weight", "weight_packed", "weight_shape", "weight_scale", "weight_zero_point", "weight_global_scale"] {
             used.insert(format!("{module}.{suffix}"));
         }
     }
     for member in &archive.members {
         if !used.contains(&member.name) {
-            out.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Codes of a naive-, int-, or float-quantized weight, stored unpacked in
@@ -1401,13 +1489,12 @@ pub fn unpack_pack_quantized(
     Ok(codes)
 }
 
-fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTensor>> {
+fn dequant_mlx(archive: &Archive, config: Option<&Value>, out: &mut Floats) -> Result<()> {
     let object =
         mlx_config(config).ok_or_else(|| msg("MLX dequant needs config.json quantization"))?;
     let top = MlxParams::top_level(object)?;
     let members = index(archive);
     let mut consumed = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
     for member in &archive.members {
         let Some(prefix) = member.name.strip_suffix(".weight") else {
             continue;
@@ -1458,16 +1545,16 @@ fn dequant_mlx(archive: &Archive, config: Option<&Value>) -> Result<Vec<FloatTen
                 shape
             },
             values,
-        });
+        })?;
         consumed.insert(member.name.clone());
         consumed.insert(scales_name);
     }
     for member in &archive.members {
         if !consumed.contains(&member.name) {
-            out.push(plain_tensor(archive, member)?);
+            out.push(plain_tensor(archive, member)?)?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 struct MlxParams {
@@ -1791,16 +1878,18 @@ fn unpack_pow2(words: &[u32], shape: &[u64], bits: u32) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result<()> {
+fn refuse_gguf_output(target: FormatName) -> Result<()> {
     match target {
         #[cfg(format_gguf)]
-        FormatName::Gguf => {
-            return Err(msg(
-                "dequant output is a float container; pass a .safetensors, .npy, or .npz path. --quantize writes GGUF",
-            ));
-        }
-        _ => {}
+        FormatName::Gguf => Err(msg(
+            "dequant output is a float container; pass a .safetensors, .npy, or .npz path. --quantize writes GGUF",
+        )),
+        _ => Ok(()),
     }
+}
+
+fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result<()> {
+    refuse_gguf_output(target)?;
     let owned: Vec<crate::formats::safetensors::OutTensor> = tensors
         .iter()
         .map(|tensor| {
@@ -1869,12 +1958,11 @@ fn write_f32(path: &Path, target: FormatName, tensors: &[FloatTensor]) -> Result
     }
 }
 
-fn float_copy(archive: &Archive) -> Result<Vec<FloatTensor>> {
-    archive
-        .members
-        .iter()
-        .map(|member| plain_tensor(archive, member))
-        .collect()
+fn float_copy(archive: &Archive, out: &mut Floats) -> Result<()> {
+    for member in &archive.members {
+        out.push(plain_tensor(archive, member)?)?;
+    }
+    Ok(())
 }
 
 /// Outermost-first shape. GGUF members carry ggml `ne[]`, innermost first.

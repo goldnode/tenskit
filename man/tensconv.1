@@ -119,6 +119,8 @@ An architecture whose record is
 .I complete: false
 and that is not the LLaMA or Qwen3.5 case stops and names
 .IR unexpanded .
+A BF16 tensor is changed in F32, as llama.cpp's converter does,
+and returns to BF16 afterwards unless it is written as F32.
 .TP
 .B \-\-names\-only
 Rename and skip the value changes.

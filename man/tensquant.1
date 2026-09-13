@@ -192,6 +192,13 @@ reads
 reads
 .I \%architectures[0]
 to resolve tensor roles.
+.TP
+.I .OUTPUT.tensquant\-spill
+Beside the output.
+.B \-\-dequant
+writes each float32 tensor here as soon as it is computed,
+so memory holds about one tensor rather than the whole model.
+The file is as large as the output and is removed when tensquant exits.
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
