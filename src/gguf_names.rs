@@ -246,6 +246,9 @@ pub struct ConverterRecord {
     /// `tensor_hooks` method names: code outside `modify_tensors` that
     /// changes the tensor set (GGUF-030).
     pub hooks: Vec<String>,
+    /// The class and line of the `generate_extra_tensors` hook, which key
+    /// its `gguf_generated_tensors` row (GGUF-035).
+    pub generator: Option<(String, u64)>,
     /// `global_filters_after`: the global filters that run after the class's
     /// own chain, such as TextModel's drop test.
     pub global_filters_after: Vec<String>,
@@ -397,6 +400,18 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                 })
                 .unwrap_or_default();
             hooks.dedup();
+            let generator = item
+                .get("tensor_hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|hook| hook.get("method").and_then(Value::as_str) == Some("generate_extra_tensors"))
+                .and_then(|hook| {
+                    Some((
+                        hook.get("class")?.as_str()?.to_string(),
+                        hook.get("line")?.as_u64()?,
+                    ))
+                });
             Some(ConverterRecord {
                 class,
                 hf_architectures,
@@ -406,6 +421,7 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
                 branches,
                 filter,
                 hooks,
+                generator,
                 global_filters_after,
             })
         })

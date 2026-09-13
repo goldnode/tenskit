@@ -345,11 +345,13 @@ fn skip_base_suffixes(tensors: &mut Vec<Tensor>, warnings: &mut Vec<String>) {
 /// GGUF-030: a hook other than generate_extra_tensors changes the tensor set
 /// in code the spec does not transcribe.
 fn check_hooks(arch: &str, converter: &ConverterRecord) -> Result<()> {
+    // A repack row consumes checkpoint tensors, so it counts as another hook (GGUF-035).
+    let repack = generated_row(converter).is_some_and(|row| row.kind == "repack");
     let other: Vec<&str> = converter
         .hooks
         .iter()
         .map(String::as_str)
-        .filter(|hook| *hook != "generate_extra_tensors")
+        .filter(|hook| *hook != "generate_extra_tensors" || repack)
         .collect();
     if other.is_empty() {
         return Ok(());
@@ -436,52 +438,104 @@ fn apply_global_filters(
     Ok(())
 }
 
-/// GGUF-030: tensors that generate_extra_tensors computes from config.json are
-/// not written. One warning, under the condition the spec gives where it gives one.
+/// GGUF-035: the generate_extra_tensors row for this converter, if any.
+fn generated_row(converter: &ConverterRecord) -> Option<&'static crate::dtype::GeneratedTensors> {
+    let (class, line) = converter.generator.as_ref()?;
+    crate::dtype::GENERATED_TENSORS
+        .iter()
+        .find(|row| row.class == class && row.line == *line)
+}
+
+/// GGUF-035's P and R: P is rope_parameters, else rope_scaling, else {}; its
+/// rope_type comes from type when it has neither full_attention nor
+/// sliding_attention. R is P.full_attention when present, else P.
+fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, Value>, Map<String, Value>) {
+    let pick = |key: &str| {
+        hparams
+            .and_then(|map| map.get(key))
+            .and_then(Value::as_object)
+            .cloned()
+    };
+    let mut p = pick("rope_parameters").or_else(|| pick("rope_scaling")).unwrap_or_default();
+    if !p.contains_key("full_attention") && !p.contains_key("sliding_attention") && !p.contains_key("rope_type") {
+        if let Some(kind) = p.get("type").cloned() {
+            p.insert("rope_type".into(), kind);
+        }
+    }
+    let r = p
+        .get("full_attention")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| p.clone());
+    (p, r)
+}
+
+/// A gguf_generated_tensors condition, read up to its first `;`. None when
+/// the form is not one tenspile knows, such as a file beside the weights.
+fn generated_condition(when: &str, hparams: Option<&Map<String, Value>>) -> Option<bool> {
+    let when = when.split(';').next().unwrap_or(when).trim();
+    if when.starts_with("always") {
+        return Some(true);
+    }
+    if when.starts_with("never") {
+        return Some(false);
+    }
+    let (p, r) = rope_params(hparams);
+    let text = |map: &Map<String, Value>, key: &str| map.get(key).and_then(Value::as_str).map(str::to_string);
+    let filled = |key: &str| p.get(key).and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+    if let Some(rest) = when.strip_prefix("R.rope_type lowercased == ") {
+        let want = quoted(rest).ok()?;
+        return Some(text(&r, "rope_type").map(|kind| kind.to_lowercase()) == Some(want));
+    }
+    if let Some(rest) = when.strip_prefix("P.rope_type == ") {
+        let want = quoted(rest).ok()?;
+        return Some(text(&p, "rope_type") == Some(want));
+    }
+    match when {
+        "P.long_factor is non-empty" => Some(filled("long_factor")),
+        "P.long_factor or P.short_factor is non-empty" => Some(filled("long_factor") || filled("short_factor")),
+        _ => None,
+    }
+}
+
+/// GGUF-030 and GGUF-035: tensors that generate_extra_tensors computes are
+/// not written. One warning, only when the spec's condition holds, or when
+/// tenspile cannot test the condition.
 fn extra_tensor_note(
     converter: &ConverterRecord,
     hparams: Option<&Map<String, Value>>,
     warnings: &mut Vec<String>,
 ) {
-    if !converter.hooks.iter().any(|hook| hook == "generate_extra_tensors") {
+    if converter.generator.is_none() {
         return;
     }
-    let rope = hparams
-        .and_then(|map| map.get("rope_scaling"))
-        .and_then(Value::as_object);
-    let has = |key: &str| rope.is_some_and(|map| map.get(key).is_some_and(|value| !value.is_null()));
-    let added = match converter.class.as_str() {
-        "Phi3MiniModel" if has("long_factor") => Some("rope_factors_long and rope_factors_short"),
-        "MiniCPM3Model" if has("long_factor") || has("short_factor") => {
-            Some("rope_factors_long and rope_factors_short")
-        }
-        "ExaoneModel" | "Exaone4Model"
-            if rope
-                .and_then(|map| map.get("rope_type"))
-                .and_then(Value::as_str)
-                == Some("llama3") =>
-        {
-            Some("rope_freqs")
-        }
-        "Phi3MiniModel" | "MiniCPM3Model" | "ExaoneModel" | "Exaone4Model" => None,
-        _ => {
-            warnings.push(format!(
-                "llama.cpp's {} converter may also compute tensors from config.json \
-                 (generate_extra_tensors); the spec does not say when, and tensconv does not \
-                 write them (GGUF-030)",
-                converter.class
-            ));
-            None
-        }
-    };
-    if let Some(added) = added {
+    let Some(row) = generated_row(converter) else {
         warnings.push(format!(
-            "llama.cpp's {} converter would also write {added}, computed from config.json \
-             rope_scaling. tensconv does not write them. llama.cpp still loads the file, but \
-             runs RoPE without the factors, so its answers can differ (GGUF-030)",
+            "llama.cpp's {} converter may also compute tensors (generate_extra_tensors), and the \
+             spec has no row for it; tensconv does not write them (GGUF-035)",
             converter.class
         ));
+        return;
+    };
+    if row.kind == "none" || row.kind == "repack" {
+        return;
     }
+    let condition = match generated_condition(row.when, hparams) {
+        Some(false) => return,
+        Some(true) => String::new(),
+        None => format!(" when {}", row.when),
+    };
+    let tensors = row.tensors.replace('"', "");
+    let effect = match row.kind {
+        "rope" => "llama.cpp still loads the file, but runs RoPE without them, so its answers can differ",
+        "side-file" => "they come from files beside the weights",
+        _ => "they are computed from config.json",
+    };
+    warnings.push(format!(
+        "llama.cpp's {} converter would also write {tensors}{condition}. tensconv does not write \
+         them; {effect} (GGUF-030, GGUF-035)",
+        converter.class
+    ));
 }
 
 fn llama_permute(tensors: &mut [Tensor], hparams: Option<&Map<String, Value>>) -> Result<()> {
@@ -2375,6 +2429,9 @@ mod tests {
                 drop_when: drop.iter().map(|item| item.to_string()).collect(),
             }),
             hooks: hooks.iter().map(|item| item.to_string()).collect(),
+            generator: hooks
+                .contains(&"generate_extra_tensors")
+                .then(|| (class.to_string(), if class == "Phi3MiniModel" { 175 } else { 0 })),
             global_filters_after: Vec::new(),
         };
         assert!(check_hooks("phi3", &record("Phi3MiniModel", &["generate_extra_tensors"], None)).is_ok());
@@ -2437,6 +2494,7 @@ mod tests {
             branches: Vec::new(),
             filter: None,
             hooks: Vec::new(),
+            generator: None,
             global_filters_after: Vec::new(),
         };
         assert_eq!(hand_transcription("llama", &record("LlamaModel")), Some(Transcription::Llama));
@@ -2485,5 +2543,57 @@ mod tests {
         let mut kept = vec![tensor("model.visual.x")];
         apply_global_filters(&mut kept, &converter, &mut warnings).unwrap();
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn generated_tensors_follow_gguf_035() {
+        assert!(crate::dtype::GENERATED_TENSORS.len() >= 26);
+        // Every converter's generator has a row.
+        let value: Value = serde_json::from_str(include_str!(
+            "../tensdataspecs_readonly/specs/tables/gguf-tensor-roles.json"
+        ))
+        .unwrap();
+        for arch in value["architectures"].as_object().unwrap().keys() {
+            for record in gguf_names::converter_records(arch) {
+                if record.generator.is_some() {
+                    assert!(generated_row(&record).is_some(), "{}", record.class);
+                }
+            }
+        }
+        let config = |text: &str| serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone();
+        let llama = "R.rope_type lowercased == 'llama3'";
+        assert_eq!(generated_condition(llama, Some(&config(r#"{"rope_scaling": null}"#))), Some(false));
+        assert_eq!(generated_condition(llama, None), Some(false));
+        assert_eq!(
+            generated_condition(llama, Some(&config(r#"{"rope_scaling": {"type": "Llama3", "factor": 8}}"#))),
+            Some(true)
+        );
+        assert_eq!(
+            generated_condition(llama, Some(&config(r#"{"rope_parameters": {"full_attention": {"rope_type": "llama3"}}}"#))),
+            Some(true)
+        );
+        let phi = "P.long_factor is non-empty; also writes the rope_scaling.attn_factor KV";
+        assert_eq!(generated_condition(phi, Some(&config(r#"{"rope_scaling": {"long_factor": []}}"#))), Some(false));
+        assert_eq!(generated_condition(phi, Some(&config(r#"{"rope_scaling": {"long_factor": [1.0]}}"#))), Some(true));
+        assert_eq!(generated_condition("never", None), Some(false));
+        assert_eq!(generated_condition("1_Dense/model.safetensors exists", None), None);
+
+        let llama_record = gguf_names::converter_records("llama")
+            .into_iter()
+            .find(|record| record.class == "LlamaModel")
+            .unwrap();
+        let mut notes = Vec::new();
+        extra_tensor_note(&llama_record, Some(&config(r#"{"rope_scaling": null}"#)), &mut notes);
+        assert!(notes.is_empty(), "{notes:?}");
+        extra_tensor_note(&llama_record, Some(&config(r#"{"rope_scaling": {"rope_type": "llama3"}}"#)), &mut notes);
+        assert!(notes[0].contains("rope_freqs.weight"), "{notes:?}");
+
+        let gpt_oss = gguf_names::converter_records("gpt-oss")
+            .into_iter()
+            .find(|record| record.class == "GptOssModel");
+        if let Some(record) = gpt_oss {
+            let err = check_hooks("gpt-oss", &record).unwrap_err().to_string();
+            assert!(err.contains("generate_extra_tensors"), "{err}");
+        }
     }
 }

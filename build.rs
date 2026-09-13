@@ -23,12 +23,11 @@ fn main() {
 
     let safe = safetensors_rows(&yaml_dtypes, &mapping);
     let name_tables = parse_name_tables(&specs.join("mappings/metadata-mapping.yaml"));
+    let generated = parse_generated_tensors(&specs.join("mappings/metadata-mapping.yaml"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    fs::write(
-        out_dir.join("spec_tables.rs"),
-        render(&yaml_dtypes, &formats, &ggml, &safe, &name_tables),
-    )
-    .unwrap();
+    let mut tables = render(&yaml_dtypes, &formats, &ggml, &safe, &name_tables);
+    tables.push_str(&render_generated(&generated));
+    fs::write(out_dir.join("spec_tables.rs"), tables).unwrap();
 
     for row in &formats {
         println!(
@@ -766,6 +765,63 @@ fn render(
             ));
         }
         out.push_str("    ] },\n");
+    }
+    out.push_str("];\n");
+    out
+}
+
+/// metadata-mapping.yaml `gguf_generated_tensors` (GGUF-035): one row per
+/// generate_extra_tensors method, as class, line, kind, tensors, and when.
+fn parse_generated_tensors(path: &Path) -> Vec<Vec<(String, String)>> {
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let mut rows = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            inside = line.trim_end() == "gguf_generated_tensors:";
+            continue;
+        }
+        let trimmed = line.trim();
+        if inside && trimmed.starts_with("- {class:") {
+            let fields = parse_flow_map(trimmed.trim_start_matches('-').trim());
+            for key in ["class", "line", "kind", "tensors", "when"] {
+                if !fields.iter().any(|(name, _)| name == key) {
+                    panic!("gguf_generated_tensors row has no {key}: {trimmed}");
+                }
+            }
+            rows.push(fields);
+        }
+    }
+    if rows.is_empty() {
+        panic!("{} has no gguf_generated_tensors rows", path.display());
+    }
+    rows
+}
+
+fn render_generated(rows: &[Vec<(String, String)>]) -> String {
+    let field = |row: &[(String, String)], key: &str| {
+        row.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+            .unwrap()
+    };
+    let mut out = String::from(
+        "\n#[allow(dead_code)]\npub struct GeneratedTensors {\n    pub class: &'static str,\n    pub line: u64,\n    pub kind: &'static str,\n    pub tensors: &'static str,\n    pub when: &'static str,\n}\n\n#[allow(dead_code)]\npub static GENERATED_TENSORS: &[GeneratedTensors] = &[\n",
+    );
+    for row in rows {
+        let line: u64 = field(row, "line")
+            .parse()
+            .unwrap_or_else(|_| panic!("gguf_generated_tensors line is not a number: {row:?}"));
+        let tensors = field(row, "tensors");
+        let tensors = tensors.trim_start_matches('[').trim_end_matches(']');
+        out.push_str(&format!(
+            "    GeneratedTensors {{ class: {}, line: {line}, kind: {}, tensors: {}, when: {} }},\n",
+            rust_str(&field(row, "class")),
+            rust_str(&field(row, "kind")),
+            rust_str(tensors),
+            rust_str(&field(row, "when"))
+        ));
     }
     out.push_str("];\n");
     out
