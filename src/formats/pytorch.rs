@@ -5,7 +5,7 @@
 //! and the old tar container are recognized and refused. Remove this file and
 //! the `pytorch` line in `local/supported-formats.txt` to drop the format.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -1589,6 +1589,20 @@ pub fn open(path: &Path) -> Result<Archive> {
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "zip".into());
+    // data_bytes counts each storage once, as the file holds it; a tied
+    // weight is a second view of the same storage.
+    let mut storages = BTreeMap::new();
+    for named in &found {
+        storages.insert(named.tensor.storage.key.clone(), named.tensor.storage_bytes);
+    }
+    let data_bytes = storages.values().fold(0u64, |acc, bytes| acc.saturating_add(*bytes));
+    if storages.len() < found.len() {
+        notes.push(format!(
+            "{} tensors share {} storages; data_bytes counts each storage once",
+            found.len(),
+            storages.len()
+        ));
+    }
     let mut members = Vec::with_capacity(found.len());
     for named in found {
         let tensor = &named.tensor;
@@ -1614,9 +1628,6 @@ pub fn open(path: &Path) -> Result<Archive> {
             fortran: false,
         });
     }
-    let data_bytes = members
-        .iter()
-        .fold(0u64, |acc, member| acc.saturating_add(member.nbytes));
     Ok(Archive {
         format: FormatName::Pytorch,
         version,
@@ -2120,6 +2131,10 @@ mod tests {
         let Inner::Pytorch(torch) = &archive.inner else { unreachable!() };
         assert!(torch.refused.is_none());
         assert_eq!(data_records(&source), 5);
+        // tied_a, tied_b, and row1 are views of one storage, counted once.
+        let views: u64 = archive.members.iter().map(|member| member.nbytes).sum();
+        assert!(archive.data_bytes < views, "{} {views}", archive.data_bytes);
+        assert!(archive.notes.iter().any(|note| note.contains("share 5 storages")), "{:?}", archive.notes);
         let keep: Vec<_> = archive
             .members
             .iter()

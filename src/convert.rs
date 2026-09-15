@@ -46,6 +46,10 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
     let config = read_config(config_dir)?;
     let hparams = config.as_ref().map(merge_text_config);
     let mut warnings = Vec::new();
+    #[cfg(format_safetensors)]
+    if target == FormatName::Safetensors {
+        tied_copy_note(&archive, &mut warnings);
+    }
     let mut tensors = load_tensors(&archive)?;
     if request.rename {
         let arch = choose_architecture(&archive, config.as_ref())?;
@@ -292,6 +296,37 @@ fn llama_scope(tensors: &mut [Tensor], config: Option<&Value>, class: Option<&st
         }
     }
     Ok(())
+}
+
+/// metadata-mapping pytorch_to_safetensors: safetensors cannot alias, so
+/// tensors that share one PyTorch storage are written as separate copies.
+/// Hugging Face's save_pretrained drops the tied copy instead; the spec does
+/// not say which name a converter should keep, so both are written.
+#[cfg(format_safetensors)]
+fn tied_copy_note(archive: &Archive, warnings: &mut Vec<String>) {
+    if archive.format != FormatName::Pytorch {
+        return;
+    }
+    let mut seen: std::collections::BTreeMap<(PathBuf, u64, u64), &str> = Default::default();
+    for member in &archive.members {
+        let Payload::Range { path, offset, len } = &member.payload else {
+            continue;
+        };
+        if *len == 0 {
+            continue;
+        }
+        match seen.get(&(path.clone(), *offset, *len)) {
+            Some(first) => warnings.push(format!(
+                "{} shares its storage with {first} in the source; safetensors cannot share, so both are \
+                 written in full. Hugging Face's save_pretrained would drop the tied copy \
+                 (metadata-mapping pytorch_to_safetensors)",
+                member.name
+            )),
+            None => {
+                seen.insert((path.clone(), *offset, *len), member.name.as_str());
+            }
+        }
+    }
 }
 
 fn apply_values(
@@ -2216,6 +2251,18 @@ mod tests {
         apply_branches(&mut tensor, "gemma", &converter, None).unwrap();
         let value = f32::from_le_bytes(tensor.bytes.read_vec().unwrap().try_into().unwrap());
         assert!((value - 2.5).abs() < 1e-6);
+    }
+
+    #[cfg(all(format_safetensors, format_pytorch))]
+    #[test]
+    fn a_tied_pytorch_tensor_is_reported_when_written_twice() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tensdataspecs_readonly/specs/test-vectors/small-pt-fp8.pt");
+        let archive = archive::open(&source, None, DEFAULT_MAX_HEADER, None, None).unwrap();
+        let mut warnings = Vec::new();
+        tied_copy_note(&archive, &mut warnings);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("tied_b shares its storage with tied_a"), "{warnings:?}");
     }
 
     #[test]

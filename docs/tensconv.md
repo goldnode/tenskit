@@ -44,6 +44,8 @@ No metadata is dropped silently. The rules are conversion-considerations section
 - **Other string metadata into GGUF:** stored as `<format>.metadata.<key>`, where `<format>` is `safetensors`, `onnx`, or `raw-sidecar`. A rawtensor value keeps its type when GGUF has it. A `bytes` or `json` value becomes a string envelope such as `{"type":"BYTES","value":"AAE="}`, and converting that GGUF file back to rawtensor restores the typed `<key>`.
 - **npy, npz, and PyTorch output:** these hold no metadata, so a warning says how many keys were left behind.
 
+Tensors that share one storage in a PyTorch file, such as a tied `lm_head.weight`, are each written in full into safetensors, which cannot share storage. A warning names each pair. Hugging Face's `save_pretrained` drops the tied copy and relies on `tie_word_embeddings` in `config.json`; tensconv keeps both, so the output is larger but loads either way.
+
 A GGUF file survives a trip through safetensors:
 
 ```
