@@ -32,6 +32,18 @@ pub fn safe_dtype(name: &str) -> Result<SafeDtype> {
         .ok_or_else(|| msg(format!("unknown safetensors dtype {name}")))
 }
 
+/// The name tenspile lists for a member dtype. PyTorch, ONNX, and rawtensor
+/// members carry the canonical id (`float16`); where safetensors has a short
+/// name (`F16`) it is listed instead, so every format reads alike. Other names
+/// are listed as stored.
+pub fn display_name(name: &str) -> &str {
+    SAFE_ROWS
+        .iter()
+        .find(|row| row.canonical == name)
+        .map(|row| row.name)
+        .unwrap_or(name)
+}
+
 /// Canonical id for a safetensors name, a ggml type name, or an id that is already canonical.
 pub fn canonical_id(name: &str) -> Result<&'static str> {
     if let Some(row) = SAFE_ROWS.iter().find(|row| row.name == name || row.canonical == name) {

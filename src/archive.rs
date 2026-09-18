@@ -542,7 +542,10 @@ fn open_index(path: &Path, max_header: u64) -> Result<Archive> {
         members,
         metadata: meta_pairs,
         data_bytes,
-        notes: vec![format!("{} shards", shards.len())],
+        notes: vec![match shards.len() {
+            1 => "1 shard".to_string(),
+            count => format!("{count} shards"),
+        }],
         inner: Inner::Index(IndexFile {
             directory,
             metadata,
@@ -682,7 +685,9 @@ fn resolve_directory(dir: &Path) -> Result<ResolvedPath> {
     };
     let mut listed = others;
     if indexes.len() == 1 {
-        listed.extend(loose);
+        // A loose file the index names is one of its shards, not another file.
+        let named = index_shards(&dir.join(&chosen));
+        listed.extend(loose.into_iter().filter(|name| !named.contains(name)));
     }
     listed.retain(|name| name != &chosen);
     listed.sort();
@@ -699,6 +704,22 @@ fn resolve_directory(dir: &Path) -> Result<ResolvedPath> {
         path: dir.join(chosen),
         note,
     })
+}
+
+/// The shard files a safetensors index names. An unreadable index gives an
+/// empty set here; opening it reports the error.
+fn index_shards(path: &Path) -> std::collections::BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Default::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Default::default();
+    };
+    value
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| map.values().filter_map(|file| file.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 /// `prefix-00001-of-00005.safetensors` is one shard, not the weight set.
@@ -774,6 +795,19 @@ mod tests {
         fs::write(shards.path().join("model-00001-of-00002.safetensors"), b"a").unwrap();
         let err = resolve_user_path(shards.path(), false).unwrap_err();
         assert!(err.to_string().contains("no index"), "{err}");
+
+        // An index naming one loose file: that file is its shard.
+        let single = tempfile::tempdir().unwrap();
+        fs::write(single.path().join("model.safetensors"), b"a").unwrap();
+        fs::write(single.path().join("extra.safetensors"), b"b").unwrap();
+        fs::write(
+            single.path().join("model.safetensors.index.json"),
+            br#"{"weight_map": {"w": "model.safetensors"}}"#,
+        )
+        .unwrap();
+        let note = resolve_user_path(single.path(), false).unwrap().note.unwrap();
+        assert!(!note.contains("model.safetensors,") && !note.ends_with("model.safetensors"), "{note}");
+        assert!(note.contains("extra.safetensors"), "{note}");
     }
 
     #[test]

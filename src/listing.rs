@@ -82,7 +82,7 @@ fn row_from(order: usize, name: &str, member: &Member, offset: String) -> Row {
         order,
         header,
         leaf,
-        dtype: member.dtype.clone(),
+        dtype: crate::dtype::display_name(&member.dtype).to_string(),
         shape: format_shape(&member.shape),
         bytes: human_bytes(member.nbytes),
         offset,
@@ -348,7 +348,7 @@ fn piece_at(member: &Member, order: usize, depth: usize) -> Option<Piece> {
         sig: Sig {
             prefix,
             suffix,
-            dtype: member.dtype.clone(),
+            dtype: crate::dtype::display_name(&member.dtype).to_string(),
             shape: member.shape.clone(),
             nbytes: member.nbytes,
             numel: member.numel,

@@ -8,13 +8,13 @@ The protobuf is walked directly, so no ONNX library or code generator is needed.
 
 ```
 $ tenspile -t --columns -f small-typed.onnx
-name   dtype    shape   bytes  offset  params
-t_f32  float32  [2, 2]   16 B       0       4
-t_f16  float16  [3]       6 B       0       3
-t_i8   int8     [3]       3 B       0       3
-t_i32  int32    [3]      12 B       0       3
-t_i64  int64    [3]      24 B       0       3
-t_u32  uint32   [2]       8 B       0       2
+name   dtype  shape   bytes  offset  params
+t_f32  F32    [2, 2]   16 B       0       4
+t_f16  F16    [3]       6 B       0       3
+t_i8   I8     [3]       3 B       0       3
+t_i32  I32    [3]      12 B       0       3
+t_i64  I64    [3]      24 B       0       3
+t_u32  U32    [2]       8 B       0       2
 ```
 
 An initializer's bytes come from one of three places:

@@ -146,7 +146,7 @@ fn info(cli: &Cli) -> Result<()> {
     outln!("dtypes:");
     let mut totals: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for member in &archive.members {
-        let slot = totals.entry(member.dtype.as_str()).or_insert((0, 0));
+        let slot = totals.entry(crate::dtype::display_name(&member.dtype)).or_insert((0, 0));
         slot.0 += 1;
         slot.1 = slot.1.saturating_add(member.numel.unwrap_or(0));
     }
@@ -255,7 +255,7 @@ fn print_members(members: &[&Member], style: MemberStyle) {
         outln!(
             "{}\t{}\t{}\t{}\t{}\t{params}\t{shard}\t{detail}",
             member.name,
-            member.dtype,
+            crate::dtype::display_name(&member.dtype),
             format_shape(&member.shape),
             member.nbytes,
             member.file_offset
@@ -295,7 +295,10 @@ fn json_document(archive: &Archive, members: &[&Member]) -> Result<String> {
     for member in members {
         let mut object = Map::new();
         object.insert("name".into(), Value::String(member.name.clone()));
-        object.insert("dtype".into(), Value::String(member.dtype.clone()));
+        object.insert(
+            "dtype".into(),
+            Value::String(crate::dtype::display_name(&member.dtype).to_string()),
+        );
         object.insert(
             "shape".into(),
             Value::Array(member.shape.iter().copied().map(Value::from).collect()),

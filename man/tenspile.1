@@ -117,6 +117,8 @@ is set.
 List member names.
 .B \-v
 adds dtype, shape, bytes, offset, and parameters.
+A dtype is listed by its safetensors name, such as F16, when it has one,
+whatever the format; other dtypes, such as GGUF block types, keep their own names.
 .TP
 .BR \-x ", " \-\-extract
 Extract members.
