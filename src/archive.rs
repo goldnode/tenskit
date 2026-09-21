@@ -681,7 +681,21 @@ fn resolve_directory(dir: &Path) -> Result<ResolvedPath> {
             shards.join(", ")
         )));
     } else {
-        return Err(msg(format!("{} has no safetensors weights", dir.display())));
+        let readable: Vec<&String> = others
+            .iter()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                READABLE_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+            })
+            .collect();
+        let mut text = format!("{} has no safetensors weights", dir.display());
+        if let Some(first) = readable.first() {
+            text.push_str(&format!(
+                "; pass a weight file instead, such as {}",
+                dir.join(first).display()
+            ));
+        }
+        return Err(msg(text));
     };
     let mut listed = others;
     if indexes.len() == 1 {
@@ -705,6 +719,10 @@ fn resolve_directory(dir: &Path) -> Result<ResolvedPath> {
         note,
     })
 }
+
+/// Weight files other than safetensors that tenspile opens, suggested when a
+/// directory has no safetensors weights.
+const READABLE_SUFFIXES: &[&str] = &[".bin", ".pt", ".pth", ".gguf", ".onnx", ".npz", ".npy", ".rawtensor.json"];
 
 /// The shard files a safetensors index names. An unreadable index gives an
 /// empty set here; opening it reports the error.
@@ -808,6 +826,13 @@ mod tests {
         let note = resolve_user_path(single.path(), false).unwrap().note.unwrap();
         assert!(!note.contains("model.safetensors,") && !note.ends_with("model.safetensors"), "{note}");
         assert!(note.contains("extra.safetensors"), "{note}");
+
+        // No safetensors: name a file tenspile can open instead.
+        let bin = tempfile::tempdir().unwrap();
+        fs::write(bin.path().join("config.json"), b"{}").unwrap();
+        fs::write(bin.path().join("pytorch_model.bin"), b"a").unwrap();
+        let err = resolve_user_path(bin.path(), false).unwrap_err().to_string();
+        assert!(err.contains("such as") && err.ends_with("pytorch_model.bin"), "{err}");
     }
 
     #[test]

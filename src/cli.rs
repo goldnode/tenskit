@@ -497,6 +497,7 @@ Members:
   A bare name selects a member.
   KEY=PATH adds or replaces from a file. A bare .npy uses its file stem as the key.
   KEY=ARCHIVE:MEMBER copies one member out of another container.
+  A container holding one tensor, such as an extracted .rawtensor.json, needs no :MEMBER.
   A bare .npz on create, append, or update imports every array in the archive.
 
 Examples:

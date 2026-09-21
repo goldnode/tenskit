@@ -284,6 +284,14 @@ uses its file stem as the key.
 .PP
 .I key=archive:member
 copies one member out of another container.
+A container that holds exactly one tensor, such as the
+.I .rawtensor.json
+that
+.B \-x
+writes for a BF16 tensor, can be given as
+.I key=path
+without
+.IR :member .
 .PP
 A bare
 .I .npz

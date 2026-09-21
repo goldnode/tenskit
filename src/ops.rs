@@ -1775,11 +1775,21 @@ fn load_file(path: &Path, key: Option<&str>, cli: &Cli) -> Result<Vec<Planned>> 
                 | Detected::Index
                 | Detected::RawTensor
                 | Detected::Pytorch
-                | Detected::Onnx => Err(msg(format!(
-                    "{} holds named tensors; copy one with KEY={}:MEMBER",
-                    path.display(),
-                    path.display()
-                ))),
+                | Detected::Onnx => {
+                    // A file holding one tensor, such as one tenspile -x wrote
+                    // as rawtensor, needs no :MEMBER.
+                    let archive = archive::open(path, None, cli.max_header, None, None)?;
+                    if let [only] = archive.members.as_slice() {
+                        let name = key.unwrap_or(&only.name).to_string();
+                        return Ok(vec![load_member(path, &only.name, &name, cli, true)?]);
+                    }
+                    Err(msg(format!(
+                        "{} holds {} tensors; copy one with KEY={}:MEMBER",
+                        path.display(),
+                        archive.members.len(),
+                        path.display()
+                    )))
+                }
                 Detected::Pickle | Detected::LegacyGgml => unreachable!("refused above"),
             }
         }

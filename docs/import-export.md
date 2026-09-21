@@ -29,7 +29,7 @@ tenspile -xf model.safetensors -o layer.npz embed norm
 
 | Operand | Meaning |
 | --- | --- |
-| `KEY=PATH` | Read that file as one tensor named `KEY`. |
+| `KEY=PATH` | Read that file as one tensor named `KEY`. The file is an `.npy`, headerless bytes with `--dtype` and `--shape`, or any container that holds exactly one tensor, such as the rawtensor that `-x` writes for a BF16 tensor. |
 | a bare `.npy` path | Same, with the file stem as the key. |
 | a bare `.npz` path | Read every array. The array names are the keys. |
 | `KEY=ARCHIVE:MEMBER` | Copy one member from safetensors, GGUF, `.npz`, rawtensor, pytorch, ONNX, or a shard index. |
