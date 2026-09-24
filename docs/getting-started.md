@@ -130,7 +130,7 @@ $ tenspile -r -f new.safetensors --dtype F32 --shape 2 z=zeros.bin
 tenspile: tensor z already exists; use -u to replace it
 ```
 
-`-r` (append) refuses a name that exists, and leaves the file unchanged. `-u` (update) replaces it. `--delete` removes members:
+`-r` (append) refuses a name that exists, and leaves the file unchanged. `-u` (update) replaces it, with the new tensor's own dtype and shape; a warning names any change, such as BF16 to F32 from an `.npy` file. `--delete` removes members:
 
 ```
 $ tenspile --delete -f new.safetensors b

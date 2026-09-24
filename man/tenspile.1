@@ -130,6 +130,10 @@ Errors if a tensor key already exists.
 .TP
 .BR \-u ", " \-\-update
 Replace a tensor key, or add it if it is missing.
+The new tensor is written with its own dtype and shape;
+a warning names any change, such as BF16 to F32 from an
+.I .npy
+file.
 .TP
 .B \-\-delete
 Remove tensor keys and write the archive again.

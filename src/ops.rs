@@ -829,6 +829,9 @@ fn modify(cli: &Cli, mode: Modify) -> Result<()> {
             "-o for a shard index must stay in the same directory as the index",
         ));
     }
+    if mode == Modify::Update {
+        report_changed_types(cli, &archive, &dest);
+    }
     #[allow(unreachable_patterns)]
     match &archive.inner {
         #[cfg(format_gguf)]
@@ -848,6 +851,47 @@ fn modify(cli: &Cli, mode: Modify) -> Result<()> {
         #[cfg(format_onnx)]
         Inner::Onnx => edit_onnx(cli, &archive, mode, &dest),
         _ => Err(msg("this format cannot be edited in this build")),
+    }
+}
+
+/// An update writes the new tensor as it is, so a different dtype or shape
+/// changes the file's tensor. Say so; it is often a widen such as BF16 to F32
+/// from an .npy file.
+fn report_changed_types(cli: &Cli, archive: &Archive, dest: &Path) {
+    if cli.operands.is_empty() {
+        return;
+    }
+    let Ok(incoming) = load_incoming(cli) else {
+        return;
+    };
+    for item in &incoming {
+        let Some(member) = archive.members.iter().find(|member| member.name == item.name) else {
+            continue;
+        };
+        let old = dtype::canonical_id(&member.dtype).ok();
+        if old != dtype::canonical_id(&item.dtype).ok() || old.is_none() && member.dtype != item.dtype {
+            eprintln!(
+                "tenspile: {}: {} changes dtype from {} to {}",
+                dest.display(),
+                item.name,
+                dtype::display_name(&member.dtype),
+                dtype::display_name(&item.dtype)
+            );
+        }
+        let mut shape = member.shape.clone();
+        #[cfg(format_gguf)]
+        if matches!(archive.inner, Inner::Gguf(_)) {
+            shape.reverse();
+        }
+        if shape != item.shape {
+            eprintln!(
+                "tenspile: {}: {} changes shape from {} to {}",
+                dest.display(),
+                item.name,
+                format_shape(&shape),
+                format_shape(&item.shape)
+            );
+        }
     }
 }
 

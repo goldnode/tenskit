@@ -321,7 +321,7 @@ fn spans(
         let offset = raw[index].3;
         if offset > data_len {
             return Err(msg(format!(
-                "gguf tensor {} offset {offset} is past the tensor blob",
+                "gguf tensor {} offset {offset} is past the tensor blob; the file may be truncated or damaged",
                 raw[index].0
             )));
         }
@@ -343,7 +343,7 @@ fn spans(
             // end of the file.
             if nbytes > span_of[index] {
                 return Err(msg(format!(
-                    "gguf tensor {name} needs {nbytes} bytes and has {} before the next tensor or the end of the file (GGUF-015)",
+                    "gguf tensor {name} needs {nbytes} bytes and has {} before the next tensor or the end of the file (GGUF-015); the file may be truncated or damaged",
                     span_of[index]
                 )));
             }
@@ -1146,6 +1146,15 @@ pub fn type_label(tensor: &GgufTensor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_tensor_blob_suggests_truncation() {
+        // ggml type 0 is F32: 4 elements need 16 bytes.
+        let past = spans(vec![("w".into(), 0, vec![4], 32)], 0, 16).unwrap_err().to_string();
+        assert!(past.ends_with("the file may be truncated or damaged"), "{past}");
+        let short = spans(vec![("w".into(), 0, vec![4], 0)], 0, 8).unwrap_err().to_string();
+        assert!(short.ends_with("the file may be truncated or damaged"), "{short}");
+    }
 
     #[test]
     fn metadata_rewrite_keeps_tensor_bytes() {
