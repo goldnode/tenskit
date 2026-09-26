@@ -25,6 +25,8 @@ A dtype is copied when the target has it. When it does not, the value is widened
 | E8M0 | F32 |
 | anything else the target lacks | the command stops |
 
+One warning per pair of dtypes gives the count and the first tensor's name.
+
 Narrowing is never done. Quantized GGUF blocks are not converted. The command stops and names `tensquant`:
 
 ```

@@ -89,8 +89,24 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             }
         }
     }
+    let mut widened: Vec<((String, String), Vec<String>)> = Vec::new();
     for tensor in &mut tensors {
-        fit_dtype(tensor, target, &mut warnings)?;
+        if let Some(pair) = fit_dtype(tensor, target)? {
+            match widened.iter_mut().find(|(seen, _)| *seen == pair) {
+                Some((_, names)) => names.push(tensor.name.clone()),
+                None => widened.push((pair, vec![tensor.name.clone()])),
+            }
+        }
+    }
+    for ((from, to), names) in widened {
+        warnings.push(match names.as_slice() {
+            [only] => format!("widened {only} from {from} to {to}"),
+            _ => format!(
+                "widened {} tensors from {from} to {to}, the first {}",
+                names.len(),
+                names[0]
+            ),
+        });
     }
     write_target(
         &request.output,
@@ -1110,17 +1126,15 @@ fn keep_f32_roles(tensors: &mut [Tensor], warnings: &mut Vec<String>) -> Result<
     Ok(())
 }
 
-fn fit_dtype(tensor: &mut Tensor, target: FormatName, warnings: &mut Vec<String>) -> Result<()> {
+/// Widen a dtype the target cannot store. Returns the (from, to) pair, so
+/// one warning can count every tensor widened the same way.
+fn fit_dtype(tensor: &mut Tensor, target: FormatName) -> Result<Option<(String, String)>> {
     if target_accepts(target, &tensor.canonical)? {
-        return Ok(());
+        return Ok(None);
     }
     let widened = widen_to(tensor, target)?;
-    warnings.push(format!(
-        "widened {} from {} to {widened}",
-        tensor.name, tensor.canonical
-    ));
-    tensor.canonical = widened;
-    Ok(())
+    let from = std::mem::replace(&mut tensor.canonical, widened.clone());
+    Ok(Some((from, widened)))
 }
 
 fn target_accepts(target: FormatName, canonical: &str) -> Result<bool> {

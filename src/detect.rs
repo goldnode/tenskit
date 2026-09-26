@@ -107,10 +107,55 @@ pub fn sniff(path: &Path, max_header: u64) -> Result<Detected> {
             return Ok(Detected::Onnx);
         }
     }
+    let named_safetensors = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"));
+    if named_safetensors {
+        return Err(msg(format!(
+            "{} is not a valid safetensors file: {}",
+            path.display(),
+            safetensors_problem(file, len, max_header)
+        )));
+    }
     Err(msg(format!(
         "cannot tell what kind of tensor file {} is; pass --format",
         path.display()
     )))
+}
+
+/// Why the first bytes of a file named .safetensors are not a safetensors
+/// header (ST-001, ST-002).
+fn safetensors_problem(mut file: File, len: u64, max_header: u64) -> String {
+    use std::io::{Seek, SeekFrom};
+    if len < 8 {
+        return format!("it is {len} bytes, shorter than the 8-byte header length");
+    }
+    let mut len_buf = [0u8; 8];
+    if file.seek(SeekFrom::Start(0)).is_err() || file.read_exact(&mut len_buf).is_err() {
+        return "its header length cannot be read".into();
+    }
+    let header_len = u64::from_le_bytes(len_buf);
+    if header_len > max_header && header_len > len - 8 {
+        return format!(
+            "its first 8 bytes do not hold a plausible header length ({header_len}); it does not look like safetensors data"
+        );
+    }
+    if header_len > len - 8 {
+        return format!(
+            "the header length {header_len} is more than the {} bytes after it; the file may be truncated or damaged",
+            len - 8
+        );
+    }
+    if header_len > max_header {
+        return format!(
+            "the header length {header_len} is above the {max_header}-byte limit; --max-header-size raises it"
+        );
+    }
+    if header_len < 2 {
+        return format!("the header length {header_len} is too short for a JSON object");
+    }
+    "the header does not start with '{'".into()
 }
 
 fn safetensors_or_index(
@@ -179,5 +224,27 @@ pub fn refuse_unsafe(kind: Detected, path: &Path) -> Result<()> {
             path.display()
         ))),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_safetensors_file_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = |name: &str, bytes: &[u8], want: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let err = sniff(&path, 100_000_000).unwrap_err().to_string();
+            assert!(err.contains(want), "{err}");
+        };
+        check("text.safetensors", b"hello world, not tensors\n", "not a valid safetensors file: its first 8 bytes");
+        check("short.safetensors", b"abc", "shorter than the 8-byte header length");
+        let mut cut = 320u64.to_le_bytes().to_vec();
+        cut.extend_from_slice(b"{\"w\":");
+        check("cut.safetensors", &cut, "the file may be truncated or damaged");
+        check("junk.bin", b"junk junk junk\n", "cannot tell what kind of tensor file");
     }
 }
