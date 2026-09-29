@@ -1285,10 +1285,10 @@ fn write_target(
     // generic_rules: never drop metadata silently).
     let dropped = |warnings: &mut Vec<String>, target: &str| {
         if !source.is_empty() {
-            warnings.push(format!(
-                "{} metadata keys were not written: {target} has no metadata",
-                source.len()
-            ));
+            warnings.push(match source.len() {
+                1 => format!("1 metadata key was not written: {target} has no metadata"),
+                count => format!("{count} metadata keys were not written: {target} has no metadata"),
+            });
         }
     };
     match target {
