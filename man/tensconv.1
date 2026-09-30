@@ -84,7 +84,10 @@ or
 Hyperparameters written into GGUF follow
 .IR \%hf_config_to_gguf :
 .I text_config
-is merged over the root object first, then the first listed key is used.
+is merged over the root object first, then the first listed key that is present is used.
+Each row is written only under the condition of llama.cpp's
+.IR \%TextModel.set_gguf_parameters ,
+which the rows transcribe.
 A sibling
 .I config.json
 is read only for those keys.
@@ -119,7 +122,7 @@ An architecture whose record is
 .I complete: false
 and that is not the LLaMA or Qwen3.5 case stops and names
 .IR unexpanded .
-A BF16 tensor is changed in F32, as llama.cpp's converter does,
+A BF16 tensor is changed in F32, as llama.cpp's converter does (GGUF-036),
 and returns to BF16 afterwards unless it is written as F32.
 .TP
 .B \-\-names\-only

@@ -17,6 +17,7 @@ mod dtype;
 mod error;
 mod formats;
 mod ggml_dequant;
+mod gguf_keys;
 mod gguf_names;
 mod io_util;
 mod listing;

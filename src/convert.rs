@@ -83,11 +83,6 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             keep_f32_roles(&mut tensors, &mut warnings)?;
         }
         narrow_after_values(&mut tensors, gguf_values);
-        if target == FormatName::Gguf {
-            if let Some(map) = &hparams {
-                warnings.extend(metadata_notes(map));
-            }
-        }
     }
     let mut widened: Vec<((String, String), Vec<String>)> = Vec::new();
     for tensor in &mut tensors {
@@ -506,27 +501,6 @@ fn generated_row(converter: &ConverterRecord) -> Option<&'static crate::dtype::G
 /// GGUF-035's P and R: P is rope_parameters, else rope_scaling, else {}; its
 /// rope_type comes from type when it has neither full_attention nor
 /// sliding_attention. R is P.full_attention when present, else P.
-fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, Value>, Map<String, Value>) {
-    let pick = |key: &str| {
-        hparams
-            .and_then(|map| map.get(key))
-            .and_then(Value::as_object)
-            .cloned()
-    };
-    let mut p = pick("rope_parameters").or_else(|| pick("rope_scaling")).unwrap_or_default();
-    if !p.contains_key("full_attention") && !p.contains_key("sliding_attention") && !p.contains_key("rope_type") {
-        if let Some(kind) = p.get("type").cloned() {
-            p.insert("rope_type".into(), kind);
-        }
-    }
-    let r = p
-        .get("full_attention")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| p.clone());
-    (p, r)
-}
-
 /// A gguf_generated_tensors condition, read up to its first `;`. None when
 /// the form is not one tenspile knows, such as a file beside the weights.
 fn generated_condition(when: &str, hparams: Option<&Map<String, Value>>) -> Option<bool> {
@@ -537,7 +511,7 @@ fn generated_condition(when: &str, hparams: Option<&Map<String, Value>>) -> Opti
     if when.starts_with("never") {
         return Some(false);
     }
-    let (p, r) = rope_params(hparams);
+    let (p, r) = crate::gguf_keys::rope_params(hparams);
     let text = |map: &Map<String, Value>, key: &str| map.get(key).and_then(Value::as_str).map(str::to_string);
     let filled = |key: &str| p.get(key).and_then(Value::as_array).is_some_and(|items| !items.is_empty());
     if let Some(rest) = when.strip_prefix("R.rope_type lowercased == ") {
@@ -1705,152 +1679,8 @@ fn gguf_hparams(map: &Map<String, Value>) -> Result<Vec<(String, MetaValue)>> {
     {
         out.push(("general.name".into(), MetaValue::String(name.to_string())));
     }
-    push_u32(
-        &mut out,
-        &format!("{arch}.block_count"),
-        map,
-        &["n_layers", "num_hidden_layers", "n_layer", "num_layers"],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.context_length"),
-        map,
-        &[
-            "max_position_embeddings",
-            "n_ctx",
-            "n_positions",
-            "max_length",
-            "max_sequence_length",
-            "model_max_length",
-        ],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.embedding_length"),
-        map,
-        &["hidden_size", "n_embd", "dim"],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.feed_forward_length"),
-        map,
-        &[
-            "prefix_dense_intermediate_size",
-            "dense_intermediate_size",
-            "intermediate_size",
-            "n_inner",
-            "hidden_dim",
-        ],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.attention.head_count"),
-        map,
-        &["num_attention_heads", "n_head", "n_heads"],
-    );
-    if let Some(heads) = hparam_u64(Some(map), &["num_attention_heads", "n_head", "n_heads"]) {
-        let kv = hparam_u64(Some(map), &["num_key_value_heads", "n_kv_heads"]).unwrap_or(heads);
-        out.push((
-            format!("{arch}.attention.head_count_kv"),
-            MetaValue::U32(kv as u32),
-        ));
-    }
-    if let Some(dim) = hparam_u64(Some(map), &["head_dim"]) {
-        out.push((
-            format!("{arch}.attention.key_length"),
-            MetaValue::U32(dim as u32),
-        ));
-        out.push((
-            format!("{arch}.attention.value_length"),
-            MetaValue::U32(dim as u32),
-        ));
-    }
-    push_f32(
-        &mut out,
-        &format!("{arch}.rope.freq_base"),
-        map,
-        &[
-            "global_rope_theta",
-            "rope_global_theta",
-            "rope_theta_global",
-            "rope_theta",
-            "rotary_emb_base",
-        ],
-    );
-    push_f32(
-        &mut out,
-        &format!("{arch}.attention.layer_norm_rms_epsilon"),
-        map,
-        &["rms_norm_eps", "norm_eps"],
-    );
-    push_f32(
-        &mut out,
-        &format!("{arch}.attention.layer_norm_epsilon"),
-        map,
-        &["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon"],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.expert_count"),
-        map,
-        &["num_local_experts", "num_experts", "n_routed_experts"],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.expert_used_count"),
-        map,
-        &[
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "top_k_experts",
-        ],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.vocab_size"),
-        map,
-        &["vocab_size"],
-    );
-    push_u32(
-        &mut out,
-        &format!("{arch}.attention.sliding_window"),
-        map,
-        &["sliding_window"],
-    );
+    crate::gguf_keys::base_rows(&arch, map, &mut out)?;
     Ok(out)
-}
-
-fn push_u32(
-    out: &mut Vec<(String, MetaValue)>,
-    key: &str,
-    map: &Map<String, Value>,
-    names: &[&str],
-) {
-    if let Some(value) = hparam_u64(Some(map), names) {
-        out.push((key.to_string(), MetaValue::U32(value as u32)));
-    }
-}
-
-fn push_f32(
-    out: &mut Vec<(String, MetaValue)>,
-    key: &str,
-    map: &Map<String, Value>,
-    names: &[&str],
-) {
-    if let Some(value) = hparam_f64(Some(map), names) {
-        out.push((key.to_string(), MetaValue::F32(value as f32)));
-    }
-}
-
-fn metadata_notes(map: &Map<String, Value>) -> Vec<String> {
-    let mut notes = Vec::new();
-    // `"rope_scaling": null` means no scaling, so there is nothing to copy.
-    if map.get("rope_scaling").is_some_and(|value| !value.is_null()) {
-        notes.push(
-            "rope_scaling was left in config.json; the nested GGUF keys are not copied".into(),
-        );
-    }
-    notes
 }
 
 fn read_config(dir: &Path) -> Result<Option<Value>> {
@@ -1906,19 +1736,6 @@ fn hparam_u64(map: Option<&Map<String, Value>>, names: &[&str]) -> Option<u64> {
     None
 }
 
-fn hparam_f64(map: Option<&Map<String, Value>>, names: &[&str]) -> Option<f64> {
-    let map = map?;
-    for name in names {
-        if let Some(value) = map.get(*name).and_then(Value::as_f64) {
-            return Some(value);
-        }
-        if let Some(value) = map.get(*name).and_then(Value::as_u64) {
-            return Some(value as f64);
-        }
-    }
-    None
-}
-
 fn json_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
@@ -1936,9 +1753,9 @@ fn elem_width(canonical: &str) -> Result<usize> {
     Ok((bits / 8) as usize)
 }
 
-/// llama.cpp's ModelBase.prepare_tensors turns a tensor that is not F16 or
-/// F32 into F32 before modify_tensors changes its values, so `w + 1` on a
-/// BF16 norm is exact. An F16 tensor stays F16 for the arithmetic.
+/// GGUF-036: llama.cpp's ModelBase.prepare_tensors turns a tensor that is not
+/// F16 or F32 into F32 before modify_tensors changes its values, so `w + 1` on
+/// a BF16 norm is exact. An F16 tensor stays F16 for the arithmetic.
 fn widen_for_values(tensor: &mut Tensor) -> Result<()> {
     if tensor.canonical == "bfloat16" {
         tensor.bytes = Payload::Bytes(bf16_to_f32(&tensor.bytes.read_vec()?)?);
@@ -1948,9 +1765,9 @@ fn widen_for_values(tensor: &mut Tensor) -> Result<()> {
     Ok(())
 }
 
-/// After the GGUF-029 widen: a BF16 tensor whose values were computed in F32
-/// returns to BF16 unless it is written F32, as llama.cpp's --outtype bf16
-/// rounds it once.
+/// GGUF-036, after the GGUF-029 widen: a BF16 tensor whose values were
+/// computed in F32 returns to BF16 unless it is written F32, as llama.cpp's
+/// --outtype bf16 rounds it once.
 fn narrow_after_values(tensors: &mut [Tensor], keep_f32: bool) {
     for tensor in tensors.iter_mut() {
         if !tensor.from_bf16 || tensor.canonical != "float32" {
@@ -2489,13 +2306,6 @@ mod tests {
         let raw = crate::archive::open(&back, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let Inner::Raw(file) = &raw.inner else { panic!() };
         assert_eq!(file.metadata, metadata);
-    }
-
-    #[test]
-    fn a_null_rope_scaling_is_not_reported() {
-        let config = |text: &str| serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone();
-        assert!(metadata_notes(&config(r#"{"rope_scaling": null}"#)).is_empty());
-        assert_eq!(metadata_notes(&config(r#"{"rope_scaling": {"type": "linear", "factor": 2.0}}"#)).len(), 1);
     }
 
     #[test]
