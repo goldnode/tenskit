@@ -51,6 +51,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         tied_copy_note(&archive, &mut warnings);
     }
     let mut tensors = load_tensors(&archive)?;
+    let mut hparam_keys = None;
     if request.rename {
         let arch = choose_architecture(&archive, config.as_ref())?;
         let class = config.as_ref().and_then(hf_class);
@@ -78,6 +79,11 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             )?;
         }
         rename_tensors(&mut tensors, &arch, layers, &mut warnings)?;
+        if target == FormatName::Gguf {
+            if let Some(map) = &hparams {
+                hparam_keys = Some(gguf_hparams(&arch, &converter.class, map, config_dir, &mut warnings)?);
+            }
+        }
         let gguf_values = target == FormatName::Gguf && !request.names_only;
         if gguf_values {
             keep_f32_roles(&mut tensors, &mut warnings)?;
@@ -108,7 +114,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         target,
         &tensors,
         &archive,
-        hparams.as_ref(),
+        hparam_keys.as_deref(),
         request.rename,
         &mut warnings,
     )?;
@@ -1247,7 +1253,7 @@ fn write_target(
     target: FormatName,
     tensors: &[Tensor],
     archive: &Archive,
-    hparams: Option<&Map<String, Value>>,
+    hparam_keys: Option<&[(String, MetaValue)]>,
     rename: bool,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
@@ -1292,7 +1298,7 @@ fn write_target(
         }
         #[cfg(format_gguf)]
         FormatName::Gguf => {
-            let (mut metadata, dense) = gguf_out(tensors, hparams, rename)?;
+            let (mut metadata, dense) = gguf_out(tensors, hparam_keys, rename)?;
             for (key, value) in gguf_metadata(archive, source, warnings) {
                 // Keys the writer computes win (CONV-007).
                 match metadata.iter().find(|(existing, _)| *existing == key) {
@@ -1543,14 +1549,12 @@ pub(crate) fn tokenizer_note(metadata: &[(String, MetaValue)], warnings: &mut Ve
 
 fn gguf_out(
     tensors: &[Tensor],
-    hparams: Option<&Map<String, Value>>,
+    hparam_keys: Option<&[(String, MetaValue)]>,
     rename: bool,
 ) -> Result<(Vec<(String, MetaValue)>, Vec<DenseTensor>)> {
     let mut metadata = Vec::new();
     if rename {
-        if let Some(map) = hparams {
-            metadata.extend(gguf_hparams(map)?);
-        }
+        metadata.extend(hparam_keys.unwrap_or_default().iter().cloned());
         metadata.push(("general.quantization_version".into(), MetaValue::U32(2)));
     }
     let mut dense = Vec::new();
@@ -1655,23 +1659,17 @@ fn numpy_descr(canonical: &str) -> Result<&'static str> {
         .ok_or_else(|| msg(format!("dtype {canonical} has no NumPy descr")))
 }
 
-fn gguf_hparams(map: &Map<String, Value>) -> Result<Vec<(String, MetaValue)>> {
-    let arch = map
-        .get("general.architecture")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            map.get("architectures")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-                .and_then(gguf_names::architecture_for_hf_class)
-        })
-        .ok_or_else(|| msg("GGUF metadata needs an architecture"))?;
-    let mut out = vec![(
-        "general.architecture".into(),
-        MetaValue::String(arch.clone()),
-    )];
+/// GGUF-037: general.architecture, general.name, and the keys the converter
+/// class's set_gguf_parameters chain writes. Listed keys whose guard or value
+/// cannot be evaluated from config.json are named in one warning.
+fn gguf_hparams(
+    arch: &str,
+    class: &str,
+    map: &Map<String, Value>,
+    dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(String, MetaValue)>> {
+    let mut out = vec![("general.architecture".into(), MetaValue::String(arch.to_string()))];
     if let Some(name) = map
         .get("_name_or_path")
         .and_then(Value::as_str)
@@ -1679,7 +1677,14 @@ fn gguf_hparams(map: &Map<String, Value>) -> Result<Vec<(String, MetaValue)>> {
     {
         out.push(("general.name".into(), MetaValue::String(name.to_string())));
     }
-    crate::gguf_keys::base_rows(&arch, map, &mut out)?;
+    let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
+    out.extend(found.keys);
+    if !found.unevaluated.is_empty() {
+        warnings.push(format!(
+            "llama.cpp's {class} may also write {}; tenspile cannot evaluate when or what from config.json, so they are left out (GGUF-037)",
+            found.unevaluated.join(", ")
+        ));
+    }
     Ok(out)
 }
 

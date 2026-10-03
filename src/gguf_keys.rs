@@ -250,6 +250,1067 @@ fn rope_scaling(arch: &str, r: &Map<String, Value>, out: &mut Vec<(String, MetaV
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// GGUF-037: the keys a converter class's set_gguf_parameters chain writes.
+
+static CONFIG_KEYS_JSON: &str =
+    include_str!("../tensdataspecs_readonly/specs/tables/gguf-config-keys.json");
+
+fn index() -> &'static Value {
+    static INDEX: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| serde_json::from_str(CONFIG_KEYS_JSON).expect("gguf-config-keys.json parses"))
+}
+
+/// What a class's chain writes: the keys, and the listed keys whose guard or
+/// value could not be evaluated from the config.
+pub(crate) struct ClassKeys {
+    pub(crate) keys: Vec<(String, MetaValue)>,
+    pub(crate) unevaluated: Vec<String>,
+}
+
+/// GGUF-037: follow `class`'s set_gguf_parameters chain, base first.
+/// TextModel is the hf_config_to_gguf rows; a class with a transcription in
+/// gguf_class_parameters is that transcription; any other class is its
+/// writes in tables/gguf-config-keys.json, evaluated where the guard and the
+/// value can be.
+pub(crate) fn class_keys(
+    class: &str,
+    arch: &str,
+    map: &Map<String, Value>,
+    dir: &std::path::Path,
+) -> Result<ClassKeys> {
+    let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
+    let record = index()["converters"].get(class);
+    let chain: Vec<String> = match record.and_then(|record| record["set_gguf_parameters"].as_array()) {
+        Some(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+        None => {
+            return Err(msg(format!(
+                "{class} is not in tables/gguf-config-keys.json, so its GGUF keys are not known (GGUF-037)"
+            )))
+        }
+    };
+    let (p, _) = rope_params(Some(map));
+    for owner in chain.iter().rev() {
+        if owner == "TextModel" {
+            base_rows(arch, map, &mut found.keys)?;
+            continue;
+        }
+        if transcribed(owner, arch, map, &mut found.keys)? {
+            continue;
+        }
+        let method = format!("{owner}.set_gguf_parameters");
+        let mut ctx = Ctx { map, p: &p, dir, arch, depth: 0 };
+        ctx.method(&method, &mut found)?;
+    }
+    Ok(found)
+}
+
+/// find(a, b) in gguf_class_parameters: find_hparam, KeyError when none is present.
+fn find<'a>(map: &'a Map<String, Value>, names: &[&str], class: &str) -> Result<&'a Value> {
+    first_present(map, names).ok_or_else(|| {
+        msg(format!(
+            "config.json has none of {}, which llama.cpp's {class} needs",
+            names.join(", ")
+        ))
+    })
+}
+
+/// A step of the chain that metadata-mapping gguf_class_parameters
+/// transcribes by hand. Returns false for a class it does not cover.
+fn transcribed(owner: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<bool> {
+    match owner {
+        "Phi3MiniModel" => phi3_mini(owner, arch, map, out)?,
+        "PhiMoeModel" => {
+            let key = |name: &str| format!("{arch}.{name}");
+            let used = find(map, &["num_experts_per_tok", "num_experts_per_token"], owner)?;
+            set(out, key("expert_used_count"), as_u32(&key("expert_used_count"), used)?);
+            let count = find(map, &["num_local_experts", "num_experts"], owner)?;
+            set(out, key("expert_count"), as_u32(&key("expert_count"), count)?);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// gguf_class_parameters Phi3MiniModel: a replaced base, and attn_factor
+/// from generate_extra_tensors when P.long_factor is non-empty.
+fn phi3_mini(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<()> {
+    let key = |name: &str| format!("{arch}.{name}");
+    let (p, r) = rope_params(Some(map));
+    let u32_of = |name: &str, value: &Value| as_u32(&key(name), value);
+    let context = find(map, &["n_positions", "max_position_embeddings"], class)?;
+    set(out, key("context_length"), u32_of("context_length", context)?);
+    let original = p
+        .get("original_max_position_embeddings")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| msg(format!("config.json has no original_max_position_embeddings, which llama.cpp's {class} needs")))?;
+    set(out, key("rope.scaling.original_context_length"), u32_of("rope.scaling.original_context_length", original)?);
+    let n_embd = find(map, &["hidden_size", "n_embd"], class)?;
+    set(out, key("embedding_length"), u32_of("embedding_length", n_embd)?);
+    let ff = find(map, &["intermediate_size"], class)?;
+    set(out, key("feed_forward_length"), u32_of("feed_forward_length", ff)?);
+    let blocks = find(map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"], class)?;
+    set(out, key("block_count"), u32_of("block_count", blocks)?);
+    let n_head = find(map, &["num_attention_heads", "n_head"], class)?;
+    set(out, key("attention.head_count"), u32_of("attention.head_count", n_head)?);
+    let n_kv = find(map, &["num_key_value_heads", "n_head_kv"], class)?;
+    set(out, key("attention.head_count_kv"), u32_of("attention.head_count_kv", n_kv)?);
+    let eps = find(map, &["rms_norm_eps"], class)?;
+    set(out, key("attention.layer_norm_rms_epsilon"), as_f32(&key("attention.layer_norm_rms_epsilon"), eps)?);
+    // int(P.get('partial_rotary_factor', 1.0) * n_embd) // n_head
+    let partial = p.get("partial_rotary_factor").and_then(Value::as_f64).unwrap_or(1.0);
+    let embd = n_embd.as_f64().ok_or_else(|| msg("hidden_size is not a number"))?;
+    let heads = n_head.as_u64().filter(|heads| *heads > 0).ok_or_else(|| msg("num_attention_heads is not a positive integer"))?;
+    let rope_dim = (partial * embd).trunc() as u64 / heads;
+    set(out, key("rope.dimension_count"), MetaValue::U32(rope_dim as u32));
+    let theta = r
+        .get("rope_theta")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| msg(format!("config.json has no rope_theta, which llama.cpp's {class} needs")))?;
+    set(out, key("rope.freq_base"), as_f32(&key("rope.freq_base"), theta)?);
+    let window = match map.get("sliding_window") {
+        None | Some(Value::Null) => MetaValue::U32(0),
+        Some(value) => u32_of("attention.sliding_window", value)?,
+    };
+    set(out, key("attention.sliding_window"), window);
+    let long = p.get("long_factor").and_then(Value::as_array).filter(|items| !items.is_empty());
+    if let Some(long) = long {
+        let scale = context.as_f64().ok_or_else(|| msg("context length is not a number"))?
+            / original.as_f64().filter(|value| *value > 0.0).ok_or_else(|| msg("original_max_position_embeddings is not positive"))?;
+        let original = original.as_f64().unwrap_or(1.0);
+        let kind = p
+            .get("rope_type")
+            .and_then(Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .ok_or_else(|| msg(format!("rope_scaling has long_factor but no type, which llama.cpp's {class} needs")))?
+            .to_lowercase();
+        let factor = match kind.as_str() {
+            "su" | "longrope" if scale > 1.0 => (1.0 + scale.ln() / original.ln()).sqrt(),
+            "yarn" if scale > 1.0 => 0.1 * scale.ln() + 1.0,
+            "su" | "longrope" | "yarn" => 1.0,
+            other => {
+                return Err(msg(format!(
+                    "rope_scaling type {other} with long_factor is not su, longrope, or yarn; llama.cpp's {class} stops there too"
+                )))
+            }
+        };
+        set(out, key("rope.scaling.attn_factor"), MetaValue::F32(factor as f32));
+        let short = p.get("short_factor").and_then(Value::as_array);
+        let half = (rope_dim / 2) as usize;
+        if long.len() != half || short.map(Vec::len) != Some(half) {
+            return Err(msg(format!(
+                "rope_scaling long_factor and short_factor must each have rope.dimension_count / 2 = {half} items; llama.cpp's {class} stops there too"
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct Ctx<'a> {
+    map: &'a Map<String, Value>,
+    p: &'a Map<String, Value>,
+    dir: &'a std::path::Path,
+    arch: &'a str,
+    depth: usize,
+}
+
+impl Ctx<'_> {
+    fn key(&self, template: &str) -> String {
+        template.replace("{arch}", self.arch)
+    }
+
+    /// The writes of one indexed method, and the self calls it makes, in line order.
+    fn method(&mut self, name: &str, found: &mut ClassKeys) -> Result<()> {
+        let Some(record) = index()["methods"].get(name) else {
+            return Ok(());
+        };
+        self.depth += 1;
+        if self.depth > 16 {
+            return Err(msg(format!("{name}: self calls nest too deeply")));
+        }
+        let locals = record.get("locals").and_then(Value::as_object);
+        let mut steps: Vec<(u64, &Value, bool)> = Vec::new();
+        for write in record["writes"].as_array().into_iter().flatten() {
+            steps.push((write["line"].as_u64().unwrap_or(0), write, true));
+        }
+        for call in record["self_calls"].as_array().into_iter().flatten() {
+            steps.push((call["line"].as_u64().unwrap_or(0), call, false));
+        }
+        steps.sort_by_key(|step| step.0);
+        for (_, step, is_write) in steps {
+            let mut eval = Eval { ctx: self, locals, vars: Default::default(), depth: 0 };
+            let guard = step["when"].as_str().unwrap_or("always");
+            let holds = if guard == "always" { Ok(true) } else { eval.expr(guard).map(|value| truthy(&value)) };
+            if is_write {
+                let template = step["key"].as_str().unwrap_or("");
+                if template.starts_with("general.") || template.starts_with("tokenizer.") {
+                    continue;
+                }
+                let key = self.key(template);
+                let value = match holds {
+                    Ok(false) => continue,
+                    Ok(true) => step["value"]
+                        .as_str()
+                        .ok_or(Unknown)
+                        .and_then(|text| eval.expr(text))
+                        .and_then(|value| to_meta(&value, step["type"].as_str().unwrap_or(""))),
+                    Err(Unknown) => Err(Unknown),
+                };
+                match value {
+                    Ok(value) => set(&mut found.keys, key, value),
+                    Err(Unknown) => {
+                        if !found.unevaluated.contains(&key) {
+                            found.unevaluated.push(key);
+                        }
+                    }
+                }
+            } else {
+                let Some(target) = step["resolves_to"].as_str() else {
+                    continue;
+                };
+                match holds {
+                    Ok(false) => {}
+                    Ok(true) => self.method(target, found)?,
+                    Err(Unknown) => {
+                        // The call may or may not run: none of its keys can be evaluated.
+                        let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
+                        self.method(target, &mut skipped)?;
+                        for key in skipped.keys.into_iter().map(|(key, _)| key).chain(skipped.unevaluated) {
+                            if !found.unevaluated.contains(&key) {
+                                found.unevaluated.push(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.depth -= 1;
+        Ok(())
+    }
+}
+
+/// A guard or value the evaluator cannot decide from the config.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Unknown;
+
+type Ev<T> = std::result::Result<T, Unknown>;
+
+#[derive(Debug, Clone, PartialEq)]
+enum V {
+    J(Value),
+    Path(std::path::PathBuf),
+    SelfObj,
+    Builtin(&'static str),
+    Bound(Box<V>, String),
+}
+
+fn truthy(value: &V) -> bool {
+    match value {
+        V::J(Value::Null) => false,
+        V::J(Value::Bool(flag)) => *flag,
+        V::J(Value::Number(number)) => number.as_f64().is_some_and(|number| number != 0.0),
+        V::J(Value::String(text)) => !text.is_empty(),
+        V::J(Value::Array(items)) => !items.is_empty(),
+        V::J(Value::Object(map)) => !map.is_empty(),
+        _ => true,
+    }
+}
+
+/// A Python value as the GGUF type the index gives. Arrays and enum
+/// constants are not converted.
+fn to_meta(value: &V, kind: &str) -> Ev<MetaValue> {
+    let V::J(value) = value else { return Err(Unknown) };
+    match kind {
+        "u32" | "u32 or array" => value
+            .as_u64()
+            .and_then(|number| u32::try_from(number).ok())
+            .map(MetaValue::U32)
+            .ok_or(Unknown),
+        "i32" => value
+            .as_i64()
+            .and_then(|number| i32::try_from(number).ok())
+            .map(MetaValue::I32)
+            .ok_or(Unknown),
+        "f32" => value.as_f64().map(|number| MetaValue::F32(number as f32)).ok_or(Unknown),
+        "bool" => value.as_bool().map(MetaValue::Bool).ok_or(Unknown),
+        "string" | "string or array" => value.as_str().map(|text| MetaValue::String(text.into())).ok_or(Unknown),
+        _ => Err(Unknown),
+    }
+}
+
+struct Eval<'c, 'a> {
+    ctx: &'c Ctx<'a>,
+    locals: Option<&'static Map<String, Value>>,
+    vars: std::collections::HashMap<String, V>,
+    depth: usize,
+}
+
+impl Eval<'_, '_> {
+    fn expr(&mut self, text: &str) -> Ev<V> {
+        let tokens = lex(text).ok_or(Unknown)?;
+        let mut parser = Parser { tokens, at: 0 };
+        let tree = parser.named().ok_or(Unknown)?;
+        if parser.at != parser.tokens.len() {
+            return Err(Unknown);
+        }
+        self.eval(&tree)
+    }
+
+    fn name(&mut self, name: &str) -> Ev<V> {
+        if let Some(value) = self.vars.get(name) {
+            return Ok(value.clone());
+        }
+        match name {
+            "self" => return Ok(V::SelfObj),
+            "int" | "float" | "len" | "bool" | "str" | "abs" | "min" | "max" => {
+                return Ok(V::Builtin(match name {
+                    "int" => "int",
+                    "float" => "float",
+                    "len" => "len",
+                    "bool" => "bool",
+                    "str" => "str",
+                    "abs" => "abs",
+                    "min" => "min",
+                    _ => "max",
+                }))
+            }
+            _ => {}
+        }
+        // A local with one assignment in the method is that expression. With
+        // more than one, which applies depends on code the index does not give.
+        let assigned = self
+            .locals
+            .and_then(|locals| locals.get(name))
+            .and_then(Value::as_array)
+            .ok_or(Unknown)?;
+        let [only] = assigned.as_slice() else { return Err(Unknown) };
+        let text = only.as_str().ok_or(Unknown)?;
+        let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
+        self.depth += 1;
+        if self.depth > 16 {
+            return Err(Unknown);
+        }
+        let value = self.expr(text);
+        self.depth -= 1;
+        let value = value?;
+        self.vars.insert(name.to_string(), value.clone());
+        Ok(value)
+    }
+
+    fn attr(&mut self, base: V, name: &str) -> Ev<V> {
+        match (&base, name) {
+            (V::SelfObj, "hparams") => Ok(V::J(Value::Object(self.ctx.map.clone()))),
+            (V::SelfObj, "rope_parameters") => Ok(V::J(Value::Object(self.ctx.p.clone()))),
+            (V::SelfObj, "dir_model") => Ok(V::Path(self.ctx.dir.to_path_buf())),
+            (V::SelfObj, "block_count") => first_present(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
+                .map(|value| V::J(value.clone()))
+                .ok_or(Unknown),
+            // tensconv reads a Hugging Face config.json checkpoint, never the
+            // Mistral params.json format (hf_config_to_gguf vocab_size row).
+            (V::SelfObj, "is_mistral_format") => Ok(V::J(Value::Bool(false))),
+            (V::SelfObj, "find_hparam") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::J(Value::Object(_)), "get") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::Path(_), "is_file" | "exists") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::J(Value::String(_)), "endswith" | "startswith" | "lower") => Ok(V::Bound(Box::new(base), name.into())),
+            _ => Err(Unknown),
+        }
+    }
+
+    fn call(&mut self, func: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> Ev<V> {
+        let json = |value: &V| match value {
+            V::J(value) => Ok(value.clone()),
+            _ => Err(Unknown),
+        };
+        match func {
+            V::Bound(base, method) => match (*base, method.as_str()) {
+                (V::J(Value::Object(map)), "get") => {
+                    let key = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                    let key = key.as_str().ok_or(Unknown)?;
+                    match map.get(key) {
+                        Some(value) => Ok(V::J(value.clone())),
+                        None => Ok(args.get(1).cloned().unwrap_or(V::J(Value::Null))),
+                    }
+                }
+                (V::SelfObj, "find_hparam") => {
+                    let names = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                    let optional = kwargs
+                        .iter()
+                        .find(|(name, _)| name == "optional")
+                        .map(|(_, value)| truthy(value))
+                        .unwrap_or(false);
+                    for name in names.as_array().ok_or(Unknown)? {
+                        if let Some(value) = name.as_str().and_then(|name| self.ctx.map.get(name)) {
+                            return Ok(V::J(value.clone()));
+                        }
+                    }
+                    if optional {
+                        Ok(V::J(Value::Null))
+                    } else {
+                        Err(Unknown)
+                    }
+                }
+                (V::Path(path), "is_file") => Ok(V::J(Value::Bool(path.is_file()))),
+                (V::Path(path), "exists") => Ok(V::J(Value::Bool(path.exists()))),
+                (V::J(Value::String(text)), "endswith" | "startswith") => {
+                    let affix = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                    let affix = affix.as_str().ok_or(Unknown)?;
+                    let hit = if method == "endswith" { text.ends_with(affix) } else { text.starts_with(affix) };
+                    Ok(V::J(Value::Bool(hit)))
+                }
+                (V::J(Value::String(text)), "lower") => Ok(V::J(Value::String(text.to_lowercase()))),
+                _ => Err(Unknown),
+            },
+            V::Builtin(name) => {
+                let first = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                match name {
+                    "int" => match &first {
+                        Value::Number(number) if number.is_i64() || number.is_u64() => Ok(V::J(first.clone())),
+                        Value::Number(number) => Ok(V::J(Value::from(number.as_f64().ok_or(Unknown)?.trunc() as i64))),
+                        Value::Bool(flag) => Ok(V::J(Value::from(i64::from(*flag)))),
+                        Value::String(text) => text.trim().parse::<i64>().map(|number| V::J(Value::from(number))).map_err(|_| Unknown),
+                        _ => Err(Unknown),
+                    },
+                    "float" => match &first {
+                        Value::Number(number) => Ok(V::J(Value::from(number.as_f64().ok_or(Unknown)?))),
+                        Value::String(text) => text.trim().parse::<f64>().map(|number| V::J(Value::from(number))).map_err(|_| Unknown),
+                        _ => Err(Unknown),
+                    },
+                    "len" => match &first {
+                        Value::Array(items) => Ok(V::J(Value::from(items.len()))),
+                        Value::String(text) => Ok(V::J(Value::from(text.chars().count()))),
+                        Value::Object(map) => Ok(V::J(Value::from(map.len()))),
+                        _ => Err(Unknown),
+                    },
+                    "bool" => Ok(V::J(Value::Bool(truthy(&V::J(first))))),
+                    "str" => match first {
+                        Value::String(text) => Ok(V::J(Value::String(text))),
+                        _ => Err(Unknown),
+                    },
+                    "abs" => match first.as_i64() {
+                        Some(number) => Ok(V::J(Value::from(number.abs()))),
+                        None => Ok(V::J(Value::from(first.as_f64().ok_or(Unknown)?.abs()))),
+                    },
+                    _ => {
+                        // min and max of numbers, given separately or as one list.
+                        let items: Vec<Value> = if args.len() == 1 {
+                            first.as_array().cloned().ok_or(Unknown)?
+                        } else {
+                            args.iter().map(json).collect::<Ev<_>>()?
+                        };
+                        let mut best: Option<Value> = None;
+                        for item in items {
+                            let number = item.as_f64().ok_or(Unknown)?;
+                            let better = match &best {
+                                None => true,
+                                Some(seen) => {
+                                    let seen = seen.as_f64().ok_or(Unknown)?;
+                                    if name == "min" { number < seen } else { number > seen }
+                                }
+                            };
+                            if better {
+                                best = Some(item);
+                            }
+                        }
+                        best.map(V::J).ok_or(Unknown)
+                    }
+                }
+            }
+            _ => Err(Unknown),
+        }
+    }
+
+    fn eval(&mut self, tree: &E) -> Ev<V> {
+        match tree {
+            E::Const(value) => Ok(V::J(value.clone())),
+            E::Name(name) => self.name(name),
+            E::Attr(base, name) => {
+                let base = self.eval(base)?;
+                self.attr(base, name)
+            }
+            E::Index(base, index) => {
+                let base = self.eval(base)?;
+                let index = self.eval(index)?;
+                match (base, index) {
+                    (V::J(Value::Object(map)), V::J(Value::String(key))) => map.get(&key).cloned().map(V::J).ok_or(Unknown),
+                    (V::J(Value::Array(items)), V::J(Value::Number(number))) => {
+                        let at = number.as_i64().ok_or(Unknown)?;
+                        let at = if at < 0 { items.len() as i64 + at } else { at };
+                        usize::try_from(at).ok().and_then(|at| items.get(at)).cloned().map(V::J).ok_or(Unknown)
+                    }
+                    _ => Err(Unknown),
+                }
+            }
+            E::Slice(base, start, end) => {
+                let V::J(Value::Array(items)) = self.eval(base)? else { return Err(Unknown) };
+                let bound = |this: &mut Self, part: &Option<Box<E>>, default: usize| -> Ev<usize> {
+                    match part {
+                        None => Ok(default),
+                        Some(part) => match this.eval(part)? {
+                            V::J(Value::Number(number)) => {
+                                let at = number.as_i64().ok_or(Unknown)?;
+                                let at = if at < 0 { (items.len() as i64 + at).max(0) } else { at };
+                                Ok((at as usize).min(items.len()))
+                            }
+                            _ => Err(Unknown),
+                        },
+                    }
+                };
+                let from = bound(self, start, 0)?;
+                let to = bound(self, end, items.len())?;
+                Ok(V::J(Value::Array(items.get(from..to.max(from)).unwrap_or(&[]).to_vec())))
+            }
+            E::Call(func, args, kwargs) => {
+                let func = self.eval(func)?;
+                let args = args.iter().map(|arg| self.eval(arg)).collect::<Ev<Vec<_>>>()?;
+                let kwargs = kwargs
+                    .iter()
+                    .map(|(name, arg)| Ok((name.clone(), self.eval(arg)?)))
+                    .collect::<Ev<Vec<_>>>()?;
+                self.call(func, args, kwargs)
+            }
+            E::Not(inner) => Ok(V::J(Value::Bool(!truthy(&self.eval(inner)?)))),
+            E::Neg(inner) => match self.eval(inner)? {
+                V::J(Value::Number(number)) => match number.as_i64() {
+                    Some(number) => Ok(V::J(Value::from(-number))),
+                    None => Ok(V::J(Value::from(-number.as_f64().ok_or(Unknown)?))),
+                },
+                _ => Err(Unknown),
+            },
+            E::Bin(op, left, right) => {
+                let left = self.eval(left)?;
+                let right = self.eval(right)?;
+                arith(op, &left, &right)
+            }
+            E::Cmp(first, rest) => {
+                let mut left = self.eval(first)?;
+                for (op, right) in rest {
+                    let right = self.eval(right)?;
+                    if !compare(op, &left, &right)? {
+                        return Ok(V::J(Value::Bool(false)));
+                    }
+                    left = right;
+                }
+                Ok(V::J(Value::Bool(true)))
+            }
+            // Three-valued: an operand that decides the result decides it even
+            // when an earlier operand is unknown.
+            E::And(items) | E::Or(items) => {
+                let want = matches!(tree, E::Or(_));
+                let mut unknown = false;
+                let mut last = V::J(Value::Null);
+                for item in items {
+                    match self.eval(item) {
+                        Ok(value) if truthy(&value) == want => return Ok(value),
+                        Ok(value) => last = value,
+                        Err(Unknown) => unknown = true,
+                    }
+                }
+                if unknown {
+                    Err(Unknown)
+                } else {
+                    Ok(last)
+                }
+            }
+            E::IfExp(then, cond, other) => match self.eval(cond) {
+                Ok(value) if truthy(&value) => self.eval(then),
+                Ok(_) => self.eval(other),
+                Err(Unknown) => {
+                    let then = self.eval(then)?;
+                    if self.eval(other)? == then {
+                        Ok(then)
+                    } else {
+                        Err(Unknown)
+                    }
+                }
+            },
+            E::Walrus(name, inner) => {
+                let value = self.eval(inner)?;
+                self.vars.insert(name.clone(), value.clone());
+                Ok(value)
+            }
+            E::List(items) => Ok(V::J(Value::Array(
+                items
+                    .iter()
+                    .map(|item| match self.eval(item)? {
+                        V::J(value) => Ok(value),
+                        _ => Err(Unknown),
+                    })
+                    .collect::<Ev<_>>()?,
+            ))),
+            E::Dict(items) => {
+                let mut map = Map::new();
+                for (key, value) in items {
+                    let V::J(Value::String(key)) = self.eval(key)? else { return Err(Unknown) };
+                    let V::J(value) = self.eval(value)? else { return Err(Unknown) };
+                    map.insert(key, value);
+                }
+                Ok(V::J(Value::Object(map)))
+            }
+            E::BinPath(left, right) => match (self.eval(left)?, self.eval(right)?) {
+                (V::Path(path), V::J(Value::String(part))) => Ok(V::Path(path.join(part))),
+                (left, right) => arith("/", &left, &right),
+            },
+        }
+    }
+}
+
+fn number(value: &V) -> Ev<(Option<i64>, f64)> {
+    match value {
+        V::J(Value::Number(number)) => Ok((number.as_i64(), number.as_f64().ok_or(Unknown)?)),
+        V::J(Value::Bool(flag)) => Ok((Some(i64::from(*flag)), f64::from(u8::from(*flag)))),
+        _ => Err(Unknown),
+    }
+}
+
+fn arith(op: &str, left: &V, right: &V) -> Ev<V> {
+    if op == "+" {
+        if let (V::J(Value::String(a)), V::J(Value::String(b))) = (left, right) {
+            return Ok(V::J(Value::String(format!("{a}{b}"))));
+        }
+    }
+    let (left_int, a) = number(left)?;
+    let (right_int, b) = number(right)?;
+    let ints = left_int.zip(right_int);
+    let value = match (op, ints) {
+        ("+", Some((x, y))) => Value::from(x.checked_add(y).ok_or(Unknown)?),
+        ("-", Some((x, y))) => Value::from(x.checked_sub(y).ok_or(Unknown)?),
+        ("*", Some((x, y))) => Value::from(x.checked_mul(y).ok_or(Unknown)?),
+        ("//", Some((x, y))) if y != 0 => Value::from(x.div_euclid(y) - i64::from(x.rem_euclid(y) != 0 && y < 0)),
+        ("%", Some((x, y))) if y != 0 => Value::from(x - y * (x as f64 / y as f64).floor() as i64),
+        ("+", None) => Value::from(a + b),
+        ("-", None) => Value::from(a - b),
+        ("*", None) => Value::from(a * b),
+        ("/", _) if b != 0.0 => Value::from(a / b),
+        ("//", None) if b != 0.0 => Value::from((a / b).floor()),
+        _ => return Err(Unknown),
+    };
+    Ok(V::J(value))
+}
+
+fn compare(op: &str, left: &V, right: &V) -> Ev<bool> {
+    let (V::J(a), V::J(b)) = (left, right) else { return Err(Unknown) };
+    let equal = |a: &Value, b: &Value| match (a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y)) if a.is_number() && b.is_number() => x == y,
+        _ => a == b,
+    };
+    match op {
+        "==" => Ok(equal(a, b)),
+        "!=" => Ok(!equal(a, b)),
+        // `is` is used with None, True, and False only.
+        "is" => Ok(a == b && (b.is_null() || b.is_boolean())),
+        "is not" => Ok(!(a == b && (b.is_null() || b.is_boolean()))),
+        "in" | "not in" => {
+            let hit = match b {
+                Value::Array(items) => items.iter().any(|item| equal(item, a)),
+                Value::Object(map) => a.as_str().is_some_and(|key| map.contains_key(key)),
+                Value::String(text) => a.as_str().is_some_and(|part| text.contains(part)),
+                _ => return Err(Unknown),
+            };
+            Ok(hit == (op == "in"))
+        }
+        "<" | ">" | "<=" | ">=" => {
+            let (x, y) = (a.as_f64().ok_or(Unknown)?, b.as_f64().ok_or(Unknown)?);
+            Ok(match op {
+                "<" => x < y,
+                ">" => x > y,
+                "<=" => x <= y,
+                _ => x >= y,
+            })
+        }
+        _ => Err(Unknown),
+    }
+}
+
+/// The Python expression subset the index uses for guards and values.
+#[derive(Debug, Clone)]
+enum E {
+    Const(Value),
+    Name(String),
+    Attr(Box<E>, String),
+    Index(Box<E>, Box<E>),
+    Slice(Box<E>, Option<Box<E>>, Option<Box<E>>),
+    Call(Box<E>, Vec<E>, Vec<(String, E)>),
+    Not(Box<E>),
+    Neg(Box<E>),
+    Bin(&'static str, Box<E>, Box<E>),
+    BinPath(Box<E>, Box<E>),
+    Cmp(Box<E>, Vec<(&'static str, E)>),
+    And(Vec<E>),
+    Or(Vec<E>),
+    IfExp(Box<E>, Box<E>, Box<E>),
+    Walrus(String, Box<E>),
+    List(Vec<E>),
+    Dict(Vec<(E, E)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Name(String),
+    Num(Value),
+    Str(String),
+    Op(&'static str),
+}
+
+fn lex(text: &str) -> Option<Vec<Tok>> {
+    const OPS: &[&str] = &[
+        ":=", "==", "!=", "<=", ">=", "//", "**", "(", ")", "[", "]", "{", "}", ",", ":", ".", "<", ">", "+", "-",
+        "*", "/", "%", "&", "|",
+    ];
+    let chars: Vec<char> = text.chars().collect();
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if c.is_whitespace() {
+            at += 1;
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = at;
+            while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '_') {
+                at += 1;
+            }
+            tokens.push(Tok::Name(chars[start..at].iter().collect()));
+        } else if c.is_ascii_digit() || (c == '.' && chars.get(at + 1).is_some_and(char::is_ascii_digit)) {
+            let start = at;
+            while at < chars.len()
+                && (chars[at].is_ascii_alphanumeric() || chars[at] == '.' || chars[at] == '_'
+                    || ((chars[at] == '-' || chars[at] == '+') && matches!(chars[at - 1], 'e' | 'E')))
+            {
+                at += 1;
+            }
+            let word: String = chars[start..at].iter().filter(|c| **c != '_').collect();
+            let value = match word.parse::<i64>() {
+                Ok(number) => Value::from(number),
+                Err(_) => Value::from(word.parse::<f64>().ok()?),
+            };
+            tokens.push(Tok::Num(value));
+        } else if c == '\'' || c == '"' {
+            let mut out = String::new();
+            at += 1;
+            loop {
+                let next = *chars.get(at)?;
+                at += 1;
+                if next == c {
+                    break;
+                }
+                if next == '\\' {
+                    let escaped = *chars.get(at)?;
+                    at += 1;
+                    out.push(match escaped {
+                        'n' => '\n',
+                        't' => '\t',
+                        other => other,
+                    });
+                } else {
+                    out.push(next);
+                }
+            }
+            // Adjacent literals join, as in Python.
+            if let Some(Tok::Str(previous)) = tokens.last_mut() {
+                previous.push_str(&out);
+            } else {
+                tokens.push(Tok::Str(out));
+            }
+        } else {
+            let op = OPS.iter().find(|op| {
+                let len = op.chars().count();
+                chars.get(at..at + len).is_some_and(|slice| slice.iter().copied().eq(op.chars()))
+            });
+            match op {
+                Some(op) => {
+                    at += op.chars().count();
+                    tokens.push(Tok::Op(op));
+                }
+                None if c == '=' => {
+                    at += 1;
+                    tokens.push(Tok::Op("kw="));
+                }
+                None => return None,
+            }
+        }
+    }
+    Some(tokens)
+}
+
+struct Parser {
+    tokens: Vec<Tok>,
+    at: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Tok> {
+        self.tokens.get(self.at)
+    }
+
+    fn eat_op(&mut self, op: &str) -> bool {
+        if matches!(self.peek(), Some(Tok::Op(seen)) if *seen == op) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_word(&mut self, word: &str) -> bool {
+        if matches!(self.peek(), Some(Tok::Name(seen)) if seen == word) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// NAME ':=' test, or test.
+    fn named(&mut self) -> Option<E> {
+        if let (Some(Tok::Name(name)), Some(Tok::Op(":="))) = (self.tokens.get(self.at), self.tokens.get(self.at + 1)) {
+            let name = name.clone();
+            self.at += 2;
+            return Some(E::Walrus(name, Box::new(self.test()?)));
+        }
+        self.test()
+    }
+
+    fn test(&mut self) -> Option<E> {
+        let body = self.or_test()?;
+        if self.eat_word("if") {
+            let cond = self.or_test()?;
+            if !self.eat_word("else") {
+                return None;
+            }
+            let other = self.test()?;
+            return Some(E::IfExp(Box::new(body), Box::new(cond), Box::new(other)));
+        }
+        Some(body)
+    }
+
+    fn or_test(&mut self) -> Option<E> {
+        let mut items = vec![self.and_test()?];
+        while self.eat_word("or") {
+            items.push(self.and_test()?);
+        }
+        Some(if items.len() == 1 { items.pop()? } else { E::Or(items) })
+    }
+
+    fn and_test(&mut self) -> Option<E> {
+        let mut items = vec![self.not_test()?];
+        while self.eat_word("and") {
+            items.push(self.not_test()?);
+        }
+        Some(if items.len() == 1 { items.pop()? } else { E::And(items) })
+    }
+
+    fn not_test(&mut self) -> Option<E> {
+        if self.eat_word("not") {
+            return Some(E::Not(Box::new(self.not_test()?)));
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Option<E> {
+        let first = self.arith()?;
+        let mut rest = Vec::new();
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Op(op)) if matches!(*op, "==" | "!=" | "<" | ">" | "<=" | ">=") => {
+                    let op = *op;
+                    self.at += 1;
+                    op
+                }
+                Some(Tok::Name(word)) if word == "in" => {
+                    self.at += 1;
+                    "in"
+                }
+                Some(Tok::Name(word)) if word == "not" && matches!(self.tokens.get(self.at + 1), Some(Tok::Name(next)) if next == "in") => {
+                    self.at += 2;
+                    "not in"
+                }
+                Some(Tok::Name(word)) if word == "is" => {
+                    self.at += 1;
+                    if self.eat_word("not") {
+                        "is not"
+                    } else {
+                        "is"
+                    }
+                }
+                _ => break,
+            };
+            rest.push((op, self.arith()?));
+        }
+        Some(if rest.is_empty() { first } else { E::Cmp(Box::new(first), rest) })
+    }
+
+    fn arith(&mut self) -> Option<E> {
+        let mut left = self.term()?;
+        loop {
+            let op = if self.eat_op("+") {
+                "+"
+            } else if self.eat_op("-") {
+                "-"
+            } else {
+                return Some(left);
+            };
+            left = E::Bin(op, Box::new(left), Box::new(self.term()?));
+        }
+    }
+
+    fn term(&mut self) -> Option<E> {
+        let mut left = self.factor()?;
+        loop {
+            if self.eat_op("//") {
+                left = E::Bin("//", Box::new(left), Box::new(self.factor()?));
+            } else if self.eat_op("/") {
+                left = E::BinPath(Box::new(left), Box::new(self.factor()?));
+            } else if self.eat_op("*") {
+                left = E::Bin("*", Box::new(left), Box::new(self.factor()?));
+            } else if self.eat_op("%") {
+                left = E::Bin("%", Box::new(left), Box::new(self.factor()?));
+            } else {
+                return Some(left);
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<E> {
+        if self.eat_op("-") {
+            return Some(E::Neg(Box::new(self.factor()?)));
+        }
+        if self.eat_op("+") {
+            return self.factor();
+        }
+        let base = self.atom_expr()?;
+        if matches!(self.peek(), Some(Tok::Op("**"))) {
+            return None;
+        }
+        Some(base)
+    }
+
+    fn atom_expr(&mut self) -> Option<E> {
+        let mut base = self.atom()?;
+        loop {
+            if self.eat_op(".") {
+                let Some(Tok::Name(name)) = self.peek().cloned() else { return None };
+                self.at += 1;
+                base = E::Attr(Box::new(base), name);
+            } else if self.eat_op("(") {
+                let mut args = Vec::new();
+                let mut kwargs = Vec::new();
+                while !self.eat_op(")") {
+                    if let Some(kw) = self.keyword_arg() {
+                        kwargs.push(kw);
+                    } else {
+                        args.push(self.named()?);
+                    }
+                    if !self.eat_op(",") {
+                        if !self.eat_op(")") {
+                            return None;
+                        }
+                        break;
+                    }
+                }
+                base = E::Call(Box::new(base), args, kwargs);
+            } else if self.eat_op("[") {
+                let start = if matches!(self.peek(), Some(Tok::Op(":"))) { None } else { Some(Box::new(self.test()?)) };
+                if self.eat_op(":") {
+                    let end = if matches!(self.peek(), Some(Tok::Op("]"))) { None } else { Some(Box::new(self.test()?)) };
+                    if !self.eat_op("]") {
+                        return None;
+                    }
+                    base = E::Slice(Box::new(base), start, end);
+                } else {
+                    if !self.eat_op("]") {
+                        return None;
+                    }
+                    base = E::Index(Box::new(base), start?);
+                }
+            } else {
+                return Some(base);
+            }
+        }
+    }
+
+    /// NAME '=' test inside a call, such as `optional=True`. The lexer gives
+    /// a lone '=' as the token `kw=`.
+    fn keyword_arg(&mut self) -> Option<(String, E)> {
+        if let (Some(Tok::Name(name)), Some(Tok::Op("kw="))) = (self.tokens.get(self.at), self.tokens.get(self.at + 1)) {
+            let name = name.clone();
+            self.at += 2;
+            let value = self.test()?;
+            return Some((name, value));
+        }
+        None
+    }
+
+    fn atom(&mut self) -> Option<E> {
+        let token = self.peek()?.clone();
+        self.at += 1;
+        match token {
+            Tok::Num(value) => Some(E::Const(value)),
+            Tok::Str(text) => Some(E::Const(Value::String(text))),
+            Tok::Name(name) => match name.as_str() {
+                "None" => Some(E::Const(Value::Null)),
+                "True" => Some(E::Const(Value::Bool(true))),
+                "False" => Some(E::Const(Value::Bool(false))),
+                "not" | "and" | "or" | "in" | "is" | "if" | "else" | "for" | "lambda" => None,
+                _ => Some(E::Name(name)),
+            },
+            Tok::Op("(") => {
+                if self.eat_op(")") {
+                    return Some(E::List(Vec::new()));
+                }
+                let first = self.named()?;
+                if self.eat_op(")") {
+                    return Some(first);
+                }
+                let mut items = vec![first];
+                while self.eat_op(",") {
+                    if self.eat_op(")") {
+                        return Some(E::List(items));
+                    }
+                    items.push(self.named()?);
+                }
+                if !self.eat_op(")") {
+                    return None;
+                }
+                Some(E::List(items))
+            }
+            Tok::Op("[") => {
+                let mut items = Vec::new();
+                while !self.eat_op("]") {
+                    items.push(self.named()?);
+                    if matches!(self.peek(), Some(Tok::Name(word)) if word == "for") {
+                        return None;
+                    }
+                    if !self.eat_op(",") {
+                        if !self.eat_op("]") {
+                            return None;
+                        }
+                        break;
+                    }
+                }
+                Some(E::List(items))
+            }
+            Tok::Op("{") => {
+                let mut items = Vec::new();
+                while !self.eat_op("}") {
+                    let key = self.test()?;
+                    if !self.eat_op(":") {
+                        return None;
+                    }
+                    items.push((key, self.test()?));
+                    if !self.eat_op(",") {
+                        if !self.eat_op("}") {
+                            return None;
+                        }
+                        break;
+                    }
+                }
+                Some(E::Dict(items))
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +1327,114 @@ mod tests {
 
     fn get<'a>(out: &'a [(String, MetaValue)], key: &str) -> Option<&'a MetaValue> {
         out.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+    }
+
+    fn eval_in(config_text: &str, expr: &str) -> Ev<V> {
+        let map = config(config_text);
+        let (p, _) = rope_params(Some(&map));
+        let dir = std::path::Path::new("/nonexistent");
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, vars: Default::default(), depth: 0 };
+        eval.expr(expr)
+    }
+
+    #[test]
+    fn the_evaluator_reads_the_config_and_admits_what_it_cannot() {
+        let config = r#"{"a": 3, "b": null, "f": 2.5, "s": "Yarn", "l": [1, 2, 3]}"#;
+        let yes = |expr: &str| assert_eq!(eval_in(config, expr), Ok(V::J(Value::Bool(true))), "{expr}");
+        yes("self.hparams['a'] == 3");
+        yes("self.hparams.get('b') is None");
+        yes("self.hparams.get('missing', 7) == 7");
+        yes("(x := self.find_hparam(['zz', 'a'], optional=True)) is not None and x // 2 == 1");
+        yes("self.find_hparam(['zz'], optional=True) is None");
+        yes("int(self.hparams['f'] * 2) == 5");
+        yes("self.hparams['s'].lower() in ('yarn', 'linear')");
+        yes("len(self.hparams['l'][:2]) == 2 and self.hparams['l'][-1] == 3");
+        yes("'a' in self.hparams and 'zz' not in self.hparams");
+        yes("not (self.dir_model / 'x.json').is_file()");
+        yes("(1 if self.hparams['a'] > 2 else 0) == 1");
+        yes("self.is_mistral_format is False");
+        // A KeyError, an unknown attribute, or a missing find_hparam is unknown.
+        assert_eq!(eval_in(config, "self.hparams['zz']"), Err(Unknown));
+        assert_eq!(eval_in(config, "self.something_else"), Err(Unknown));
+        assert_eq!(eval_in(config, "self.find_hparam(['zz'])"), Err(Unknown));
+        assert_eq!(eval_in(config, "gguf.PoolingType.LAST"), Err(Unknown));
+        assert_eq!(eval_in(config, "[x for x in self.hparams['l']]"), Err(Unknown));
+        // An unknown operand does not hide a decided one.
+        assert_eq!(eval_in(config, "self.unknown and False"), Ok(V::J(Value::Bool(false))));
+        assert_eq!(eval_in(config, "self.unknown or self.hparams['a']"), Ok(V::J(Value::from(3))));
+        assert_eq!(eval_in(config, "self.unknown and True"), Err(Unknown));
+    }
+
+    #[test]
+    fn a_class_follows_its_chain_from_the_index() {
+        let dir = std::path::Path::new("/nonexistent");
+        let map = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "vocab_size": 9}"#);
+        let llama = class_keys("LlamaModel", "llama", &map, dir).unwrap();
+        // LlamaModel adds vocab_size to the base rows (not a Mistral-format checkpoint).
+        assert!(llama.keys.iter().any(|(key, value)| key == "llama.vocab_size" && *value == MetaValue::U32(9)));
+        assert!(llama.keys.iter().any(|(key, _)| key == "llama.block_count"));
+        let qwen = class_keys("Qwen2Model", "qwen2", &map, dir).unwrap();
+        assert!(!qwen.keys.iter().any(|(key, _)| key == "qwen2.vocab_size"));
+        // A chain that never reaches TextModel writes none of the base rows.
+        // RWKV6Qwen2Model writes a constant context length and no rope keys.
+        let map = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "max_position_embeddings": 32, "rope_theta": 1.0}"#);
+        let rwkv = class_keys("RWKV6Qwen2Model", "rwkv6qwen2", &map, dir).unwrap();
+        assert!(rwkv.keys.iter().any(|(key, value)| key == "rwkv6qwen2.context_length" && *value == MetaValue::U32(1048576)));
+        assert!(!rwkv.keys.iter().any(|(key, _)| key == "rwkv6qwen2.rope.freq_base"));
+        assert!(class_keys("NoSuchModel", "x", &map, dir).is_err());
+    }
+
+    #[test]
+    fn phi3_writes_its_own_keys_and_attn_factor() {
+        let dir = std::path::Path::new("/nonexistent");
+        let half = "[1.0, 1.0]";
+        let text = format!(
+            r#"{{"max_position_embeddings": 131072, "original_max_position_embeddings": 4096, "hidden_size": 8,
+                "intermediate_size": 16, "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "vocab_size": 9,
+                "rope_scaling": {{"type": "longrope", "long_factor": {half}, "short_factor": {half}}}}}"#
+        );
+        let map = config(&text);
+        let phi = class_keys("Phi3MiniModel", "phi3", &map, dir).unwrap();
+        assert!(phi.unevaluated.is_empty(), "{:?}", phi.unevaluated);
+        let get = |key: &str| phi.keys.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        assert_eq!(get("phi3.rope.scaling.original_context_length"), Some(MetaValue::U32(4096)));
+        assert_eq!(get("phi3.rope.scaling.attn_factor"), Some(MetaValue::F32(1.190_238_1)));
+        assert_eq!(get("phi3.rope.dimension_count"), Some(MetaValue::U32(4)));
+        assert_eq!(get("phi3.attention.sliding_window"), Some(MetaValue::U32(0)));
+        // The base never runs: no scaling type or factor, no vocab_size.
+        assert_eq!(get("phi3.rope.scaling.type"), None);
+        assert_eq!(get("phi3.vocab_size"), None);
+        // Factor lists of the wrong length stop the conversion, as in llama.cpp.
+        let bad = config(&text.replace(r#""short_factor": [1.0, 1.0]"#, r#""short_factor": [1.0]"#));
+        assert!(class_keys("Phi3MiniModel", "phi3", &bad, dir).is_err());
+        let moe = config(&text.replace("\"vocab_size\": 9", "\"num_local_experts\": 16, \"num_experts_per_tok\": 2"));
+        let moe = class_keys("PhiMoeModel", "phimoe", &moe, dir).unwrap();
+        assert!(moe.keys.iter().any(|(key, value)| key == "phimoe.expert_count" && *value == MetaValue::U32(16)));
+        assert!(moe.keys.iter().any(|(key, _)| key == "phimoe.rope.scaling.attn_factor"));
+    }
+
+    #[test]
+    fn every_index_expression_lexes_or_is_unknown() {
+        // The evaluator must never panic on the index; unparsable text is unknown.
+        let map = config(r#"{"num_hidden_layers": 2}"#);
+        let (p, _) = rope_params(Some(&map));
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", depth: 0 };
+        let mut total = 0;
+        for record in index()["methods"].as_object().unwrap().values() {
+            let locals = record.get("locals").and_then(Value::as_object);
+            for write in record["writes"].as_array().into_iter().flatten() {
+                for field in ["when", "value"] {
+                    if let Some(text) = write[field].as_str() {
+                        let mut eval = Eval { ctx: &ctx, locals, vars: Default::default(), depth: 0 };
+                        let _ = eval.expr(text);
+                        total += 1;
+                    }
+                }
+            }
+        }
+        assert!(total > 3000, "{total}");
     }
 
     #[test]
