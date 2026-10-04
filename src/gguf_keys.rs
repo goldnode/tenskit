@@ -302,6 +302,9 @@ pub(crate) fn class_keys(
         let method = format!("{owner}.set_gguf_parameters");
         let mut ctx = Ctx { map, p: &p, dir, arch, depth: 0 };
         ctx.method(&method, &mut found)?;
+        if owner == "LlamaModel" {
+            llama_rope_dim(arch, map, &mut found)?;
+        }
     }
     Ok(found)
 }
@@ -328,9 +331,98 @@ fn transcribed(owner: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<
             let count = find(map, &["num_local_experts", "num_experts"], owner)?;
             set(out, key("expert_count"), as_u32(&key("expert_count"), count)?);
         }
+        "Gemma2Model" => gemma2(owner, arch, map, out)?,
+        "Gemma3Model" => gemma3(owner, arch, map, out)?,
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// gguf_class_parameters Gemma2Model: a replaced base. Every key is written,
+/// and a missing config value stops the conversion as it stops llama.cpp's.
+fn gemma2(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<()> {
+    let key = |name: &str| format!("{arch}.{name}");
+    let u32_rows: [(&str, &[&str]); 6] = [
+        ("context_length", &["max_position_embeddings"]),
+        ("embedding_length", &["hidden_size"]),
+        ("block_count", &["n_layers", "num_hidden_layers", "n_layer", "num_layers"]),
+        ("feed_forward_length", &["intermediate_size"]),
+        ("attention.head_count", &["num_attention_heads"]),
+        ("attention.head_count_kv", &["num_key_value_heads", "num_attention_heads"]),
+    ];
+    for (name, names) in u32_rows {
+        set(out, key(name), as_u32(&key(name), find(map, names, class)?)?);
+    }
+    let eps = find(map, &["rms_norm_eps"], class)?;
+    set(out, key("attention.layer_norm_rms_epsilon"), as_f32(&key("attention.layer_norm_rms_epsilon"), eps)?);
+    let head_dim = find(map, &["head_dim"], class)?;
+    set(out, key("attention.key_length"), as_u32(&key("attention.key_length"), head_dim)?);
+    set(out, key("attention.value_length"), as_u32(&key("attention.value_length"), head_dim)?);
+    for name in ["attn_logit_softcapping", "final_logit_softcapping"] {
+        set(out, key(name), as_f32(&key(name), find(map, &[name], class)?)?);
+    }
+    let window = find(map, &["sliding_window"], class)?;
+    set(out, key("attention.sliding_window"), as_u32(&key("attention.sliding_window"), window)?);
+    Ok(())
+}
+
+/// gguf_class_parameters Gemma3Model: written after the base rows, with
+/// defaults where the config has no value.
+fn gemma3(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<()> {
+    let key = |name: &str| format!("{arch}.{name}");
+    let or = |name: &str, default: Value| map.get(name).filter(|value| !value.is_null()).cloned().unwrap_or(default);
+    let (_, r) = rope_params(Some(map));
+    set(out, key("context_length"), as_u32(&key("context_length"), &or("max_position_embeddings", Value::from(131072)))?);
+    set(out, key("attention.head_count"), as_u32(&key("attention.head_count"), &or("num_attention_heads", Value::from(8)))?);
+    set(
+        out,
+        key("attention.layer_norm_rms_epsilon"),
+        as_f32(&key("attention.layer_norm_rms_epsilon"), &or("rms_norm_eps", Value::from(1e-6)))?,
+    );
+    let head_dim = or("head_dim", Value::from(256));
+    set(out, key("attention.key_length"), as_u32(&key("attention.key_length"), &head_dim)?);
+    set(out, key("attention.value_length"), as_u32(&key("attention.value_length"), &head_dim)?);
+    let theta = r.get("rope_theta").filter(|value| !value.is_null()).cloned().unwrap_or(Value::from(1_000_000.0));
+    set(out, key("rope.freq_base"), as_f32(&key("rope.freq_base"), &theta)?);
+    if map.get("attn_logit_softcapping").is_some_and(|value| !value.is_null()) {
+        return Err(msg(format!(
+            "config.json sets attn_logit_softcapping, which llama.cpp's {class} asserts is absent"
+        )));
+    }
+    let final_cap = map.get("final_logit_softcapping").filter(|value| {
+        !value.is_null() && value.as_f64() != Some(0.0) && value.as_bool() != Some(false)
+    });
+    if let Some(cap) = final_cap {
+        set(out, key("final_logit_softcapping"), as_f32(&key("final_logit_softcapping"), cap)?);
+    }
+    let pattern_is_one = map.get("sliding_window_pattern").and_then(Value::as_f64) == Some(1.0);
+    if !pattern_is_one {
+        let window = find(map, &["sliding_window"], class)?;
+        set(out, key("attention.sliding_window"), as_u32(&key("attention.sliding_window"), window)?);
+    }
+    set(out, key("attention.head_count_kv"), as_u32(&key("attention.head_count_kv"), &or("num_key_value_heads", Value::from(4)))?);
+    Ok(())
+}
+
+/// hf_config_to_gguf rope.dimension_count: LlamaModel uses head_dim, else
+/// hidden_size // num_attention_heads. The index cannot evaluate it, because
+/// rope_dim is assigned twice there.
+fn llama_rope_dim(arch: &str, map: &Map<String, Value>, found: &mut ClassKeys) -> Result<()> {
+    let key = format!("{arch}.rope.dimension_count");
+    let dim = match map.get("head_dim").filter(|value| !value.is_null()) {
+        Some(dim) => as_u32(&key, dim)?,
+        None => {
+            let hidden = find(map, &["hidden_size"], "LlamaModel")?.as_u64();
+            let heads = find(map, &["num_attention_heads"], "LlamaModel")?.as_u64().filter(|heads| *heads > 0);
+            match hidden.zip(heads) {
+                Some((hidden, heads)) => MetaValue::U32(u32::try_from(hidden / heads).map_err(|_| msg(format!("{key} is too large")))?),
+                None => return Err(msg("hidden_size and num_attention_heads must be positive integers for LlamaModel")),
+            }
+        }
+    };
+    set(&mut found.keys, key.clone(), dim);
+    found.unevaluated.retain(|name| *name != key);
+    Ok(())
 }
 
 /// gguf_class_parameters Phi3MiniModel: a replaced base, and attn_factor
@@ -1369,11 +1461,16 @@ mod tests {
     #[test]
     fn a_class_follows_its_chain_from_the_index() {
         let dir = std::path::Path::new("/nonexistent");
-        let map = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "vocab_size": 9}"#);
+        let map = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2, "vocab_size": 9}"#);
         let llama = class_keys("LlamaModel", "llama", &map, dir).unwrap();
         // LlamaModel adds vocab_size to the base rows (not a Mistral-format checkpoint).
         assert!(llama.keys.iter().any(|(key, value)| key == "llama.vocab_size" && *value == MetaValue::U32(9)));
         assert!(llama.keys.iter().any(|(key, _)| key == "llama.block_count"));
+        // rope.dimension_count is hidden_size // num_attention_heads without head_dim.
+        let map = config(r#"{"num_hidden_layers": 2, "hidden_size": 576, "num_attention_heads": 9, "vocab_size": 9}"#);
+        let llama = class_keys("LlamaModel", "llama", &map, dir).unwrap();
+        assert!(llama.keys.iter().any(|(key, value)| key == "llama.rope.dimension_count" && *value == MetaValue::U32(64)));
+        assert!(llama.unevaluated.is_empty(), "{:?}", llama.unevaluated);
         let qwen = class_keys("Qwen2Model", "qwen2", &map, dir).unwrap();
         assert!(!qwen.keys.iter().any(|(key, _)| key == "qwen2.vocab_size"));
         // A chain that never reaches TextModel writes none of the base rows.
@@ -1413,6 +1510,35 @@ mod tests {
         let moe = class_keys("PhiMoeModel", "phimoe", &moe, dir).unwrap();
         assert!(moe.keys.iter().any(|(key, value)| key == "phimoe.expert_count" && *value == MetaValue::U32(16)));
         assert!(moe.keys.iter().any(|(key, _)| key == "phimoe.rope.scaling.attn_factor"));
+    }
+
+    #[test]
+    fn gemma2_and_gemma3_write_softcapping() {
+        let dir = std::path::Path::new("/nonexistent");
+        let text = r#"{"max_position_embeddings": 8192, "hidden_size": 8, "num_hidden_layers": 2,
+            "intermediate_size": 16, "num_attention_heads": 2, "num_key_value_heads": 1, "rms_norm_eps": 1e-6,
+            "head_dim": 4, "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+            "sliding_window": 4096, "rope_theta": 10000.0, "vocab_size": 9}"#;
+        let gemma2 = class_keys("Gemma2Model", "gemma2", &config(text), dir).unwrap();
+        let get = |found: &ClassKeys, key: &str| found.keys.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        assert_eq!(get(&gemma2, "gemma2.attn_logit_softcapping"), Some(MetaValue::F32(50.0)));
+        assert_eq!(get(&gemma2, "gemma2.final_logit_softcapping"), Some(MetaValue::F32(30.0)));
+        assert_eq!(get(&gemma2, "gemma2.attention.sliding_window"), Some(MetaValue::U32(4096)));
+        assert_eq!(get(&gemma2, "gemma2.rope.freq_base"), None);
+        assert!(class_keys("Gemma2Model", "gemma2", &config(&text.replace("\"head_dim\": 4,", "")), dir).is_err());
+
+        let text3 = text.replace("\"attn_logit_softcapping\": 50.0, ", "");
+        let gemma3 = class_keys("Gemma3Model", "gemma3", &config(&text3), dir).unwrap();
+        assert_eq!(get(&gemma3, "gemma3.final_logit_softcapping"), Some(MetaValue::F32(30.0)));
+        assert_eq!(get(&gemma3, "gemma3.rope.freq_base"), Some(MetaValue::F32(10000.0)));
+        assert_eq!(get(&gemma3, "gemma3.attention.sliding_window"), Some(MetaValue::U32(4096)));
+        // The base rows ran first.
+        assert_eq!(get(&gemma3, "gemma3.feed_forward_length"), Some(MetaValue::U32(16)));
+        let off = text3.replace("\"final_logit_softcapping\": 30.0", "\"final_logit_softcapping\": null, \"sliding_window_pattern\": 1");
+        let gemma3 = class_keys("Gemma3Model", "gemma3", &config(&off), dir).unwrap();
+        assert_eq!(get(&gemma3, "gemma3.final_logit_softcapping"), None);
+        assert_eq!(get(&gemma3, "gemma3.attention.sliding_window"), None);
+        assert!(class_keys("Gemma3Model", "gemma3", &config(text), dir).is_err());
     }
 
     #[test]
