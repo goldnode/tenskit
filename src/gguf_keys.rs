@@ -251,6 +251,59 @@ fn rope_scaling(arch: &str, r: &Map<String, Value>, out: &mut Vec<(String, MetaV
 }
 
 
+/// GGUF-038 and metadata-mapping generation_config_to_gguf: the sampler
+/// defaults from generation_config.json, each written only when its field is
+/// present and not null. A missing or invalid file writes none. A value of
+/// the wrong JSON type is left out and named in the returned warning.
+pub(crate) fn sampling_keys(dir: &std::path::Path) -> (Vec<(String, MetaValue)>, Option<String>) {
+    const ROWS: &[(&str, &str, &[&str])] = &[
+        ("sequence", "string", &["sequence"]),
+        ("top_k", "i32", &["top_k"]),
+        ("top_p", "f32", &["top_p"]),
+        ("min_p", "f32", &["min_p"]),
+        ("xtc_probability", "f32", &["xtc_probability"]),
+        ("xtc_threshold", "f32", &["xtc_threshold"]),
+        ("temp", "f32", &["temperature"]),
+        ("penalty_last_n", "i32", &["penalty_last_n"]),
+        ("penalty_repeat", "f32", &["penalty_repeat", "repetition_penalty"]),
+        ("mirostat", "i32", &["mirostat"]),
+        ("mirostat_tau", "f32", &["mirostat_tau"]),
+        ("mirostat_eta", "f32", &["mirostat_eta"]),
+    ];
+    let Ok(text) = std::fs::read_to_string(dir.join("generation_config.json")) else {
+        return (Vec::new(), None);
+    };
+    let Ok(Value::Object(config)) = serde_json::from_str::<Value>(&text) else {
+        return (Vec::new(), None);
+    };
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, kind, fields) in ROWS {
+        let Some((field, value)) = fields
+            .iter()
+            .find_map(|field| config.get(*field).filter(|value| !value.is_null()).map(|value| (*field, value)))
+        else {
+            continue;
+        };
+        let meta = match *kind {
+            "string" => value.as_str().map(|text| MetaValue::String(text.into())),
+            "i32" => value.as_i64().and_then(|number| i32::try_from(number).ok()).map(MetaValue::I32),
+            _ => value.as_f64().map(|number| MetaValue::F32(number as f32)),
+        };
+        match meta {
+            Some(meta) => out.push((format!("general.sampling.{name}"), meta)),
+            None => skipped.push(format!("{field} ({value})")),
+        }
+    }
+    let warning = (!skipped.is_empty()).then(|| {
+        format!(
+            "generation_config.json {} is not the type general.sampling.* needs, so it is left out (GGUF-038)",
+            skipped.join(", ")
+        )
+    });
+    (out, warning)
+}
+
 // ---------------------------------------------------------------------------
 // GGUF-037: the keys a converter class's set_gguf_parameters chain writes.
 
@@ -1539,6 +1592,29 @@ mod tests {
         assert_eq!(get(&gemma3, "gemma3.final_logit_softcapping"), None);
         assert_eq!(get(&gemma3, "gemma3.attention.sliding_window"), None);
         assert!(class_keys("Gemma3Model", "gemma3", &config(text), dir).is_err());
+    }
+
+    #[test]
+    fn sampling_keys_come_from_generation_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sampling_keys(dir.path()).0.is_empty());
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"do_sample": false, "repetition_penalty": 1.1, "temperature": 0.7, "top_p": 0.8, "top_k": 20,
+                "min_p": null, "mirostat": "x", "eos_token_id": [1, 2]}"#,
+        )
+        .unwrap();
+        let (keys, warning) = sampling_keys(dir.path());
+        let names: Vec<&str> = keys.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            names,
+            ["general.sampling.top_k", "general.sampling.top_p", "general.sampling.temp", "general.sampling.penalty_repeat"]
+        );
+        assert_eq!(keys[0].1, MetaValue::I32(20));
+        assert_eq!(keys[3].1, MetaValue::F32(1.1));
+        assert!(warning.unwrap().contains("mirostat"));
+        std::fs::write(dir.path().join("generation_config.json"), "not json").unwrap();
+        assert!(sampling_keys(dir.path()).0.is_empty());
     }
 
     #[test]

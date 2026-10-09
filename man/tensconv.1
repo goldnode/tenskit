@@ -205,6 +205,14 @@ tensdiff model.safetensors model.gguf
 Beside the source file or in the source directory.
 .B \-\-rename
 reads the architecture and the hyperparameters from it.
+.TP
+.I generation_config.json
+Beside
+.IR config.json .
+.B \-\-rename
+into GGUF writes its sampler defaults as
+.I \%general.sampling.*
+(GGUF-038).
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO

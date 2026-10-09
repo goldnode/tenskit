@@ -315,10 +315,10 @@ fn llama_scope(tensors: &mut [Tensor], config: Option<&Value>, class: Option<&st
     Ok(())
 }
 
-/// metadata-mapping pytorch_to_safetensors: safetensors cannot alias, so
-/// tensors that share one PyTorch storage are written as separate copies.
-/// Hugging Face's save_pretrained drops the tied copy instead; the spec does
-/// not say which name a converter should keep, so both are written.
+/// CONV-010 (conversion-considerations section 18): safetensors cannot
+/// alias, so tensors that share one PyTorch storage are written in full, one
+/// copy per name, with a warning naming each pair. De-duplicating is the
+/// other choice CONV-010 allows; tensconv does not make it.
 #[cfg(format_safetensors)]
 fn tied_copy_note(archive: &Archive, warnings: &mut Vec<String>) {
     if archive.format != FormatName::Pytorch {
@@ -335,8 +335,8 @@ fn tied_copy_note(archive: &Archive, warnings: &mut Vec<String>) {
         match seen.get(&(path.clone(), *offset, *len)) {
             Some(first) => warnings.push(format!(
                 "{} shares its storage with {first} in the source; safetensors cannot share, so both are \
-                 written in full. Hugging Face's save_pretrained would drop the tied copy \
-                 (metadata-mapping pytorch_to_safetensors)",
+                 written in full. safetensors' save_model and Hugging Face's save_pretrained \
+                 would keep one name instead (CONV-010)",
                 member.name
             )),
             None => {
@@ -1679,6 +1679,9 @@ fn gguf_hparams(
     }
     let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
     out.extend(found.keys);
+    let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
+    out.extend(sampling);
+    warnings.extend(skipped);
     if !found.unevaluated.is_empty() {
         warnings.push(format!(
             "llama.cpp's {class} may also write {}; tenspile cannot evaluate when or what from config.json, so they are left out (GGUF-037)",
