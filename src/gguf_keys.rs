@@ -344,21 +344,8 @@ pub(crate) fn class_keys(
         }
     };
     let (p, _) = rope_params(Some(map));
-    for owner in chain.iter().rev() {
-        if owner == "TextModel" {
-            base_rows(arch, map, &mut found.keys)?;
-            continue;
-        }
-        if transcribed(owner, arch, map, &mut found.keys)? {
-            continue;
-        }
-        let method = format!("{owner}.set_gguf_parameters");
-        let mut ctx = Ctx { map, p: &p, dir, arch, depth: 0 };
-        ctx.method(&method, &mut found)?;
-        if owner == "LlamaModel" {
-            llama_rope_dim(arch, map, &mut found)?;
-        }
-    }
+    let mut ctx = Ctx { map, p: &p, dir, arch, depth: 0 };
+    ctx.chain(&chain, &mut found)?;
     Ok(found)
 }
 
@@ -374,6 +361,10 @@ fn find<'a>(map: &'a Map<String, Value>, names: &[&str], class: &str) -> Result<
 
 /// A step of the chain that metadata-mapping gguf_class_parameters
 /// transcribes by hand. Returns false for a class it does not cover.
+fn is_transcribed(owner: &str) -> bool {
+    matches!(owner, "Phi3MiniModel" | "PhiMoeModel" | "Gemma2Model" | "Gemma3Model")
+}
+
 fn transcribed(owner: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<bool> {
     match owner {
         "Phi3MiniModel" => phi3_mini(owner, arch, map, out)?,
@@ -565,8 +556,32 @@ impl Ctx<'_> {
         template.replace("{arch}", self.arch)
     }
 
-    /// The writes of one indexed method, and the self calls it makes, in line order.
-    fn method(&mut self, name: &str, found: &mut ClassKeys) -> Result<()> {
+    /// One step of the set_gguf_parameters chain and, through its super()
+    /// call, the steps after it. TextModel is the hf_config_to_gguf rows. A
+    /// transcribed class extends the rest of its chain.
+    fn chain(&mut self, chain: &[String], found: &mut ClassKeys) -> Result<()> {
+        let Some((owner, rest)) = chain.split_first() else {
+            return Ok(());
+        };
+        if owner == "TextModel" {
+            return base_rows(self.arch, self.map, &mut found.keys);
+        }
+        if is_transcribed(owner) {
+            self.chain(rest, found)?;
+            transcribed(owner, self.arch, self.map, &mut found.keys)?;
+            return Ok(());
+        }
+        self.method(&format!("{owner}.set_gguf_parameters"), rest, found)?;
+        if owner == "LlamaModel" {
+            llama_rope_dim(self.arch, self.map, found)?;
+        }
+        Ok(())
+    }
+
+    /// The writes of one indexed method, the self calls it makes, and its
+    /// super() call to the rest of the chain, in line order: a few classes
+    /// write keys before they call super().
+    fn method(&mut self, name: &str, rest: &[String], found: &mut ClassKeys) -> Result<()> {
         let Some(record) = index()["methods"].get(name) else {
             return Ok(());
         };
@@ -575,15 +590,23 @@ impl Ctx<'_> {
             return Err(msg(format!("{name}: self calls nest too deeply")));
         }
         let locals = record.get("locals").and_then(Value::as_object);
-        let mut steps: Vec<(u64, &Value, bool)> = Vec::new();
+        let mut steps: Vec<(u64, &Value, Step)> = Vec::new();
         for write in record["writes"].as_array().into_iter().flatten() {
-            steps.push((write["line"].as_u64().unwrap_or(0), write, true));
+            steps.push((write["line"].as_u64().unwrap_or(0), write, Step::Write));
         }
         for call in record["self_calls"].as_array().into_iter().flatten() {
-            steps.push((call["line"].as_u64().unwrap_or(0), call, false));
+            steps.push((call["line"].as_u64().unwrap_or(0), call, Step::SelfCall));
+        }
+        if !rest.is_empty() {
+            for call in record["super_calls"].as_array().into_iter().flatten() {
+                if call["method"].as_str() == Some("set_gguf_parameters") {
+                    steps.push((call["line"].as_u64().unwrap_or(0), call, Step::Super));
+                }
+            }
         }
         steps.sort_by_key(|step| step.0);
-        for (_, step, is_write) in steps {
+        for (_, step, kind) in steps {
+            let is_write = kind == Step::Write;
             let mut eval = Eval { ctx: self, locals, vars: Default::default(), depth: 0 };
             let guard = step["when"].as_str().unwrap_or("always");
             let holds = if guard == "always" { Ok(true) } else { eval.expr(guard).map(|value| truthy(&value)) };
@@ -611,16 +634,21 @@ impl Ctx<'_> {
                     }
                 }
             } else {
-                let Some(target) = step["resolves_to"].as_str() else {
+                let target = step["resolves_to"].as_str();
+                if kind == Step::SelfCall && target.is_none() {
                     continue;
+                }
+                let mut run = |this: &mut Self, into: &mut ClassKeys| match target {
+                    Some(target) if kind == Step::SelfCall => this.method(target, &[], into),
+                    _ => this.chain(rest, into),
                 };
                 match holds {
                     Ok(false) => {}
-                    Ok(true) => self.method(target, found)?,
+                    Ok(true) => run(self, found)?,
                     Err(Unknown) => {
                         // The call may or may not run: none of its keys can be evaluated.
                         let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
-                        self.method(target, &mut skipped)?;
+                        run(self, &mut skipped)?;
                         for key in skipped.keys.into_iter().map(|(key, _)| key).chain(skipped.unevaluated) {
                             if !found.unevaluated.contains(&key) {
                                 found.unevaluated.push(key);
@@ -633,6 +661,13 @@ impl Ctx<'_> {
         self.depth -= 1;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Step {
+    Write,
+    SelfCall,
+    Super,
 }
 
 /// A guard or value the evaluator cannot decide from the config.
@@ -1615,6 +1650,23 @@ mod tests {
         assert!(warning.unwrap().contains("mirostat"));
         std::fs::write(dir.path().join("generation_config.json"), "not json").unwrap();
         assert!(sampling_keys(dir.path()).0.is_empty());
+    }
+
+    #[test]
+    fn a_write_before_super_is_overwritten_by_the_base() {
+        // DistilBertModel writes layer_norm_epsilon 1e-12 and then calls super(),
+        // whose base row replaces it when the config gives a value.
+        let dir = std::path::Path::new("/nonexistent");
+        let get = |text: &str| {
+            class_keys("DistilBertModel", "bert", &config(text), dir)
+                .unwrap()
+                .keys
+                .into_iter()
+                .find(|(key, _)| key == "bert.attention.layer_norm_epsilon")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(get(r#"{"n_layers": 2, "layer_norm_eps": 1e-5}"#), Some(MetaValue::F32(1e-5)));
+        assert_eq!(get(r#"{"n_layers": 2}"#), Some(MetaValue::F32(1e-12)));
     }
 
     #[test]
