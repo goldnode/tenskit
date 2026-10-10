@@ -77,11 +77,17 @@ const GATING: &[&str] = &[
     "router_score_function",
 ];
 
-/// find_hparam(names, optional=True): the first name present and not null.
+/// find_hparam(names): the value of the first listed name that is a key of
+/// the dict. A null value counts as present and stops the search
+/// (hf_config_to_gguf description).
+pub(crate) fn lookup<'a>(map: &'a Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| map.get(*name))
+}
+
+/// find_hparam(names, optional=True) guarded by `is not None`: the lookup's
+/// value unless it is null.
 pub(crate) fn first_present<'a>(map: &'a Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
-    names
-        .iter()
-        .find_map(|name| map.get(*name).filter(|value| !value.is_null()))
+    lookup(map, names).filter(|value| !value.is_null())
 }
 
 /// Replace a key already written, as GGUFWriter.add_key_value does, or add it.
@@ -123,11 +129,7 @@ pub(crate) fn base_rows(arch: &str, map: &Map<String, Value>, out: &mut Vec<(Str
         Ok(())
     };
     let blocks = ["n_layers", "num_hidden_layers", "n_layer", "num_layers"];
-    if first_present(map, &blocks).is_none() {
-        return Err(msg(
-            "config.json has none of n_layers, num_hidden_layers, n_layer, num_layers; llama.cpp's converter stops there too",
-        ));
-    }
+    find(map, &blocks, "TextModel")?;
     u32_row(out, "block_count", &blocks)?;
     u32_row(
         out,
@@ -344,19 +346,29 @@ pub(crate) fn class_keys(
         }
     };
     let (p, _) = rope_params(Some(map));
-    let mut ctx = Ctx { map, p: &p, dir, arch, depth: 0 };
+    let converter = &index()["converters"][class];
+    let mut ctx = Ctx { map, p: &p, dir, arch, converter, depth: 0 };
     ctx.chain(&chain, &mut found)?;
     Ok(found)
 }
 
 /// find(a, b) in gguf_class_parameters: find_hparam, KeyError when none is present.
+/// A null value is found too, but llama.cpp then fails writing it, so it
+/// stops the conversion here.
 fn find<'a>(map: &'a Map<String, Value>, names: &[&str], class: &str) -> Result<&'a Value> {
-    first_present(map, names).ok_or_else(|| {
+    let value = lookup(map, names).ok_or_else(|| {
         msg(format!(
             "config.json has none of {}, which llama.cpp's {class} needs",
             names.join(", ")
         ))
-    })
+    })?;
+    if value.is_null() {
+        let name = names.iter().find(|name| map.contains_key(**name)).unwrap_or(&"");
+        return Err(msg(format!(
+            "config.json {name} is null; llama.cpp's {class} would fail writing it"
+        )));
+    }
+    Ok(value)
 }
 
 /// A step of the chain that metadata-mapping gguf_class_parameters
@@ -414,7 +426,8 @@ fn gemma2(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(Stri
 /// defaults where the config has no value.
 fn gemma3(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(String, MetaValue)>) -> Result<()> {
     let key = |name: &str| format!("{arch}.{name}");
-    let or = |name: &str, default: Value| map.get(name).filter(|value| !value.is_null()).cloned().unwrap_or(default);
+    // config.get(name, default): a present null is passed on, and fails as a u32 or f32.
+    let or = |name: &str, default: Value| map.get(name).cloned().unwrap_or(default);
     let (_, r) = rope_params(Some(map));
     set(out, key("context_length"), as_u32(&key("context_length"), &or("max_position_embeddings", Value::from(131072)))?);
     set(out, key("attention.head_count"), as_u32(&key("attention.head_count"), &or("num_attention_heads", Value::from(8)))?);
@@ -426,7 +439,7 @@ fn gemma3(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(Stri
     let head_dim = or("head_dim", Value::from(256));
     set(out, key("attention.key_length"), as_u32(&key("attention.key_length"), &head_dim)?);
     set(out, key("attention.value_length"), as_u32(&key("attention.value_length"), &head_dim)?);
-    let theta = r.get("rope_theta").filter(|value| !value.is_null()).cloned().unwrap_or(Value::from(1_000_000.0));
+    let theta = r.get("rope_theta").cloned().unwrap_or(Value::from(1_000_000.0));
     set(out, key("rope.freq_base"), as_f32(&key("rope.freq_base"), &theta)?);
     if map.get("attn_logit_softcapping").is_some_and(|value| !value.is_null()) {
         return Err(msg(format!(
@@ -548,6 +561,9 @@ struct Ctx<'a> {
     p: &'a Map<String, Value>,
     dir: &'a std::path::Path,
     arch: &'a str,
+    /// The converter's record: its self_calls map resolves self.<m>() for
+    /// this converter, since a method record's resolves_to may say "per converter".
+    converter: &'static Value,
     depth: usize,
 }
 
@@ -634,7 +650,14 @@ impl Ctx<'_> {
                     }
                 }
             } else {
-                let target = step["resolves_to"].as_str();
+                let target = if kind == Step::SelfCall {
+                    step["method"]
+                        .as_str()
+                        .and_then(|name| self.converter["self_calls"].get(name))
+                        .and_then(Value::as_str)
+                } else {
+                    None
+                };
                 if kind == Step::SelfCall && target.is_none() {
                     continue;
                 }
@@ -783,7 +806,7 @@ impl Eval<'_, '_> {
             (V::SelfObj, "hparams") => Ok(V::J(Value::Object(self.ctx.map.clone()))),
             (V::SelfObj, "rope_parameters") => Ok(V::J(Value::Object(self.ctx.p.clone()))),
             (V::SelfObj, "dir_model") => Ok(V::Path(self.ctx.dir.to_path_buf())),
-            (V::SelfObj, "block_count") => first_present(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
+            (V::SelfObj, "block_count") => lookup(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
                 .map(|value| V::J(value.clone()))
                 .ok_or(Unknown),
             // tensconv reads a Hugging Face config.json checkpoint, never the
@@ -1513,7 +1536,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, vars: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -1674,7 +1697,7 @@ mod tests {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, depth: 0 };
         let mut total = 0;
         for record in index()["methods"].as_object().unwrap().values() {
             let locals = record.get("locals").and_then(Value::as_object);
@@ -1689,6 +1712,16 @@ mod tests {
             }
         }
         assert!(total > 3000, "{total}");
+    }
+
+    #[test]
+    fn a_null_stops_the_lookup() {
+        // context_length: max_position_embeddings is null, so n_ctx is not tried.
+        let out = rows(r#"{"num_layers": 1, "max_position_embeddings": null, "n_ctx": 4096}"#);
+        assert!(get(&out, "t.context_length").is_none());
+        let mut out = Vec::new();
+        let err = base_rows("t", &config(r#"{"n_layers": null, "num_layers": 2}"#), &mut out).unwrap_err();
+        assert!(err.to_string().contains("n_layers is null"), "{err}");
     }
 
     #[test]

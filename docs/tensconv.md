@@ -110,7 +110,7 @@ output.
 How the architecture and its changes are chosen:
 
 - The architecture is `general.architecture`, or `config.json` `architectures[0]`. `text_config.architectures[0]` is used when it is present, except for the few classes llama.cpp keeps at the top level. The converter class is the one registered for that Hugging Face class. When there is no `config.json` and an architecture has more than one converter class, the command stops, because the spec gives no preference order.
-- Hyperparameters follow `hf_config_to_gguf`, whose rows transcribe llama.cpp's `TextModel.set_gguf_parameters`. `text_config` is merged over the root object, and the first listed key that is present and not null wins. A sibling `config.json` is read only for those keys. A row is written only when its condition holds:
+- Hyperparameters follow `hf_config_to_gguf`, whose rows transcribe llama.cpp's `TextModel.set_gguf_parameters`. `text_config` is merged over the root object, and the first listed key that is present wins, as llama.cpp's `find_hparam` takes it. A null value counts as present: a base row is then not written, and a class rule that needs the value stops the conversion, because llama.cpp's converter would fail writing it. A sibling `config.json` is read only for those keys. A row is written only when its condition holds:
   - `attention.head_count_kv` only when the config gives it, and `attention.causal` only as false, when `is_causal` is false or `use_bidirectional_attention` is true;
   - `attention.key_length` and `value_length` only from an explicit `head_dim`;
   - `rope.freq_base` from the rope parameters' `rope_theta`, filled from the top-level `rope_theta` and its aliases;
