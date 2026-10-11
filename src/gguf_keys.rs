@@ -7,38 +7,46 @@ use serde_json::{Map, Value};
 use crate::error::{msg, Result};
 use crate::formats::gguf::MetaValue;
 
-/// metadata-mapping hf_config_to_gguf: P is config rope_parameters, else
-/// rope_scaling, else empty. When P has neither full_attention nor
-/// sliding_attention, TextModel.__init__ copies type to rope_type and fills
-/// rope_theta, partial_rotary_factor, and original_max_position_embeddings
-/// from the top-level config when P lacks them. R is P.full_attention when
-/// present, else P.
+/// metadata-mapping hf_config_to_gguf rope_parameters_fill. (1) P is
+/// rope_parameters when that key is present, else rope_scaling; null gives {}.
+/// (2) Only when P has neither full_attention nor sliding_attention: the local
+/// theta keys set P.sliding_attention.rope_theta; rope_theta,
+/// partial_rotary_factor, and original_max_position_embeddings are filled
+/// from the top level; rope_type is copied from a non-null type. A key already
+/// in P is never replaced, and a null found value fills nothing. (3) A nested
+/// P is not filled. R is P.full_attention when present, else P.
 pub(crate) fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, Value>, Map<String, Value>) {
-    let pick = |key: &str| {
-        hparams
-            .and_then(|map| map.get(key))
-            .and_then(Value::as_object)
-            .cloned()
+    let empty = Map::new();
+    let map = hparams.unwrap_or(&empty);
+    let source = match map.get("rope_parameters") {
+        Some(value) => Some(value),
+        None => map.get("rope_scaling"),
     };
-    let mut p = pick("rope_parameters").or_else(|| pick("rope_scaling")).unwrap_or_default();
+    let mut p = source.and_then(Value::as_object).cloned().unwrap_or_default();
     if !p.contains_key("full_attention") && !p.contains_key("sliding_attention") {
+        if let Some(theta) = first_present(map, LOCAL_ROPE_THETA) {
+            let mut sliding = Map::new();
+            sliding.insert("rope_theta".into(), theta.clone());
+            p.insert("sliding_attention".into(), Value::Object(sliding));
+        }
+        if !p.contains_key("rope_theta") {
+            if let Some(theta) = first_present(map, ROPE_THETA) {
+                p.insert("rope_theta".into(), theta.clone());
+            }
+        }
         if !p.contains_key("rope_type") {
-            if let Some(kind) = p.get("type").cloned() {
+            if let Some(kind) = p.get("type").filter(|kind| !kind.is_null()).cloned() {
                 p.insert("rope_type".into(), kind);
             }
         }
-        if let Some(map) = hparams {
-            if !p.contains_key("rope_theta") {
-                if let Some(theta) = first_present(map, ROPE_THETA) {
-                    p.insert("rope_theta".into(), theta.clone());
-                }
+        if !p.contains_key("partial_rotary_factor") {
+            if let Some(factor) = first_present(map, &["partial_rotary_factor", "rope_pct", "rope_percent"]) {
+                p.insert("partial_rotary_factor".into(), factor.clone());
             }
-            for key in ["partial_rotary_factor", "original_max_position_embeddings"] {
-                if !p.contains_key(key) {
-                    if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
-                        p.insert(key.into(), value.clone());
-                    }
-                }
+        }
+        if !p.contains_key("original_max_position_embeddings") {
+            if let Some(original) = map.get("original_max_position_embeddings").filter(|value| !value.is_null()) {
+                p.insert("original_max_position_embeddings".into(), original.clone());
             }
         }
     }
@@ -48,6 +56,50 @@ pub(crate) fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, 
         .cloned()
         .unwrap_or_else(|| p.clone());
     (p, r)
+}
+
+/// The AutoConfig to_dict defaults GGUF-039 lists (transformers 4.57.6), added
+/// where config.json lacks them. GGUF-040 allows no others.
+pub(crate) fn listed_defaults(top: &mut Map<String, Value>) {
+    let model_type = top.get("model_type").and_then(Value::as_str).unwrap_or("").to_string();
+    match model_type.as_str() {
+        "llama" => {
+            if !top.contains_key("head_dim") {
+                let hidden = top.get("hidden_size").and_then(Value::as_u64);
+                let heads = top.get("num_attention_heads").and_then(Value::as_u64).filter(|heads| *heads > 0);
+                if let Some((hidden, heads)) = hidden.zip(heads) {
+                    top.insert("head_dim".into(), Value::from(hidden / heads));
+                }
+            }
+            if let Some(scaling) = top.get_mut("rope_scaling").and_then(Value::as_object_mut) {
+                if !scaling.contains_key("rope_type") {
+                    if let Some(kind) = scaling.get("type").cloned() {
+                        scaling.insert("rope_type".into(), kind);
+                    }
+                }
+            }
+        }
+        "qwen2" if top.get("use_sliding_window") == Some(&Value::Bool(false)) => {
+            top.insert("sliding_window".into(), Value::Null);
+        }
+        "phi3" if !top.contains_key("partial_rotary_factor") => {
+            top.insert("partial_rotary_factor".into(), Value::from(1.0));
+        }
+        _ => {}
+    }
+    let generation = [
+        ("max_length", Value::from(20)),
+        ("temperature", Value::from(1.0)),
+        ("top_k", Value::from(50)),
+        ("top_p", Value::from(1.0)),
+        ("repetition_penalty", Value::from(1.0)),
+    ];
+    for (key, value) in generation {
+        top.entry(key).or_insert(value);
+    }
+    if let Some(dtype) = top.remove("torch_dtype") {
+        top.entry("dtype").or_insert(dtype);
+    }
 }
 
 const ROPE_THETA: &[&str] = &[
@@ -176,8 +228,7 @@ pub(crate) fn base_rows(arch: &str, map: &Map<String, Value>, out: &mut Vec<(Str
         .get("sliding_attention")
         .and_then(Value::as_object)
         .and_then(|sliding| sliding.get("rope_theta"))
-        .filter(|value| !value.is_null())
-        .or_else(|| first_present(map, LOCAL_ROPE_THETA));
+        .filter(|value| !value.is_null());
     if let Some(theta) = swa {
         set(out, key("rope.freq_base_swa"), as_f32(&key("rope.freq_base_swa"), theta)?);
     }
@@ -1722,6 +1773,47 @@ mod tests {
         let mut out = Vec::new();
         let err = base_rows("t", &config(r#"{"n_layers": null, "num_layers": 2}"#), &mut out).unwrap_err();
         assert!(err.to_string().contains("n_layers is null"), "{err}");
+    }
+
+    #[test]
+    fn p_is_filled_as_rope_parameters_fill_says() {
+        let (p, _) = rope_params(Some(&config(
+            r#"{"rope_parameters": null, "rope_scaling": {"type": "linear", "factor": 2.0}, "rope_theta": 5.0}"#,
+        )));
+        // A null rope_parameters gives {} and does not fall back to rope_scaling.
+        assert!(!p.contains_key("factor"));
+        assert_eq!(p.get("rope_theta"), Some(&Value::from(5.0)));
+        let (p, _) = rope_params(Some(&config(
+            r#"{"rope_scaling": {"type": "yarn", "rope_type": null}, "rope_local_base_freq": 10.0, "rope_pct": 0.5}"#,
+        )));
+        // A present rope_type wins, even null; the local theta becomes sliding_attention.
+        assert_eq!(p.get("rope_type"), Some(&Value::Null));
+        assert_eq!(p["sliding_attention"]["rope_theta"], Value::from(10.0));
+        assert_eq!(p.get("partial_rotary_factor"), Some(&Value::from(0.5)));
+        let (p, r) = rope_params(Some(&config(
+            r#"{"rope_parameters": {"full_attention": {"rope_type": "default"}}, "rope_theta": 5.0, "rope_local_base_freq": 1.0}"#,
+        )));
+        // A nested P is not filled.
+        assert!(!p.contains_key("sliding_attention") && !r.contains_key("rope_theta"));
+    }
+
+    #[test]
+    fn the_listed_transformers_defaults_are_added() {
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "llama", "hidden_size": 576, "num_attention_heads": 9, "torch_dtype": "bfloat16"}"#,
+        )));
+        assert_eq!(merged.get("head_dim"), Some(&Value::from(64)));
+        assert_eq!(merged.get("max_length"), Some(&Value::from(20)));
+        assert_eq!(merged.get("dtype"), Some(&Value::from("bfloat16")));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "qwen2", "use_sliding_window": false, "sliding_window": 32768}"#,
+        )));
+        assert_eq!(merged.get("sliding_window"), Some(&Value::Null));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "x", "llm_config": {"hidden_size": 7}, "thinker_config": {"text_config": {"hidden_size": 9}}}"#,
+        )));
+        // thinker_config.text_config is renamed last, so it is the text_config merged.
+        assert_eq!(merged.get("hidden_size"), Some(&Value::from(9)));
     }
 
     #[test]

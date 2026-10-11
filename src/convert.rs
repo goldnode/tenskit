@@ -1677,6 +1677,11 @@ fn gguf_hparams(
     {
         out.push(("general.name".into(), MetaValue::String(name.to_string())));
     }
+    warnings.push(
+        "the keys come from config.json with the transformers defaults GGUF-039 lists; llama.cpp reads \
+         transformers' AutoConfig dict, so a key that depends on another default may differ (GGUF-040)"
+            .into(),
+    );
     let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
     out.extend(found.keys);
     let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
@@ -1705,9 +1710,27 @@ fn read_config(dir: &Path) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
+/// GGUF-039 and GGUF-040: the config dict llama.cpp's rules read, as near as
+/// tenspile gets without transformers. The defaults GGUF-039 lists are added
+/// to config.json, the sub-config renames are applied, and text_config is
+/// merged over the top level, as TextModel.__init__ does.
 pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
-    let mut merged = config.as_object().cloned().unwrap_or_default();
-    if let Some(text) = config.get("text_config").and_then(Value::as_object) {
+    let mut top = config.as_object().cloned().unwrap_or_default();
+    crate::gguf_keys::listed_defaults(&mut top);
+    for name in ["llm_config", "lm_config", "language_config", "lfm"] {
+        if let Some(sub) = top.remove(name) {
+            top.insert("text_config".into(), sub);
+        }
+    }
+    if let Some(sub) = top
+        .get_mut("thinker_config")
+        .and_then(Value::as_object_mut)
+        .and_then(|thinker| thinker.remove("text_config"))
+    {
+        top.insert("text_config".into(), sub);
+    }
+    let mut merged = top.clone();
+    if let Some(text) = top.get("text_config").and_then(Value::as_object) {
         for (key, value) in text {
             merged.insert(key.clone(), value.clone());
         }

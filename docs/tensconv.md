@@ -110,10 +110,18 @@ output.
 How the architecture and its changes are chosen:
 
 - The architecture is `general.architecture`, or `config.json` `architectures[0]`. `text_config.architectures[0]` is used when it is present, except for the few classes llama.cpp keeps at the top level. The converter class is the one registered for that Hugging Face class. When there is no `config.json` and an architecture has more than one converter class, the command stops, because the spec gives no preference order.
+- llama.cpp's converter reads transformers' `AutoConfig` dict, not `config.json` itself (GGUF-039). That dict adds the defaults of the model's config class. tenspile has no Python, so it reads `config.json` (GGUF-040) and adds only the defaults GGUF-039 lists:
+  - `head_dim` for a `llama` config;
+  - a null `sliding_window` for a `qwen2` config with `use_sliding_window: false`;
+  - `partial_rotary_factor` 1.0 for `phi3`;
+  - the generation defaults (`max_length` 20 and the rest).
+
+  It renames `llm_config`, `lm_config`, `language_config`, `lfm`, and `thinker_config.text_config` to `text_config` before merging. One warning says that a key depending on another transformers default may differ from llama.cpp's.
 - Hyperparameters follow `hf_config_to_gguf`, whose rows transcribe llama.cpp's `TextModel.set_gguf_parameters`. `text_config` is merged over the root object, and the first listed key that is present wins, as llama.cpp's `find_hparam` takes it. A null value counts as present: a base row is then not written, and a class rule that needs the value stops the conversion, because llama.cpp's converter would fail writing it. A sibling `config.json` is read only for those keys. A row is written only when its condition holds:
   - `attention.head_count_kv` only when the config gives it, and `attention.causal` only as false, when `is_causal` is false or `use_bidirectional_attention` is true;
   - `attention.key_length` and `value_length` only from an explicit `head_dim`;
-  - `rope.freq_base` from the rope parameters' `rope_theta`, filled from the top-level `rope_theta` and its aliases;
+  - the rope parameters P are `rope_parameters` when that key is present, else `rope_scaling`, and a null gives an empty set. Unless P is nested (`full_attention` or `sliding_attention`), the top-level `rope_theta`, `partial_rotary_factor` (or `rope_pct`), `original_max_position_embeddings`, and the local theta keys fill what P lacks, and `type` becomes `rope_type` when P has none. A value already in P is never replaced;
+  - `rope.freq_base` from the rope parameters' `rope_theta`, and `rope.freq_base_swa` from `sliding_attention.rope_theta`;
   - `rope.scaling.*` by `rope_type`: `linear` and `yarn` write the type and factor, and `yarn` also `original_context_length` and the `yarn_*` keys; `su` or `longrope` writes only the type `longrope`; `llama3` and `dynamic` write none;
   - `rope.dimension_sections` from `mrope_section`, `rope.freq_base_swa`, the expert counts and group counts, and `expert_gating_func` (softmax 1, sigmoid 2, sqrtsoftplus 4).
 
