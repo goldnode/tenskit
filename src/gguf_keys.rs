@@ -512,6 +512,77 @@ fn gemma3(class: &str, arch: &str, map: &Map<String, Value>, out: &mut Vec<(Stri
     Ok(())
 }
 
+/// gguf_class_parameters helpers TextModel._try_set_pooling_type: the pooling
+/// type from sentence-transformers' modules.json or embedding_config.json, and
+/// the classifier keys from the config dict.
+fn pooling(arch: &str, map: &Map<String, Value>, dir: &std::path::Path, out: &mut Vec<(String, MetaValue)>) -> Result<()> {
+    let read = |path: std::path::PathBuf| -> Result<Option<Value>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|err| crate::error::io_err(&path, err))?;
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|err| msg(format!("{}: {err}", path.display())))
+    };
+    let pooling_path = read(dir.join("modules.json"))?.and_then(|modules| {
+        modules.as_array()?.iter().find_map(|entry| {
+            let kind = entry.get("type")?.as_str()?;
+            kind.ends_with("Pooling")
+                .then(|| entry.get("path").and_then(Value::as_str).map(str::to_string))
+                .flatten()
+        })
+    });
+    let key = |name: &str| format!("{arch}.{name}");
+    let truthy = |config: &Value, name: &str| config.get(name).is_some_and(|value| truthy(&V::J(value.clone())));
+    if let Some(path) = pooling_path {
+        let config = read(dir.join(&path).join("config.json"))?.unwrap_or(Value::Null);
+        let mode = if truthy(&config, "pooling_mode_mean_tokens") {
+            1
+        } else if truthy(&config, "pooling_mode_cls_token") {
+            2
+        } else if truthy(&config, "pooling_mode_lasttoken") {
+            3
+        } else {
+            match config.get("pooling_mode").and_then(Value::as_str) {
+                Some("mean") => 1,
+                Some("cls") => 2,
+                Some("lasttoken") => 3,
+                _ => {
+                    return Err(msg(format!(
+                        "{path}/config.json names no pooling mode llama.cpp's converter supports"
+                    )))
+                }
+            }
+        };
+        set(out, key("pooling_type"), MetaValue::U32(mode));
+    } else if let Some(config) = read(dir.join("embedding_config.json"))? {
+        match config.get("pooling") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) if text == "last_token" => set(out, key("pooling_type"), MetaValue::U32(3)),
+            Some(other) => {
+                return Err(msg(format!(
+                    "embedding_config.json pooling {other} is not last_token, which llama.cpp's converter needs"
+                )))
+            }
+        }
+    }
+    match map.get("classifier_pooling") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if text == "cls" => set(out, key("classifier.pooling_type"), MetaValue::U32(2)),
+        Some(Value::String(text)) if text == "mean" => set(out, key("classifier.pooling_type"), MetaValue::U32(1)),
+        Some(other) => return Err(msg(format!("classifier_pooling {other} is not cls or mean"))),
+    }
+    match map.get("classifier_activation") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) if matches!(text.as_str(), "gelu" | "silu" | "tanh") => {
+            set(out, key("classifier.activation"), MetaValue::String(text.clone()))
+        }
+        Some(other) => return Err(msg(format!("classifier_activation {other} is not gelu, silu, or tanh"))),
+    }
+    Ok(())
+}
+
 /// hf_config_to_gguf rope.dimension_count: LlamaModel uses head_dim, else
 /// hidden_size // num_attention_heads. The index cannot evaluate it, because
 /// rope_dim is assigned twice there.
@@ -693,7 +764,8 @@ impl Ctx<'_> {
                     Err(Unknown) => Err(Unknown),
                 };
                 match value {
-                    Ok(value) => set(&mut found.keys, key, value),
+                    Ok(Some(value)) => set(&mut found.keys, key, value),
+                    Ok(None) => {}
                     Err(Unknown) => {
                         if !found.unevaluated.contains(&key) {
                             found.unevaluated.push(key);
@@ -713,6 +785,7 @@ impl Ctx<'_> {
                     continue;
                 }
                 let mut run = |this: &mut Self, into: &mut ClassKeys| match target {
+                    Some("TextModel._try_set_pooling_type") => pooling(this.arch, this.map, this.dir, &mut into.keys),
                     Some(target) if kind == Step::SelfCall => this.method(target, &[], into),
                     _ => this.chain(rest, into),
                 };
@@ -771,26 +844,79 @@ fn truthy(value: &V) -> bool {
     }
 }
 
-/// A Python value as the GGUF type the index gives. Arrays and enum
-/// constants are not converted.
-fn to_meta(value: &V, kind: &str) -> Ev<MetaValue> {
+/// A Python value as the GGUF type the index gives. `Ok(None)` is an empty
+/// list, which add_array leaves out (GGUF-041). Enum constants are not
+/// converted.
+fn to_meta(value: &V, kind: &str) -> Ev<Option<MetaValue>> {
+    use crate::formats::gguf::{TYPE_I32, TYPE_U32, TYPE_U64};
     let V::J(value) = value else { return Err(Unknown) };
-    match kind {
-        "u32" | "u32 or array" => value
-            .as_u64()
-            .and_then(|number| u32::try_from(number).ok())
-            .map(MetaValue::U32)
-            .ok_or(Unknown),
-        "i32" => value
-            .as_i64()
-            .and_then(|number| i32::try_from(number).ok())
-            .map(MetaValue::I32)
-            .ok_or(Unknown),
-        "f32" => value.as_f64().map(|number| MetaValue::F32(number as f32)).ok_or(Unknown),
-        "bool" => value.as_bool().map(MetaValue::Bool).ok_or(Unknown),
-        "string" | "string or array" => value.as_str().map(|text| MetaValue::String(text.into())).ok_or(Unknown),
-        _ => Err(Unknown),
+    let scalar = match (kind, value) {
+        (_, Value::Array(items)) => {
+            let fixed = match kind {
+                "array[u32]" => Some(TYPE_U32),
+                "array[i32]" => Some(TYPE_I32),
+                "array[u64]" => Some(TYPE_U64),
+                "array" | "u32 or array" | "string or array" => None,
+                _ => return Err(Unknown),
+            };
+            return match fixed {
+                // add_key_value with an empty array raises when the file is written.
+                Some(_) if items.is_empty() => Err(Unknown),
+                Some(elem) => {
+                    let values = items
+                        .iter()
+                        .map(|item| match elem {
+                            TYPE_U32 => item.as_u64().and_then(|n| u32::try_from(n).ok()).map(MetaValue::U32),
+                            TYPE_I32 => item.as_i64().and_then(|n| i32::try_from(n).ok()).map(MetaValue::I32),
+                            _ => item.as_u64().map(MetaValue::U64),
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(Unknown)?;
+                    Ok(Some(MetaValue::Array { elem, values }))
+                }
+                None if items.is_empty() => Ok(None),
+                None => inferred_array(items).map(Some),
+            };
+        }
+        ("u32" | "u32 or array", Value::Bool(flag)) if kind == "u32 or array" => Some(MetaValue::U32(u32::from(*flag))),
+        ("u32" | "u32 or array", _) => value.as_u64().and_then(|n| u32::try_from(n).ok()).map(MetaValue::U32),
+        ("i32", _) => value.as_i64().and_then(|n| i32::try_from(n).ok()).map(MetaValue::I32),
+        ("f32", _) => value.as_f64().map(|n| MetaValue::F32(n as f32)),
+        ("bool", _) => value.as_bool().map(MetaValue::Bool),
+        ("string" | "string or array", _) => value.as_str().map(|text| MetaValue::String(text.into())),
+        _ => None,
+    };
+    scalar.map(Some).ok_or(Unknown)
+}
+
+/// GGUF-041: gguf-py types an array by its first element (str STRING, list a
+/// nested ARRAY, float FLOAT32, bool BOOL, int INT32), and every element must
+/// get the same type.
+fn inferred_array(items: &[Value]) -> Ev<MetaValue> {
+    use crate::formats::gguf::{TYPE_ARRAY, TYPE_BOOL, TYPE_F32, TYPE_I32, TYPE_STRING};
+    let element = |item: &Value| -> Ev<MetaValue> {
+        Ok(match item {
+            Value::String(text) => MetaValue::String(text.clone()),
+            Value::Array(inner) if !inner.is_empty() => inferred_array(inner)?,
+            Value::Number(number) if number.is_f64() => MetaValue::F32(number.as_f64().ok_or(Unknown)? as f32),
+            Value::Bool(flag) => MetaValue::Bool(*flag),
+            Value::Number(number) => MetaValue::I32(number.as_i64().and_then(|n| i32::try_from(n).ok()).ok_or(Unknown)?),
+            _ => return Err(Unknown),
+        })
+    };
+    let elem = match items.first().ok_or(Unknown)? {
+        Value::String(_) => TYPE_STRING,
+        Value::Array(_) => TYPE_ARRAY,
+        Value::Number(number) if number.is_f64() => TYPE_F32,
+        Value::Bool(_) => TYPE_BOOL,
+        Value::Number(_) => TYPE_I32,
+        _ => return Err(Unknown),
+    };
+    let values = items.iter().map(element).collect::<Ev<Vec<_>>>()?;
+    if values.iter().any(|value| value.type_id() != elem) {
+        return Err(Unknown);
     }
+    Ok(MetaValue::Array { elem, values })
 }
 
 struct Eval<'c, 'a> {
@@ -1741,6 +1867,49 @@ mod tests {
         };
         assert_eq!(get(r#"{"n_layers": 2, "layer_norm_eps": 1e-5}"#), Some(MetaValue::F32(1e-5)));
         assert_eq!(get(r#"{"n_layers": 2}"#), Some(MetaValue::F32(1e-12)));
+    }
+
+    #[test]
+    fn pooling_follows_the_helper_transcription() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2}"#;
+        let get = |found: &ClassKeys, key: &str| found.keys.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        // A plain causal LM writes no pooling_type, and nothing is left unevaluated.
+        let plain = class_keys("Qwen2Model", "qwen2", &config(base), dir.path()).unwrap();
+        assert_eq!(get(&plain, "qwen2.pooling_type"), None);
+        assert!(plain.unevaluated.is_empty(), "{:?}", plain.unevaluated);
+        std::fs::write(
+            dir.path().join("modules.json"),
+            r#"[{"type": "sentence_transformers.models.Transformer", "path": ""},
+                {"type": "sentence_transformers.models.Pooling", "path": "1_Pooling"}]"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("1_Pooling")).unwrap();
+        std::fs::write(dir.path().join("1_Pooling/config.json"), r#"{"pooling_mode_lasttoken": true}"#).unwrap();
+        let embed = class_keys("Qwen2Model", "qwen2", &config(base), dir.path()).unwrap();
+        assert_eq!(get(&embed, "qwen2.pooling_type"), Some(MetaValue::U32(3)));
+        std::fs::write(dir.path().join("1_Pooling/config.json"), r#"{"pooling_mode": "max"}"#).unwrap();
+        assert!(class_keys("Qwen2Model", "qwen2", &config(base), dir.path()).is_err());
+    }
+
+    #[test]
+    fn arrays_are_typed_as_gguf_py_types_them() {
+        use crate::formats::gguf::{TYPE_ARRAY, TYPE_F32, TYPE_I32, TYPE_U32};
+        let list = |text: &str| V::J(serde_json::from_str(text).unwrap());
+        let elem = |value: Ev<Option<MetaValue>>| match value {
+            Ok(Some(MetaValue::Array { elem, .. })) => elem,
+            other => panic!("{other:?}"),
+        };
+        // A per-layer list of ints is INT32, not UINT32, unless the writer fixes the type.
+        assert_eq!(elem(to_meta(&list("[1, 2]"), "u32 or array")), TYPE_I32);
+        assert_eq!(elem(to_meta(&list("[1, 2]"), "array[u32]")), TYPE_U32);
+        assert_eq!(elem(to_meta(&list("[0.5, 1.0]"), "array")), TYPE_F32);
+        assert_eq!(elem(to_meta(&list("[[1], [2]]"), "array")), TYPE_ARRAY);
+        assert_eq!(to_meta(&list("[]"), "array"), Ok(None));
+        assert_eq!(to_meta(&list("[]"), "array[u32]"), Err(Unknown));
+        assert_eq!(to_meta(&list("[1, 0.5]"), "array"), Err(Unknown));
+        assert_eq!(to_meta(&list("true"), "u32 or array"), Ok(Some(MetaValue::U32(1))));
+        assert_eq!(to_meta(&list("7"), "u32 or array"), Ok(Some(MetaValue::U32(7))));
     }
 
     #[test]
