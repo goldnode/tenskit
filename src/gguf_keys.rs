@@ -702,7 +702,8 @@ impl Ctx<'_> {
             return Ok(());
         };
         if owner == "TextModel" {
-            return base_rows(self.arch, self.map, &mut found.keys);
+            base_rows(self.arch, self.map, &mut found.keys)?;
+            return self.reassigned_block_count(found);
         }
         if is_transcribed(owner) {
             self.chain(rest, found)?;
@@ -712,6 +713,32 @@ impl Ctx<'_> {
         self.method(&format!("{owner}.set_gguf_parameters"), rest, found)?;
         if owner == "LlamaModel" {
             llama_rope_dim(self.arch, self.map, found)?;
+        }
+        Ok(())
+    }
+
+    /// The block_count row writes self.block_count, which 40 converters assign
+    /// again in their own __init__ (converter_attributes).
+    fn reassigned_block_count(&mut self, found: &mut ClassKeys) -> Result<()> {
+        let entries = self.converter["attributes"]["block_count"].as_array();
+        let reassigned = entries
+            .and_then(|entries| entries.first())
+            .and_then(Value::as_str)
+            .is_some_and(|entry| !entry.starts_with("TextModel.__init__"));
+        if !reassigned {
+            return Ok(());
+        }
+        let key = self.key("{arch}.block_count");
+        let mut eval = Eval { ctx: self, locals: None, vars: Default::default(), depth: 0 };
+        let value = eval.self_attribute("block_count").and_then(|value| to_meta(&value, "u32"));
+        match value {
+            Ok(Some(value)) => set(&mut found.keys, key, value),
+            _ => {
+                found.keys.retain(|(name, _)| *name != key);
+                if !found.unevaluated.contains(&key) {
+                    found.unevaluated.push(key);
+                }
+            }
         }
         Ok(())
     }
@@ -983,18 +1010,58 @@ impl Eval<'_, '_> {
             (V::SelfObj, "hparams") => Ok(V::J(Value::Object(self.ctx.map.clone()))),
             (V::SelfObj, "rope_parameters") => Ok(V::J(Value::Object(self.ctx.p.clone()))),
             (V::SelfObj, "dir_model") => Ok(V::Path(self.ctx.dir.to_path_buf())),
-            (V::SelfObj, "block_count") => lookup(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
-                .map(|value| V::J(value.clone()))
-                .ok_or(Unknown),
-            // tensconv reads a Hugging Face config.json checkpoint, never the
-            // Mistral params.json format (hf_config_to_gguf vocab_size row).
+            // converter_attributes: false for every class chosen from config.json.
             (V::SelfObj, "is_mistral_format") => Ok(V::J(Value::Bool(false))),
             (V::SelfObj, "find_hparam") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::SelfObj, _) => self.self_attribute(name),
             (V::J(Value::Object(_)), "get") => Ok(V::Bound(Box::new(base), name.into())),
             (V::Path(_), "is_file" | "exists") => Ok(V::Bound(Box::new(base), name.into())),
             (V::J(Value::String(_)), "endswith" | "startswith" | "lower") => Ok(V::Bound(Box::new(base), name.into())),
             _ => Err(Unknown),
         }
+    }
+
+    /// converter_attributes: another self.<attr> is evaluated from the
+    /// assignments the converter's attributes entry lists, most derived class
+    /// first. Only the most derived class's assignment counts, and only when
+    /// it is a single plain assignment; anything else is unknown.
+    fn self_attribute(&mut self, name: &str) -> Ev<V> {
+        let entries = self.ctx.converter["attributes"].get(name).and_then(Value::as_array);
+        let Some(entries) = entries else {
+            // No index record (a unit test): block_count is TextModel's lookup.
+            if name == "block_count" && self.ctx.converter.is_null() {
+                return lookup(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
+                    .map(|value| V::J(value.clone()))
+                    .ok_or(Unknown);
+            }
+            return Err(Unknown);
+        };
+        let owner = |entry: &Value| -> Option<String> {
+            let text = entry.as_str()?;
+            Some(text.split(['.', ' ']).next()?.to_string())
+        };
+        let first_owner = entries.first().and_then(owner).ok_or(Unknown)?;
+        let own: Vec<&str> = entries
+            .iter()
+            .filter(|entry| owner(entry).as_deref() == Some(first_owner.as_str()))
+            .filter_map(Value::as_str)
+            .collect();
+        let [only] = own.as_slice() else { return Err(Unknown) };
+        let (_, expr) = only.split_once(": ").ok_or(Unknown)?;
+        if expr.starts_with("+=") || expr.starts_with("-=") || expr.starts_with("*=") {
+            return Err(Unknown);
+        }
+        self.depth += 1;
+        if self.depth > 16 {
+            return Err(Unknown);
+        }
+        // The assignment's own method locals are not indexed, so a local it
+        // reads is unknown.
+        let saved = self.locals.take();
+        let value = self.expr(expr);
+        self.locals = saved;
+        self.depth -= 1;
+        value
     }
 
     fn call(&mut self, func: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> Ev<V> {
@@ -1910,6 +1977,19 @@ mod tests {
         assert_eq!(to_meta(&list("[1, 0.5]"), "array"), Err(Unknown));
         assert_eq!(to_meta(&list("true"), "u32 or array"), Ok(Some(MetaValue::U32(1))));
         assert_eq!(to_meta(&list("7"), "u32 or array"), Ok(Some(MetaValue::U32(7))));
+    }
+
+    #[test]
+    fn self_attributes_come_from_the_converter_record() {
+        let dir = std::path::Path::new("/nonexistent");
+        let map = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2}"#);
+        // Cohere2MoeModel adds next-token layers with `+= n_nextn`: block_count is left out.
+        let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &map, dir).unwrap();
+        assert!(!cohere.keys.iter().any(|(key, _)| key.ends_with(".block_count")), "{:?}", cohere.keys);
+        assert!(cohere.unevaluated.iter().any(|key| key.ends_with(".block_count")));
+        // Qwen2Model keeps TextModel's block_count.
+        let qwen = class_keys("Qwen2Model", "qwen2", &map, dir).unwrap();
+        assert!(qwen.keys.iter().any(|(key, value)| key == "qwen2.block_count" && *value == MetaValue::U32(4)));
     }
 
     #[test]
