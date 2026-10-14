@@ -58,19 +58,35 @@ pub(crate) fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, 
     (p, r)
 }
 
-/// The AutoConfig to_dict defaults GGUF-039 lists (transformers 4.57.6), added
-/// where config.json lacks them. GGUF-040 allows no others.
-pub(crate) fn listed_defaults(top: &mut Map<String, Value>) {
-    let model_type = top.get("model_type").and_then(Value::as_str).unwrap_or("").to_string();
-    match model_type.as_str() {
-        "llama" => {
-            if !top.contains_key("head_dim") {
-                let hidden = top.get("hidden_size").and_then(Value::as_u64);
-                let heads = top.get("num_attention_heads").and_then(Value::as_u64).filter(|heads| *heads > 0);
-                if let Some((hidden, heads)) = hidden.zip(heads) {
-                    top.insert("head_dim".into(), Value::from(hidden / heads));
-                }
+static DEFAULTS_JSON: &str = include_str!("../tensdataspecs_readonly/specs/tables/hf-config-defaults.json");
+
+fn defaults_table() -> &'static Value {
+    static TABLE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| serde_json::from_str(DEFAULTS_JSON).expect("hf-config-defaults.json parses"))
+}
+
+/// GGUF-039 and GGUF-040: the defaults transformers' to_dict() adds, as
+/// tables/hf-config-defaults.json lists them for 14 model_types, with the
+/// derived-key formulas GGUF-039 gives. A default applies only when
+/// config.json lacks the key. For another model_type only the common keys
+/// are added, and the returned note says so.
+pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
+    let table = defaults_table();
+    if let Some(dtype) = top.remove("torch_dtype") {
+        top.entry("dtype").or_insert(dtype);
+    }
+    let given = top.clone();
+    let model_type = given.get("model_type").and_then(Value::as_str).unwrap_or("").to_string();
+    let entry = table["model_types"].get(model_type.as_str());
+    if let Some(entry) = entry {
+        let derived = entry["derived"].as_object();
+        for (key, value) in entry["defaults"].as_object().into_iter().flatten() {
+            if !given.contains_key(key) && !derived.is_some_and(|derived| derived.contains_key(key)) {
+                top.insert(key.clone(), value.clone());
             }
+        }
+        derived_keys(&model_type, &given, top, derived);
+        if entry["rope_scaling_type_copied_to_rope_type"] == Value::Bool(true) {
             if let Some(scaling) = top.get_mut("rope_scaling").and_then(Value::as_object_mut) {
                 if !scaling.contains_key("rope_type") {
                     if let Some(kind) = scaling.get("type").cloned() {
@@ -79,26 +95,118 @@ pub(crate) fn listed_defaults(top: &mut Map<String, Value>) {
                 }
             }
         }
-        "qwen2" if top.get("use_sliding_window") == Some(&Value::Bool(false)) => {
-            top.insert("sliding_window".into(), Value::Null);
+    }
+    for (key, value) in table["common"].as_object().into_iter().flatten() {
+        top.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    match entry {
+        Some(_) => None,
+        None => Some(format!(
+            "model_type {} is not in tables/hf-config-defaults.json, so only the common transformers defaults were added (GGUF-040)",
+            if model_type.is_empty() { "(none)" } else { model_type.as_str() }
+        )),
+    }
+}
+
+/// The GGUF-040 note for a config whose model_type the defaults table lacks.
+pub(crate) fn defaults_note(map: &Map<String, Value>) -> Option<String> {
+    let model_type = map.get("model_type").and_then(Value::as_str).unwrap_or("");
+    if defaults_table()["model_types"].get(model_type).is_some() {
+        return None;
+    }
+    let mut scratch = Map::new();
+    scratch.insert("model_type".into(), Value::from(model_type));
+    listed_defaults(&mut scratch)
+}
+
+/// GGUF-039's formulas for the keys the table marks derived.
+fn derived_keys(
+    model_type: &str,
+    given: &Map<String, Value>,
+    top: &mut Map<String, Value>,
+    derived: Option<&Map<String, Value>>,
+) {
+    let int = |top: &Map<String, Value>, key: &str| top.get(key).and_then(Value::as_u64);
+    // The value a derived key has before its formula: as given, else the table's.
+    let start = |key: &str| -> Option<Value> {
+        given
+            .get(key)
+            .cloned()
+            .or_else(|| derived.and_then(|derived| derived.get(key)).map(|row| row["value_when_all_absent"].clone()))
+    };
+    let absent_or_null = |key: &str| given.get(key).is_none_or(Value::is_null);
+    if model_type == "llama" && absent_or_null("head_dim") {
+        if let (Some(hidden), Some(heads)) = (int(top, "hidden_size"), int(top, "num_attention_heads").filter(|heads| *heads > 0)) {
+            top.insert("head_dim".into(), Value::from(hidden / heads));
         }
-        "phi3" if !top.contains_key("partial_rotary_factor") => {
-            top.insert("partial_rotary_factor".into(), Value::from(1.0));
+    }
+    let kv_when_null = ["llama", "mistral", "mixtral", "qwen2", "qwen3", "phi3", "smollm3", "olmo2", "granite"];
+    let kv_when_absent = ["llama", "phi3", "olmo2", "granite"];
+    let kv = given.get("num_key_value_heads");
+    if (kv == Some(&Value::Null) && kv_when_null.contains(&model_type))
+        || (kv.is_none() && kv_when_absent.contains(&model_type))
+    {
+        if let Some(heads) = top.get("num_attention_heads").cloned() {
+            top.insert("num_key_value_heads".into(), heads);
+        }
+    }
+    if matches!(model_type, "qwen2" | "qwen2_moe" | "qwen3" | "qwen3_moe") {
+        let window = if top.get("use_sliding_window") == Some(&Value::Bool(true)) {
+            given.get("sliding_window").cloned().unwrap_or(Value::from(4096))
+        } else {
+            Value::Null
+        };
+        top.insert("sliding_window".into(), window);
+    }
+    let layers = int(top, "num_hidden_layers").unwrap_or(0);
+    let kind = |sliding: bool| Value::from(if sliding { "sliding_attention" } else { "full_attention" });
+    let keep_layer_types = given.contains_key("layer_types");
+    match model_type {
+        "qwen2" | "qwen3" if !keep_layer_types => {
+            let windowed = top.get("sliding_window").is_some_and(|value| !value.is_null());
+            let from = int(top, "max_window_layers").unwrap_or(0);
+            let types = (0..layers).map(|i| kind(windowed && i >= from)).collect();
+            top.insert("layer_types".into(), Value::Array(types));
+        }
+        "gemma2" if !keep_layer_types => {
+            let types = (0..layers).map(|i| kind((i + 1) % 2 != 0)).collect();
+            top.insert("layer_types".into(), Value::Array(types));
+        }
+        "gemma3_text" => {
+            let pattern = given.get("sliding_window_pattern").and_then(Value::as_u64).unwrap_or(6);
+            top.insert("_sliding_window_pattern".into(), Value::from(pattern));
+            if !keep_layer_types {
+                let types = (0..layers).map(|i| kind(pattern != 0 && (i + 1) % pattern != 0)).collect();
+                top.insert("layer_types".into(), Value::Array(types));
+            }
+            let window = start("sliding_window");
+            let window = match (top.get("use_bidirectional_attention"), window.as_ref().and_then(Value::as_u64)) {
+                (Some(Value::Bool(true)), Some(window)) => Some(Value::from(window / 2 + 1)),
+                _ => window,
+            };
+            if let Some(window) = window {
+                top.insert("sliding_window".into(), window);
+            }
+        }
+        "smollm3" => {
+            let interval = int(top, "no_rope_layer_interval").unwrap_or(4).max(1);
+            let no_rope: Vec<u64> = match given.get("no_rope_layers").and_then(Value::as_array) {
+                Some(items) => items.iter().map(|item| item.as_u64().unwrap_or(0)).collect(),
+                None => (0..layers).map(|i| u64::from((i + 1) % interval != 0)).collect(),
+            };
+            if !given.contains_key("no_rope_layers") {
+                top.insert("no_rope_layers".into(), Value::from(no_rope.clone()));
+            }
+            if !keep_layer_types {
+                let windowed = top.get("use_sliding_window") == Some(&Value::Bool(true))
+                    && top.get("sliding_window").is_some_and(|value| !value.is_null());
+                let types = (0..layers as usize)
+                    .map(|i| kind(windowed && no_rope.get(i).copied() == Some(0)))
+                    .collect();
+                top.insert("layer_types".into(), Value::Array(types));
+            }
         }
         _ => {}
-    }
-    let generation = [
-        ("max_length", Value::from(20)),
-        ("temperature", Value::from(1.0)),
-        ("top_k", Value::from(50)),
-        ("top_p", Value::from(1.0)),
-        ("repetition_penalty", Value::from(1.0)),
-    ];
-    for (key, value) in generation {
-        top.entry(key).or_insert(value);
-    }
-    if let Some(dtype) = top.remove("torch_dtype") {
-        top.entry("dtype").or_insert(dtype);
     }
 }
 
@@ -2058,11 +2166,37 @@ mod tests {
             r#"{"model_type": "qwen2", "use_sliding_window": false, "sliding_window": 32768}"#,
         )));
         assert_eq!(merged.get("sliding_window"), Some(&Value::Null));
+        // qwen2's absent num_key_value_heads is the constant 32; llama's copies the heads.
+        assert_eq!(merged.get("num_key_value_heads"), Some(&Value::from(32)));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "llama", "num_attention_heads": 9, "hidden_size": 576}"#,
+        )));
+        assert_eq!(merged.get("num_key_value_heads"), Some(&Value::from(9)));
+        assert_eq!(merged.get("tie_word_embeddings"), Some(&Value::Bool(false)));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "qwen3", "num_hidden_layers": 4, "use_sliding_window": true, "sliding_window": 128, "max_window_layers": 2}"#,
+        )));
+        assert_eq!(merged.get("head_dim"), Some(&Value::from(128)));
+        assert_eq!(merged["layer_types"][1], Value::from("full_attention"));
+        assert_eq!(merged["layer_types"][2], Value::from("sliding_attention"));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "gemma3_text", "num_hidden_layers": 6, "use_bidirectional_attention": true}"#,
+        )));
+        assert_eq!(merged.get("sliding_window"), Some(&Value::from(2049)));
+        assert_eq!(merged["layer_types"][5], Value::from("full_attention"));
         let merged = crate::convert::merge_text_config(&Value::Object(config(
             r#"{"model_type": "x", "llm_config": {"hidden_size": 7}, "thinker_config": {"text_config": {"hidden_size": 9}}}"#,
         )));
-        // thinker_config.text_config is renamed last, so it is the text_config merged.
+        // thinker_config comes after llm_config, so it is the text_config merged.
         assert_eq!(merged.get("hidden_size"), Some(&Value::from(9)));
+        assert!(merged.contains_key("llm_config"));
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "x", "text_config": {"hidden_size": 1}, "thinker_config": {"text_config": {"hidden_size": 9}}, "lfm": {"hidden_size": 5}}"#,
+        )));
+        assert_eq!(merged.get("hidden_size"), Some(&Value::from(5)));
+        assert!(crate::convert::text_config_problem(&Value::Object(config(r#"{"thinker_config": {}}"#))).is_some());
+        assert!(crate::convert::text_config_problem(&Value::Object(config(r#"{"lm_config": null}"#))).is_some());
+        assert!(crate::convert::text_config_problem(&Value::Object(config(r#"{"text_config": {}}"#))).is_none());
     }
 
     #[test]

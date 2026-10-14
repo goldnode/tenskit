@@ -110,13 +110,15 @@ output.
 How the architecture and its changes are chosen:
 
 - The architecture is `general.architecture`, or `config.json` `architectures[0]`. `text_config.architectures[0]` is used when it is present, except for the few classes llama.cpp keeps at the top level. The converter class is the one registered for that Hugging Face class. When there is no `config.json` and an architecture has more than one converter class, the command stops, because the spec gives no preference order.
-- llama.cpp's converter reads transformers' `AutoConfig` dict, not `config.json` itself (GGUF-039). That dict adds the defaults of the model's config class. tenspile has no Python, so it reads `config.json` (GGUF-040) and adds only the defaults GGUF-039 lists:
-  - `head_dim` for a `llama` config;
-  - a null `sliding_window` for a `qwen2` config with `use_sliding_window: false`;
-  - `partial_rotary_factor` 1.0 for `phi3`;
-  - the generation defaults (`max_length` 20 and the rest).
+- llama.cpp's converter reads transformers' `AutoConfig` dict, not `config.json` itself (GGUF-039). That dict adds the defaults of the model's config class. tenspile has no Python, so it reads `config.json` (GGUF-040) and adds only the defaults GGUF-039 lists. For 14 model types, `tables/hf-config-defaults.json` gives every default `to_dict()` adds: `llama`, `mistral`, `mixtral`, the Qwen 2 and 3 types, the Gemma types, `phi3`, `smollm3`, `olmo2`, and `granite`. A default applies only to a key that `config.json` lacks. The derived keys follow GGUF-039's formulas:
+  - `head_dim` for `llama`;
+  - `num_key_value_heads` copied from the attention heads where transformers copies it;
+  - `sliding_window` null for the Qwen types unless `use_sliding_window` is true;
+  - `layer_types` for Qwen, Gemma 2 and 3, and SmolLM3, with Gemma 3's halved window under bidirectional attention.
 
-  It renames `llm_config`, `lm_config`, `language_config`, `lfm`, and `thinker_config.text_config` to `text_config` before merging. One warning says that a key depending on another transformers default may differ from llama.cpp's.
+  Another model type gets only the common `PretrainedConfig` keys, such as `max_length` 20, and a warning.
+
+  It renames `llm_config`, `lm_config`, `thinker_config.text_config`, `language_config`, and `lfm` to `text_config`, in that order, before merging. The last one present wins and replaces any `text_config`. A null one, or a `thinker_config` without `text_config`, stops the conversion, as it stops llama.cpp's. One warning says that a key depending on another transformers default may differ from llama.cpp's.
 - Hyperparameters follow `hf_config_to_gguf`, whose rows transcribe llama.cpp's `TextModel.set_gguf_parameters`. `text_config` is merged over the root object, and the first listed key that is present wins, as llama.cpp's `find_hparam` takes it. A null value counts as present: a base row is then not written, and a class rule that needs the value stops the conversion, because llama.cpp's converter would fail writing it. A sibling `config.json` is read only for those keys. A row is written only when its condition holds:
   - `attention.head_count_kv` only when the config gives it, and `attention.causal` only as false, when `is_causal` is false or `use_bidirectional_attention` is true;
   - `attention.key_length` and `value_length` only from an explicit `head_dim`;

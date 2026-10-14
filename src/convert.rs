@@ -44,6 +44,11 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
     let target = output_format(&request.output, request.format)?;
     let config_dir = resolved.path.parent().unwrap_or(Path::new("."));
     let config = read_config(config_dir)?;
+    if request.rename {
+        if let Some(problem) = config.as_ref().and_then(text_config_problem) {
+            return Err(msg(problem));
+        }
+    }
     let hparams = config.as_ref().map(merge_text_config);
     let mut warnings = Vec::new();
     #[cfg(format_safetensors)]
@@ -1678,10 +1683,11 @@ fn gguf_hparams(
         out.push(("general.name".into(), MetaValue::String(name.to_string())));
     }
     warnings.push(
-        "the keys come from config.json with the transformers defaults GGUF-039 lists; llama.cpp reads \
+        "the keys come from config.json with the transformers defaults GGUF-039 and hf-config-defaults.json list; llama.cpp reads \
          transformers' AutoConfig dict, so a key that depends on another default may differ (GGUF-040)"
             .into(),
     );
+    warnings.extend(crate::gguf_keys::defaults_note(map));
     let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
     out.extend(found.keys);
     let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
@@ -1714,19 +1720,42 @@ fn read_config(dir: &Path) -> Result<Option<Value>> {
 /// tenspile gets without transformers. The defaults GGUF-039 lists are added
 /// to config.json, the sub-config renames are applied, and text_config is
 /// merged over the top level, as TextModel.__init__ does.
+/// GGUF-039: load_hparams' five tests, in this order. Each sets text_config,
+/// so the last present one wins and replaces any text_config already there.
+/// The source keys stay in the dict.
+fn renamed_text_config(top: &Map<String, Value>) -> Option<Value> {
+    let mut chosen = None;
+    for name in ["llm_config", "lm_config", "thinker_config", "language_config", "lfm"] {
+        let Some(value) = top.get(name) else { continue };
+        chosen = Some(if name == "thinker_config" {
+            value.get("text_config").cloned().unwrap_or(Value::Null)
+        } else {
+            value.clone()
+        });
+    }
+    chosen
+}
+
+/// The renames that stop llama.cpp's converter: a null source makes
+/// text_config null, which TextModel.__init__ cannot merge, and a
+/// thinker_config without text_config raises KeyError.
+pub(crate) fn text_config_problem(config: &Value) -> Option<String> {
+    let top = config.as_object()?;
+    if top.get("thinker_config").is_some_and(|thinker| thinker.get("text_config").is_none()) {
+        return Some("config.json thinker_config has no text_config; llama.cpp's converter stops there too".into());
+    }
+    match renamed_text_config(top) {
+        Some(Value::Null) => Some(
+            "config.json sets text_config to null through a sub-config; llama.cpp's converter stops there too".into(),
+        ),
+        _ => None,
+    }
+}
+
 pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
     let mut top = config.as_object().cloned().unwrap_or_default();
-    crate::gguf_keys::listed_defaults(&mut top);
-    for name in ["llm_config", "lm_config", "language_config", "lfm"] {
-        if let Some(sub) = top.remove(name) {
-            top.insert("text_config".into(), sub);
-        }
-    }
-    if let Some(sub) = top
-        .get_mut("thinker_config")
-        .and_then(Value::as_object_mut)
-        .and_then(|thinker| thinker.remove("text_config"))
-    {
+    let _ = crate::gguf_keys::listed_defaults(&mut top);
+    if let Some(sub) = renamed_text_config(&top) {
         top.insert("text_config".into(), sub);
     }
     let mut merged = top.clone();
