@@ -108,15 +108,35 @@ pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
     }
 }
 
-/// The GGUF-040 note for a config whose model_type the defaults table lacks.
-pub(crate) fn defaults_note(map: &Map<String, Value>) -> Option<String> {
-    let model_type = map.get("model_type").and_then(Value::as_str).unwrap_or("");
-    if defaults_table()["model_types"].get(model_type).is_some() {
-        return None;
+/// GGUF-040's notes for a config.json: a model_type, top-level or of the
+/// text_config, that the defaults table lacks; and a composite type that
+/// transformers gives a text_config built from the top-level keys when
+/// config.json has none, which tenspile does not build.
+pub(crate) fn defaults_notes(config: &Value) -> Vec<String> {
+    let table = defaults_table();
+    let mut notes = Vec::new();
+    let top_type = config.get("model_type").and_then(Value::as_str).unwrap_or("");
+    let text = config.get("text_config").filter(|text| text.is_object());
+    let mut unlisted = |model_type: &str| {
+        if table["model_types"].get(model_type).is_none() {
+            let mut scratch = Map::new();
+            scratch.insert("model_type".into(), Value::from(model_type));
+            notes.extend(listed_defaults(&mut scratch));
+        }
+    };
+    unlisted(top_type);
+    if let Some(text_type) = text.and_then(|text| text.get("model_type")).and_then(Value::as_str) {
+        unlisted(text_type);
     }
-    let mut scratch = Map::new();
-    scratch.insert("model_type".into(), Value::from(model_type));
-    listed_defaults(&mut scratch)
+    let composite = &table["composite_text_config"][top_type];
+    if text.is_none() && composite["created_when_absent"] == Value::Bool(true) {
+        notes.push(format!(
+            "model_type {top_type} gets a text_config ({}) built from the top-level keys in transformers; \
+             tenspile does not build one, so the merged values may differ from llama.cpp's (GGUF-040)",
+            composite["default_text_model_type"].as_str().unwrap_or("?")
+        ));
+    }
+    notes
 }
 
 /// GGUF-039's formulas for the keys the table marks derived.
@@ -914,7 +934,7 @@ impl Ctx<'_> {
                 if kind == Step::SelfCall && target.is_none() {
                     continue;
                 }
-                let mut run = |this: &mut Self, into: &mut ClassKeys| match target {
+                let run = |this: &mut Self, into: &mut ClassKeys| match target {
                     Some("TextModel._try_set_pooling_type") => pooling(this.arch, this.map, this.dir, &mut into.keys),
                     Some(target) if kind == Step::SelfCall => this.method(target, &[], into),
                     _ => this.chain(rest, into),
@@ -1161,9 +1181,10 @@ impl Eval<'_, '_> {
     /// converter_attributes: no_mtp and mtp_only are command-line switches,
     /// off by default. Any other self.<attr> runs the converter's
     /// attribute_assignments in order: each site's guard, then `=` or `+=`
-    /// of its value, reading its own guarded locals. A site outside __init__
-    /// (no init_order) runs at a time the index does not give, so it makes the
-    /// value unknown unless its guard is false.
+    /// of its value, reading its own guarded locals. Each reference's phase
+    /// places it in ModelBase.write's run order: sites after the key writes
+    /// or never reached are skipped, and a site in set_gguf_parameters or an
+    /// unknown helper makes the value unknown unless its guard is false.
     fn self_attribute(&mut self, name: &str) -> Ev<V> {
         if matches!(name, "no_mtp" | "mtp_only") {
             return Ok(V::J(Value::Bool(false)));
@@ -1193,12 +1214,23 @@ impl Eval<'_, '_> {
                 pending: Default::default(),
                 depth: self.depth + 1,
             };
+            // converter_attributes run_order: a phase after the key writes, or
+            // an __init__ the chain never reaches, does not count.
+            let phase = reference["phase"].as_str().unwrap_or("unknown");
+            if matches!(phase, "never" | "after set_gguf_parameters") {
+                continue;
+            }
             let guard = site["when"].as_str().unwrap_or("always");
             let holds = guard == "always" || truthy(&eval.expr(guard)?);
             if !holds {
                 continue;
             }
-            if reference.get("init_order").is_none() {
+            // In set_gguf_parameters it runs between writes, and an "unknown"
+            // helper's callers decide, so its place in the order is not known.
+            if !matches!(
+                phase,
+                "class attribute" | "init" | "prepare_tensors" | "prepare_metadata, before set_gguf_parameters"
+            ) {
                 return Err(Unknown);
             }
             let next = eval.expr(site["value"].as_str().ok_or(Unknown)?)?;
@@ -2137,6 +2169,13 @@ mod tests {
         let nextn = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "num_nextn_predict_layers": 1}"#);
         let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &nextn, dir).unwrap();
         assert_eq!(get(&cohere), Some(MetaValue::U32(5)), "{:?}", cohere.unevaluated);
+        // NemotronHPuzzleModel calls GraniteHybridModel.__init__ directly, so
+        // NemotronH's MTP step never runs for it.
+        let (p, _) = rope_params(Some(&nextn));
+        let record = &index()["converters"]["NemotronHPuzzleModel"];
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
+        assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
         let mtp = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "mtp_num_hidden_layers": 1}"#);
         let qwen35 = class_keys("Qwen3_5TextModel", "qwen35", &mtp, dir).unwrap();
@@ -2229,6 +2268,16 @@ mod tests {
             r#"{"model_type": "gemma3_text", "num_hidden_layers": 6, "use_bidirectional_attention": true}"#,
         )));
         assert_eq!(merged.get("sliding_window"), Some(&Value::from(2049)));
+        // A text_config gets its own defaults and the common keys, and they win.
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "gemma3", "architectures": ["Gemma3ForConditionalGeneration"], "eos_token_id": [1, 106],
+                "text_config": {"model_type": "gemma3_text", "hidden_size": 8}}"#,
+        )));
+        assert_eq!(merged.get("eos_token_id"), Some(&Value::from(1)));
+        assert_eq!(merged.get("architectures"), Some(&Value::Null));
+        assert_eq!(merged.get("model_type"), Some(&Value::from("gemma3_text")));
+        let notes = defaults_notes(&Value::Object(config(r#"{"model_type": "qwen2_5_vl"}"#)));
+        assert!(notes.iter().any(|note| note.contains("qwen2_5_vl_text")), "{notes:?}");
         assert_eq!(merged["layer_types"][5], Value::from("full_attention"));
         let merged = crate::convert::merge_text_config(&Value::Object(config(
             r#"{"model_type": "x", "llm_config": {"hidden_size": 7}, "thinker_config": {"text_config": {"hidden_size": 9}}}"#,

@@ -50,6 +50,15 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         }
     }
     let hparams = config.as_ref().map(merge_text_config);
+    // GGUF-039: hf_arch is the top-level architectures[0], before text_config
+    // is merged over it.
+    let hf_arch = config
+        .as_ref()
+        .and_then(|config| config.get("architectures"))
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let mut warnings = Vec::new();
     #[cfg(format_safetensors)]
     if target == FormatName::Safetensors {
@@ -70,7 +79,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
             }
             if transcription.is_none() {
                 check_hooks(&arch, &converter)?;
-                apply_filter(&mut tensors, &arch, &converter, hparams.as_ref(), &mut warnings)?;
+                apply_filter(&mut tensors, &arch, &converter, hf_arch.as_deref(), &mut warnings)?;
             }
             apply_global_filters(&mut tensors, &converter, &mut warnings)?;
             extra_tensor_note(&converter, hparams.as_ref(), &mut warnings);
@@ -79,6 +88,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 &arch,
                 &converter,
                 hparams.as_ref(),
+                hf_arch.as_deref(),
                 config_dir,
                 &mut warnings,
             )?;
@@ -86,6 +96,9 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         rename_tensors(&mut tensors, &arch, layers, &mut warnings)?;
         if target == FormatName::Gguf {
             if let Some(map) = &hparams {
+                if let Some(config) = &config {
+                    warnings.extend(crate::gguf_keys::defaults_notes(config));
+                }
                 hparam_keys = Some(gguf_hparams(&arch, &converter.class, map, config_dir, &mut warnings)?);
             }
         }
@@ -356,12 +369,13 @@ fn apply_values(
     arch: &str,
     converter: &ConverterRecord,
     hparams: Option<&Map<String, Value>>,
+    hf_arch: Option<&str>,
     dir: &Path,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     if converter.complete {
         for tensor in tensors.iter_mut() {
-            apply_branches(tensor, arch, converter, hparams)?;
+            apply_branches(tensor, arch, converter, hf_arch)?;
         }
         return Ok(());
     }
@@ -435,7 +449,7 @@ fn apply_filter(
     tensors: &mut Vec<Tensor>,
     arch: &str,
     converter: &ConverterRecord,
-    hparams: Option<&Map<String, Value>>,
+    hf_arch: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let Some(filter) = &converter.filter else {
@@ -449,12 +463,12 @@ fn apply_filter(
             converter.class
         )));
     }
-    let class = hf_arch_from_hparams(hparams);
+    let class = hf_arch;
     let mut kept = Vec::with_capacity(tensors.len());
     for tensor in tensors.drain(..) {
         let mut dropped = false;
         for when in &filter.drop_when {
-            if when_matches(when, &tensor.name, class.as_deref())? {
+            if when_matches(when, &tensor.name, class)? {
                 dropped = true;
                 break;
             }
@@ -805,25 +819,15 @@ fn apply_branches(
     tensor: &mut Tensor,
     arch: &str,
     converter: &ConverterRecord,
-    hparams: Option<&Map<String, Value>>,
+    hf_arch: Option<&str>,
 ) -> Result<()> {
-    let class = hf_arch_from_hparams(hparams);
     for branch in &converter.branches {
-        if !when_matches(&branch.when, &tensor.name, class.as_deref())? {
+        if !when_matches(&branch.when, &tensor.name, hf_arch)? {
             continue;
         }
         apply_expr(tensor, arch, &branch.assigns, &branch.expr)?;
     }
     Ok(())
-}
-
-fn hf_arch_from_hparams(hparams: Option<&Map<String, Value>>) -> Option<String> {
-    hparams
-        .and_then(|map| map.get("architectures"))
-        .and_then(Value::as_array)
-        .and_then(|items| items.first())
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 fn when_matches(when: &str, name: &str, hf_arch: Option<&str>) -> Result<bool> {
@@ -1687,7 +1691,6 @@ fn gguf_hparams(
          transformers' AutoConfig dict, so a key that depends on another default may differ (GGUF-040)"
             .into(),
     );
-    warnings.extend(crate::gguf_keys::defaults_note(map));
     let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
     out.extend(found.keys);
     let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
@@ -1757,6 +1760,11 @@ pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
     let _ = crate::gguf_keys::listed_defaults(&mut top);
     if let Some(sub) = renamed_text_config(&top) {
         top.insert("text_config".into(), sub);
+    }
+    // GGUF-039: to_dict() writes text_config as the sub-config's own full
+    // dict, with its class defaults and the common keys, and those win in the merge.
+    if let Some(sub) = top.get_mut("text_config").and_then(Value::as_object_mut) {
+        let _ = crate::gguf_keys::listed_defaults(sub);
     }
     let mut merged = top.clone();
     if let Some(text) = top.get("text_config").and_then(Value::as_object) {
