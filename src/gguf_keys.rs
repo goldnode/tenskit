@@ -828,16 +828,11 @@ impl Ctx<'_> {
     /// The block_count row writes self.block_count, which 40 converters assign
     /// again in their own __init__ (converter_attributes).
     fn reassigned_block_count(&mut self, found: &mut ClassKeys) -> Result<()> {
-        let entries = self.converter["attributes"]["block_count"].as_array();
-        let reassigned = entries
-            .and_then(|entries| entries.first())
-            .and_then(Value::as_str)
-            .is_some_and(|entry| !entry.starts_with("TextModel.__init__"));
-        if !reassigned {
+        if self.converter["attribute_assignments"].get("block_count").is_none() {
             return Ok(());
         }
         let key = self.key("{arch}.block_count");
-        let mut eval = Eval { ctx: self, locals: None, vars: Default::default(), depth: 0 };
+        let mut eval = Eval { ctx: self, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         let value = eval.self_attribute("block_count").and_then(|value| to_meta(&value, "u32"));
         match value {
             Ok(Some(value)) => set(&mut found.keys, key, value),
@@ -880,7 +875,7 @@ impl Ctx<'_> {
         steps.sort_by_key(|step| step.0);
         for (_, step, kind) in steps {
             let is_write = kind == Step::Write;
-            let mut eval = Eval { ctx: self, locals, vars: Default::default(), depth: 0 };
+            let mut eval = Eval { ctx: self, locals, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
             let guard = step["when"].as_str().unwrap_or("always");
             let holds = if guard == "always" { Ok(true) } else { eval.expr(guard).map(|value| truthy(&value)) };
             if is_write {
@@ -1057,7 +1052,13 @@ fn inferred_array(items: &[Value]) -> Ev<MetaValue> {
 struct Eval<'c, 'a> {
     ctx: &'c Ctx<'a>,
     locals: Option<&'static Map<String, Value>>,
+    /// The locals of an attribute assignment site: each assignment in run
+    /// order, with its op and its own guard.
+    site_locals: Option<&'static Map<String, Value>>,
     vars: std::collections::HashMap<String, V>,
+    /// Site locals being evaluated, so a guard that reads its own local
+    /// before it has a value is unknown rather than endless.
+    pending: std::collections::HashSet<String>,
     depth: usize,
 }
 
@@ -1091,6 +1092,9 @@ impl Eval<'_, '_> {
                 }))
             }
             _ => {}
+        }
+        if let Some(assignments) = self.site_locals.and_then(|locals| locals.get(name)).and_then(Value::as_array) {
+            return self.site_local(name, assignments);
         }
         // A local with one assignment in the method is that expression. With
         // more than one, which applies depends on code the index does not give.
@@ -1129,13 +1133,43 @@ impl Eval<'_, '_> {
         }
     }
 
-    /// converter_attributes: another self.<attr> is evaluated from the
-    /// assignments the converter's attributes entry lists, most derived class
-    /// first. Only the most derived class's assignment counts, and only when
-    /// it is a single plain assignment; anything else is unknown.
+    /// A site local: its assignments run in order, each when its own guard
+    /// holds, with `=` replacing and `+=` adding.
+    fn site_local(&mut self, name: &str, assignments: &'static [Value]) -> Ev<V> {
+        if !self.pending.insert(name.to_string()) {
+            return Err(Unknown);
+        }
+        let mut value: Option<V> = None;
+        for assignment in assignments {
+            let guard = assignment["when"].as_str().unwrap_or("always");
+            let holds = guard == "always" || truthy(&self.expr(guard)?);
+            if holds {
+                let next = self.expr(assignment["value"].as_str().ok_or(Unknown)?)?;
+                let next = match (assignment["op"].as_str(), &value) {
+                    (Some("+="), Some(current)) => arith("+", current, &next)?,
+                    (Some("+="), None) => return Err(Unknown),
+                    _ => next,
+                };
+                self.vars.insert(name.to_string(), next.clone());
+                value = Some(next);
+            }
+        }
+        self.pending.remove(name);
+        value.ok_or(Unknown)
+    }
+
+    /// converter_attributes: no_mtp and mtp_only are command-line switches,
+    /// off by default. Any other self.<attr> runs the converter's
+    /// attribute_assignments in order: each site's guard, then `=` or `+=`
+    /// of its value, reading its own guarded locals. A site outside __init__
+    /// (no init_order) runs at a time the index does not give, so it makes the
+    /// value unknown unless its guard is false.
     fn self_attribute(&mut self, name: &str) -> Ev<V> {
-        let entries = self.ctx.converter["attributes"].get(name).and_then(Value::as_array);
-        let Some(entries) = entries else {
+        if matches!(name, "no_mtp" | "mtp_only") {
+            return Ok(V::J(Value::Bool(false)));
+        }
+        let refs = self.ctx.converter["attribute_assignments"].get(name).and_then(Value::as_array);
+        let Some(refs) = refs else {
             // No index record (a unit test): block_count is TextModel's lookup.
             if name == "block_count" && self.ctx.converter.is_null() {
                 return lookup(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
@@ -1144,32 +1178,37 @@ impl Eval<'_, '_> {
             }
             return Err(Unknown);
         };
-        let owner = |entry: &Value| -> Option<String> {
-            let text = entry.as_str()?;
-            Some(text.split(['.', ' ']).next()?.to_string())
-        };
-        let first_owner = entries.first().and_then(owner).ok_or(Unknown)?;
-        let own: Vec<&str> = entries
-            .iter()
-            .filter(|entry| owner(entry).as_deref() == Some(first_owner.as_str()))
-            .filter_map(Value::as_str)
-            .collect();
-        let [only] = own.as_slice() else { return Err(Unknown) };
-        let (_, expr) = only.split_once(": ").ok_or(Unknown)?;
-        if expr.starts_with("+=") || expr.starts_with("-=") || expr.starts_with("*=") {
-            return Err(Unknown);
-        }
-        self.depth += 1;
         if self.depth > 16 {
             return Err(Unknown);
         }
-        // The assignment's own method locals are not indexed, so a local it
-        // reads is unknown.
-        let saved = self.locals.take();
-        let value = self.expr(expr);
-        self.locals = saved;
-        self.depth -= 1;
-        value
+        let sites = &index()["assignment_sites"];
+        let mut value: Option<V> = None;
+        for reference in refs {
+            let site = &sites[reference["site"].as_str().ok_or(Unknown)?];
+            let mut eval = Eval {
+                ctx: self.ctx,
+                locals: None,
+                site_locals: site.get("locals").and_then(Value::as_object),
+                vars: Default::default(),
+                pending: Default::default(),
+                depth: self.depth + 1,
+            };
+            let guard = site["when"].as_str().unwrap_or("always");
+            let holds = guard == "always" || truthy(&eval.expr(guard)?);
+            if !holds {
+                continue;
+            }
+            if reference.get("init_order").is_none() {
+                return Err(Unknown);
+            }
+            let next = eval.expr(site["value"].as_str().ok_or(Unknown)?)?;
+            value = Some(match (site["op"].as_str(), &value) {
+                (Some("+="), Some(current)) => arith("+", current, &next)?,
+                (Some("+="), None) => return Err(Unknown),
+                _ => next,
+            });
+        }
+        value.ok_or(Unknown)
     }
 
     fn call(&mut self, func: V, args: Vec<V>, kwargs: Vec<(String, V)>) -> Ev<V> {
@@ -1889,7 +1928,7 @@ mod tests {
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
         let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, depth: 0 };
-        let mut eval = Eval { ctx: &ctx, locals: None, vars: Default::default(), depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
 
@@ -2091,10 +2130,17 @@ mod tests {
     fn self_attributes_come_from_the_converter_record() {
         let dir = std::path::Path::new("/nonexistent");
         let map = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2}"#);
-        // Cohere2MoeModel adds next-token layers with `+= n_nextn`: block_count is left out.
+        // Cohere2MoeModel adds next-token layers with `+= n_nextn` when there are any.
+        let get = |found: &ClassKeys| found.keys.iter().find(|(key, _)| key.ends_with(".block_count")).map(|(_, value)| value.clone());
         let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &map, dir).unwrap();
-        assert!(!cohere.keys.iter().any(|(key, _)| key.ends_with(".block_count")), "{:?}", cohere.keys);
-        assert!(cohere.unevaluated.iter().any(|key| key.ends_with(".block_count")));
+        assert_eq!(get(&cohere), Some(MetaValue::U32(4)));
+        let nextn = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "num_nextn_predict_layers": 1}"#);
+        let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &nextn, dir).unwrap();
+        assert_eq!(get(&cohere), Some(MetaValue::U32(5)), "{:?}", cohere.unevaluated);
+        // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
+        let mtp = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "mtp_num_hidden_layers": 1}"#);
+        let qwen35 = class_keys("Qwen3_5TextModel", "qwen35", &mtp, dir).unwrap();
+        assert_eq!(get(&qwen35), Some(MetaValue::U32(5)), "{:?}", qwen35.unevaluated);
         // Qwen2Model keeps TextModel's block_count.
         let qwen = class_keys("Qwen2Model", "qwen2", &map, dir).unwrap();
         assert!(qwen.keys.iter().any(|(key, value)| key == "qwen2.block_count" && *value == MetaValue::U32(4)));
@@ -2112,7 +2158,7 @@ mod tests {
             for write in record["writes"].as_array().into_iter().flatten() {
                 for field in ["when", "value"] {
                     if let Some(text) = write[field].as_str() {
-                        let mut eval = Eval { ctx: &ctx, locals, vars: Default::default(), depth: 0 };
+                        let mut eval = Eval { ctx: &ctx, locals, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
                         let _ = eval.expr(text);
                         total += 1;
                     }
