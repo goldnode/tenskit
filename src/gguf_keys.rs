@@ -508,11 +508,24 @@ pub(crate) struct ClassKeys {
 /// gguf_class_parameters is that transcription; any other class is its
 /// writes in tables/gguf-config-keys.json, evaluated where the guard and the
 /// value can be.
+#[cfg(test)]
 pub(crate) fn class_keys(
     class: &str,
     arch: &str,
     map: &Map<String, Value>,
     dir: &std::path::Path,
+) -> Result<ClassKeys> {
+    class_keys_with(class, arch, map, dir, &[])
+}
+
+/// class_keys, with the checkpoint's tensor names after the filter_tensors
+/// chain and the global filters (converter_attributes model_tensors).
+pub(crate) fn class_keys_with(
+    class: &str,
+    arch: &str,
+    map: &Map<String, Value>,
+    dir: &std::path::Path,
+    tensors: &[String],
 ) -> Result<ClassKeys> {
     let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
     let record = index()["converters"].get(class);
@@ -526,7 +539,7 @@ pub(crate) fn class_keys(
     };
     let (p, _) = rope_params(Some(map));
     let converter = &index()["converters"][class];
-    let mut ctx = Ctx { map, p: &p, dir, arch, converter, depth: 0 };
+    let mut ctx = Ctx { map, p: &p, dir, arch, converter, tensors, depth: 0 };
     ctx.chain(&chain, &mut found)?;
     Ok(found)
 }
@@ -814,6 +827,8 @@ struct Ctx<'a> {
     /// The converter's record: its self_calls map resolves self.<m>() for
     /// this converter, since a method record's resolves_to may say "per converter".
     converter: &'static Value,
+    /// converter_attributes model_tensors: the tensor names after filtering.
+    tensors: &'a [String],
     depth: usize,
 }
 
@@ -980,6 +995,9 @@ enum V {
     SelfObj,
     Builtin(&'static str),
     Bound(Box<V>, String),
+    /// A re.match result: the whole match and each group, None where a
+    /// group did not take part.
+    Match(Vec<Option<String>>),
 }
 
 fn truthy(value: &V) -> bool {
@@ -1099,8 +1117,15 @@ impl Eval<'_, '_> {
         }
         match name {
             "self" => return Ok(V::SelfObj),
-            "int" | "float" | "len" | "bool" | "str" | "abs" | "min" | "max" => {
+            "re" => return Ok(V::Builtin("re")),
+            "int" | "float" | "len" | "bool" | "str" | "abs" | "min" | "max" | "any" | "all" | "sum" | "list" | "sorted" | "_set" => {
                 return Ok(V::Builtin(match name {
+                    "_set" => "_set",
+                    "any" => "any",
+                    "all" => "all",
+                    "sum" => "sum",
+                    "list" => "list",
+                    "sorted" => "sorted",
                     "int" => "int",
                     "float" => "float",
                     "len" => "len",
@@ -1147,6 +1172,7 @@ impl Eval<'_, '_> {
             (V::SelfObj, "find_hparam") => Ok(V::Bound(Box::new(base), name.into())),
             (V::SelfObj, _) => self.self_attribute(name),
             (V::J(Value::Object(_)), "get") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::Builtin("re"), "match") | (V::Match(_), "group") => Ok(V::Bound(Box::new(base), name.into())),
             (V::Path(_), "is_file" | "exists") => Ok(V::Bound(Box::new(base), name.into())),
             (V::J(Value::String(_)), "endswith" | "startswith" | "lower") => Ok(V::Bound(Box::new(base), name.into())),
             _ => Err(Unknown),
@@ -1188,6 +1214,10 @@ impl Eval<'_, '_> {
     fn self_attribute(&mut self, name: &str) -> Ev<V> {
         if matches!(name, "no_mtp" | "mtp_only") {
             return Ok(V::J(Value::Bool(false)));
+        }
+        if name == "model_tensors" {
+            let names = self.ctx.tensors.iter().map(|name| (name.clone(), Value::Null)).collect();
+            return Ok(V::J(Value::Object(names)));
         }
         let refs = self.ctx.converter["attribute_assignments"].get(name).and_then(Value::as_array);
         let Some(refs) = refs else {
@@ -1285,6 +1315,28 @@ impl Eval<'_, '_> {
                     Ok(V::J(Value::Bool(hit)))
                 }
                 (V::J(Value::String(text)), "lower") => Ok(V::J(Value::String(text.to_lowercase()))),
+                // re.match anchors at the start of the string.
+                (V::Builtin("re"), "match") => {
+                    let pattern = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                    let text = args.get(1).map(json).transpose()?.ok_or(Unknown)?;
+                    let (Some(pattern), Some(text)) = (pattern.as_str(), text.as_str()) else { return Err(Unknown) };
+                    let compiled = regex::Regex::new(&format!("^(?:{pattern})")).map_err(|_| Unknown)?;
+                    Ok(match compiled.captures(text) {
+                        Some(caps) => V::Match(caps.iter().map(|group| group.map(|m| m.as_str().to_string())).collect()),
+                        None => V::J(Value::Null),
+                    })
+                }
+                (V::Match(groups), "group") => {
+                    let index = match args.first() {
+                        None => 0,
+                        Some(V::J(Value::Number(number))) => number.as_u64().ok_or(Unknown)? as usize,
+                        _ => return Err(Unknown),
+                    };
+                    match groups.get(index).ok_or(Unknown)? {
+                        Some(text) => Ok(V::J(Value::String(text.clone()))),
+                        None => Ok(V::J(Value::Null)),
+                    }
+                }
                 _ => Err(Unknown),
             },
             V::Builtin(name) => {
@@ -1308,7 +1360,46 @@ impl Eval<'_, '_> {
                         Value::Object(map) => Ok(V::J(Value::from(map.len()))),
                         _ => Err(Unknown),
                     },
-                    "bool" => Ok(V::J(Value::Bool(truthy(&V::J(first))))),
+"bool" => Ok(V::J(Value::Bool(truthy(&V::J(first))))),
+                    "any" | "all" | "sum" | "list" | "sorted" | "_set" => {
+                        let items: Vec<Value> = match first {
+                            Value::Array(items) => items,
+                            Value::Object(map) => map.keys().map(|key| Value::String(key.clone())).collect(),
+                            _ => return Err(Unknown),
+                        };
+                        match name {
+                            "any" => Ok(V::J(Value::Bool(items.iter().any(|item| truthy(&V::J(item.clone())))))),
+                            "all" => Ok(V::J(Value::Bool(items.iter().all(|item| truthy(&V::J(item.clone())))))),
+                            "sum" => {
+                                let mut total = V::J(Value::from(0));
+                                for item in items {
+                                    total = arith("+", &total, &V::J(item))?;
+                                }
+                                Ok(total)
+                            }
+                            "list" => Ok(V::J(Value::Array(items))),
+                            "_set" => {
+                                let mut unique: Vec<Value> = Vec::new();
+                                for item in items {
+                                    if !unique.contains(&item) {
+                                        unique.push(item);
+                                    }
+                                }
+                                Ok(V::J(Value::Array(unique)))
+                            }
+                            _ => {
+                                let mut items = items;
+                                if items.iter().all(Value::is_string) {
+                                    items.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+                                } else if items.iter().all(Value::is_number) {
+                                    items.sort_by(|a, b| a.as_f64().partial_cmp(&b.as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+                                } else {
+                                    return Err(Unknown);
+                                }
+                                Ok(V::J(Value::Array(items)))
+                            }
+                        }
+                    }
                     "str" => match first {
                         Value::String(text) => Ok(V::J(Value::String(text))),
                         _ => Err(Unknown),
@@ -1473,6 +1564,41 @@ impl Eval<'_, '_> {
                 }
                 Ok(V::J(Value::Object(map)))
             }
+            E::Comp(elt, name, iter, cond) => {
+                let items: Vec<Value> = match self.eval(iter)? {
+                    V::J(Value::Array(items)) => items,
+                    V::J(Value::Object(map)) => map.keys().map(|key| Value::String(key.clone())).collect(),
+                    V::J(Value::String(text)) => text.chars().map(|c| Value::String(c.to_string())).collect(),
+                    _ => return Err(Unknown),
+                };
+                let saved = self.vars.remove(name);
+                let mut out = Vec::new();
+                let mut result = Ok(());
+                for item in items {
+                    self.vars.insert(name.clone(), V::J(item));
+                    let keep = match cond {
+                        Some(cond) => self.eval(cond).map(|value| truthy(&value)),
+                        None => Ok(true),
+                    };
+                    match keep.and_then(|keep| if keep { self.eval(elt).map(Some) } else { Ok(None) }) {
+                        Ok(Some(V::J(value))) => out.push(value),
+                        Ok(Some(_)) => {
+                            result = Err(Unknown);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            result = Err(err);
+                            break;
+                        }
+                    }
+                }
+                self.vars.remove(name);
+                if let Some(saved) = saved {
+                    self.vars.insert(name.clone(), saved);
+                }
+                result.map(|()| V::J(Value::Array(out)))
+            }
             E::BinPath(left, right) => match (self.eval(left)?, self.eval(right)?) {
                 (V::Path(path), V::J(Value::String(part))) => Ok(V::Path(path.join(part))),
                 (left, right) => arith("/", &left, &right),
@@ -1568,6 +1694,8 @@ enum E {
     Walrus(String, Box<E>),
     List(Vec<E>),
     Dict(Vec<(E, E)>),
+    /// `elt for name in iter [if cond]`, as a list (a generator in a call).
+    Comp(Box<E>, String, Box<E>, Option<Box<E>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1622,11 +1750,16 @@ fn lex(text: &str) -> Option<Vec<Tok>> {
                 if next == '\\' {
                     let escaped = *chars.get(at)?;
                     at += 1;
-                    out.push(match escaped {
-                        'n' => '\n',
-                        't' => '\t',
-                        other => other,
-                    });
+                    // Python keeps the backslash of an escape it does not know, as in '\d'.
+                    match escaped {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        '\\' | '\'' | '"' => out.push(escaped),
+                        other => {
+                            out.push('\\');
+                            out.push(other);
+                        }
+                    }
                 } else {
                     out.push(next);
                 }
@@ -1824,7 +1957,8 @@ impl Parser {
                     if let Some(kw) = self.keyword_arg() {
                         kwargs.push(kw);
                     } else {
-                        args.push(self.named()?);
+                        let arg = self.named()?;
+                        args.push(self.comprehension(arg)?);
                     }
                     if !self.eat_op(",") {
                         if !self.eat_op(")") {
@@ -1852,6 +1986,24 @@ impl Parser {
                 return Some(base);
             }
         }
+    }
+
+    /// After the element of a comprehension: `for NAME in iter [if cond]`.
+    fn comprehension(&mut self, elt: E) -> Option<E> {
+        if !self.eat_word("for") {
+            return Some(elt);
+        }
+        let Some(Tok::Name(name)) = self.peek().cloned() else { return None };
+        self.at += 1;
+        if !self.eat_word("in") {
+            return None;
+        }
+        let iter = self.or_test()?;
+        let cond = if self.eat_word("if") { Some(Box::new(self.or_test()?)) } else { None };
+        if matches!(self.peek(), Some(Tok::Name(word)) if word == "for" || word == "if") {
+            return None;
+        }
+        Some(E::Comp(Box::new(elt), name, Box::new(iter), cond))
     }
 
     /// NAME '=' test inside a call, such as `optional=True`. The lexer gives
@@ -1884,6 +2036,10 @@ impl Parser {
                     return Some(E::List(Vec::new()));
                 }
                 let first = self.named()?;
+                if matches!(self.peek(), Some(Tok::Name(word)) if word == "for") {
+                    let comp = self.comprehension(first)?;
+                    return self.eat_op(")").then_some(comp);
+                }
                 if self.eat_op(")") {
                     return Some(first);
                 }
@@ -1902,10 +2058,12 @@ impl Parser {
             Tok::Op("[") => {
                 let mut items = Vec::new();
                 while !self.eat_op("]") {
-                    items.push(self.named()?);
+                    let item = self.named()?;
                     if matches!(self.peek(), Some(Tok::Name(word)) if word == "for") {
-                        return None;
+                        let comp = self.comprehension(item)?;
+                        return self.eat_op("]").then_some(comp);
                     }
+                    items.push(item);
                     if !self.eat_op(",") {
                         if !self.eat_op("]") {
                             return None;
@@ -1919,6 +2077,11 @@ impl Parser {
                 let mut items = Vec::new();
                 while !self.eat_op("}") {
                     let key = self.test()?;
+                    // A set comprehension: its items, without repeats.
+                    if items.is_empty() && matches!(self.peek(), Some(Tok::Name(word)) if word == "for") {
+                        let comp = self.comprehension(key)?;
+                        return self.eat_op("}").then(|| E::Call(Box::new(E::Name("_set".into())), vec![comp], Vec::new()));
+                    }
                     if !self.eat_op(":") {
                         return None;
                     }
@@ -1959,7 +2122,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -1985,7 +2148,16 @@ mod tests {
         assert_eq!(eval_in(config, "self.something_else"), Err(Unknown));
         assert_eq!(eval_in(config, "self.find_hparam(['zz'])"), Err(Unknown));
         assert_eq!(eval_in(config, "gguf.PoolingType.LAST"), Err(Unknown));
-        assert_eq!(eval_in(config, "[x for x in self.hparams['l']]"), Err(Unknown));
+        yes("[x * 2 for x in self.hparams['l'] if x > 1] == [4, 6]");
+        yes("any(t != 'sparse' for t in ['sparse', 'dense'])");
+        yes("not all(t > 1 for t in self.hparams['l'])");
+        yes("sum(x for x in self.hparams['l']) == 6");
+        yes("sorted(self.hparams['l']) == [1, 2, 3]");
+        yes("re.match('lay(\\d+)', 'lay12x').group(1) == '12'");
+        yes("re.match('x', 'ax') is None");
+        yes("len({x // 2 for x in self.hparams['l']}) == 2");
+        assert_eq!(eval_in(config, "[x for x in self.hparams['zz']]"), Err(Unknown));
+        assert_eq!(eval_in(config, "[x for x in l for y in l]"), Err(Unknown));
         // An unknown operand does not hide a decided one.
         assert_eq!(eval_in(config, "self.unknown and False"), Ok(V::J(Value::Bool(false))));
         assert_eq!(eval_in(config, "self.unknown or self.hparams['a']"), Ok(V::J(Value::from(3))));
@@ -2173,9 +2345,15 @@ mod tests {
         // NemotronH's MTP step never runs for it.
         let (p, _) = rope_params(Some(&nextn));
         let record = &index()["converters"]["NemotronHPuzzleModel"];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
+        // DeepseekV4DSparkModel counts the layers in the filtered tensor names.
+        let record = &index()["converters"]["DeepseekV4DSparkModel"];
+        let names = ["layers.0.attn.weight".to_string(), "layers.2.ffn.weight".to_string(), "embed.weight".to_string()];
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
+        assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(3))));
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
         let mtp = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "mtp_num_hidden_layers": 1}"#);
         let qwen35 = class_keys("Qwen3_5TextModel", "qwen35", &mtp, dir).unwrap();
@@ -2190,7 +2368,7 @@ mod tests {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], depth: 0 };
         let mut total = 0;
         for record in index()["methods"].as_object().unwrap().values() {
             let locals = record.get("locals").and_then(Value::as_object);

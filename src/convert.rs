@@ -71,7 +71,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
         let class = config.as_ref().and_then(hf_class);
         let converter = select_converter(&arch, class.as_deref())?;
         let layers = language_layers(hparams.as_ref());
-        skip_base_suffixes(&mut tensors, &mut warnings);
+        let mut model_tensors = Vec::new();
         if !request.names_only {
             let transcription = hand_transcription(&arch, &converter);
             if transcription == Some(Transcription::Llama) {
@@ -82,6 +82,12 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 apply_filter(&mut tensors, &arch, &converter, hf_arch.as_deref(), &mut warnings)?;
             }
             apply_global_filters(&mut tensors, &converter, &mut warnings)?;
+        }
+        // converter_attributes model_tensors: the names after index_tensors'
+        // filters. ModelBase.prepare_tensors skips the base suffixes later.
+        model_tensors.extend(tensors.iter().map(|tensor| tensor.name.clone()));
+        skip_base_suffixes(&mut tensors, &mut warnings);
+        if !request.names_only {
             extra_tensor_note(&converter, hparams.as_ref(), &mut warnings);
             apply_values(
                 &mut tensors,
@@ -99,7 +105,7 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 if let Some(config) = &config {
                     warnings.extend(crate::gguf_keys::defaults_notes(config));
                 }
-                hparam_keys = Some(gguf_hparams(&arch, &converter.class, map, config_dir, &mut warnings)?);
+                hparam_keys = Some(gguf_hparams(&arch, &converter.class, map, config_dir, &model_tensors, &mut warnings)?);
             }
         }
         let gguf_values = target == FormatName::Gguf && !request.names_only;
@@ -1676,6 +1682,7 @@ fn gguf_hparams(
     class: &str,
     map: &Map<String, Value>,
     dir: &Path,
+    model_tensors: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<(String, MetaValue)>> {
     let mut out = vec![("general.architecture".into(), MetaValue::String(arch.to_string()))];
@@ -1691,7 +1698,7 @@ fn gguf_hparams(
          transformers' AutoConfig dict, so a key that depends on another default may differ (GGUF-040)"
             .into(),
     );
-    let found = crate::gguf_keys::class_keys(class, arch, map, dir)?;
+    let found = crate::gguf_keys::class_keys_with(class, arch, map, dir, model_tensors)?;
     out.extend(found.keys);
     let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
     out.extend(sampling);
