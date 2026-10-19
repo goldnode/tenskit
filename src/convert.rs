@@ -96,7 +96,6 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 hparams.as_ref(),
                 hf_arch.as_deref(),
                 config_dir,
-                &mut warnings,
             )?;
         }
         rename_tensors(&mut tensors, &arch, layers, &mut warnings)?;
@@ -377,7 +376,6 @@ fn apply_values(
     hparams: Option<&Map<String, Value>>,
     hf_arch: Option<&str>,
     dir: &Path,
-    warnings: &mut Vec<String>,
 ) -> Result<()> {
     if converter.complete {
         for tensor in tensors.iter_mut() {
