@@ -130,13 +130,73 @@ pub(crate) fn defaults_notes(config: &Value) -> Vec<String> {
     }
     let composite = &table["composite_text_config"][top_type];
     if text.is_none() && composite["created_when_absent"] == Value::Bool(true) {
-        notes.push(format!(
-            "model_type {top_type} gets a text_config ({}) built from the top-level keys in transformers; \
-             tenspile does not build one, so the merged values may differ from llama.cpp's (GGUF-040)",
-            composite["default_text_model_type"].as_str().unwrap_or("?")
-        ));
+        let text_type = composite["default_text_model_type"].as_str().unwrap_or("?");
+        if table["model_types"].get(text_type).is_none() {
+            notes.push(format!(
+                "model_type {top_type} gets a {text_type} text_config, built from its defaults; {text_type} \
+                 is not in tables/hf-config-defaults.json, so its derived keys may differ from llama.cpp's (GGUF-040)"
+            ));
+        }
     }
     notes
+}
+
+/// The composites that build text_config from every top-level key their
+/// own __init__ does not take, and the keys each takes (GGUF-039).
+fn composite_takes(top_type: &str) -> Option<&'static [&'static str]> {
+    const QWEN: &[&str] = &[
+        "text_config", "vision_config", "image_token_id", "video_token_id", "vision_start_token_id",
+        "vision_end_token_id", "model_type",
+    ];
+    const GLM: &[&str] = &[
+        "text_config", "vision_config", "image_token_id", "video_token_id", "image_start_token_id",
+        "image_end_token_id", "video_start_token_id", "video_end_token_id", "model_type",
+    ];
+    match top_type {
+        "qwen2_vl" | "qwen2_5_vl" => Some(QWEN),
+        "glm4v" | "glm4v_moe" => Some(GLM),
+        _ => None,
+    }
+}
+
+/// GGUF-039 and GGUF-040: the text_config transformers builds for a
+/// composite type when config.json has none. It starts from the top-level
+/// keys the composite passes on (every key it does not take, or its
+/// copied_top_level_keys), then the text model_type's defaults and derived
+/// formulas, then default_text_config for anything still missing.
+pub(crate) fn built_text_config(raw: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let table = defaults_table();
+    let top_type = raw.get("model_type").and_then(Value::as_str)?;
+    let composite = &table["composite_text_config"][top_type];
+    if composite["created_when_absent"] != Value::Bool(true) {
+        return None;
+    }
+    let text_type = composite["default_text_model_type"].as_str()?;
+    let mut built = Map::new();
+    match composite_takes(top_type) {
+        Some(taken) => {
+            for (key, value) in raw {
+                if !taken.contains(&key.as_str()) {
+                    built.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        None => {
+            for key in composite["copied_top_level_keys"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if let Some(value) = raw.get(key) {
+                    built.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    built.insert("model_type".into(), Value::from(text_type));
+    if table["model_types"].get(text_type).is_some() {
+        let _ = listed_defaults(&mut built);
+    }
+    for (key, value) in composite["default_text_config"].as_object().into_iter().flatten() {
+        built.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    Some(built)
 }
 
 /// GGUF-039's formulas for the keys the table marks derived.
@@ -501,6 +561,9 @@ fn index() -> &'static Value {
 pub(crate) struct ClassKeys {
     pub(crate) keys: Vec<(String, MetaValue)>,
     pub(crate) unevaluated: Vec<String>,
+    /// hparams_mutations that could not be applied, so the config dict the
+    /// keys were read from may differ from llama.cpp's.
+    pub(crate) unapplied: Vec<String>,
 }
 
 /// GGUF-037: follow `class`'s set_gguf_parameters chain, base first.
@@ -519,7 +582,10 @@ pub(crate) fn class_keys(
 }
 
 /// class_keys, with the checkpoint's tensor names after the filter_tensors
-/// chain and the global filters (converter_attributes model_tensors).
+/// chain and the global filters (converter_attributes model_tensors). `map`
+/// is the GGUF-039 dict as loaded: renames applied, text_config not yet
+/// merged. The converter's hparams_mutations, TextModel's merge among them,
+/// are applied before the keys are read.
 pub(crate) fn class_keys_with(
     class: &str,
     arch: &str,
@@ -527,7 +593,7 @@ pub(crate) fn class_keys_with(
     dir: &std::path::Path,
     tensors: &[String],
 ) -> Result<ClassKeys> {
-    let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
+    let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
     let record = index()["converters"].get(class);
     let chain: Vec<String> = match record.and_then(|record| record["set_gguf_parameters"].as_array()) {
         Some(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
@@ -537,11 +603,196 @@ pub(crate) fn class_keys_with(
             )))
         }
     };
-    let (p, _) = rope_params(Some(map));
     let converter = &index()["converters"][class];
-    let mut ctx = Ctx { map, p: &p, dir, arch, converter, tensors, depth: 0 };
+    let hf_arch = map
+        .get("architectures")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let hparams = apply_mutations(map, dir, arch, converter, tensors, hf_arch.as_deref(), &mut found.unapplied);
+    let (p, _) = rope_params(Some(&hparams));
+    let mut ctx = Ctx { map: &hparams, p: &p, dir, arch, converter, tensors, hf_arch, depth: 0 };
     ctx.chain(&chain, &mut found)?;
     Ok(found)
+}
+
+/// converter_attributes hparams_mutations: the changes a converter makes to
+/// its config dict before set_gguf_parameters runs (phases init,
+/// prepare_tensors, and prepare_metadata before set_gguf_parameters), in run
+/// order. A change that cannot be evaluated is named in `unapplied`.
+fn apply_mutations(
+    loaded: &Map<String, Value>,
+    dir: &std::path::Path,
+    arch: &str,
+    converter: &'static Value,
+    tensors: &[String],
+    hf_arch: Option<&str>,
+    unapplied: &mut Vec<String>,
+) -> Map<String, Value> {
+    let mut hparams = loaded.clone();
+    let sites = &index()["assignment_sites"];
+    for reference in converter["hparams_mutations"].as_array().into_iter().flatten() {
+        let phase = reference["phase"].as_str().unwrap_or("unknown");
+        if !matches!(phase, "init" | "prepare_tensors" | "prepare_metadata, before set_gguf_parameters") {
+            continue;
+        }
+        let Some(id) = reference["site"].as_str() else { continue };
+        let site = &sites[id];
+        match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch) {
+            Ok(()) => {}
+            Err(Unknown) => unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams"))),
+        }
+    }
+    hparams
+}
+
+fn apply_mutation(
+    hparams: &mut Map<String, Value>,
+    site: &'static Value,
+    dir: &std::path::Path,
+    arch: &str,
+    converter: &'static Value,
+    tensors: &[String],
+    hf_arch: Option<&str>,
+) -> Ev<()> {
+    let current = hparams.clone();
+    let (p, _) = rope_params(Some(&current));
+    let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), depth: 0 };
+    let mut eval = Eval {
+        ctx: &ctx,
+        locals: None,
+        site_locals: site.get("locals").and_then(Value::as_object),
+        vars: Default::default(),
+        pending: Default::default(),
+        depth: 0,
+    };
+    // A local passed on as hparams= is the dict itself (constructor_arguments).
+    let on_local = site["on"].as_str().is_some_and(|on| on.starts_with("local hparams"));
+    if on_local {
+        eval.vars.insert("hparams".into(), V::J(Value::Object(current.clone())));
+    }
+    let op = site["op"].as_str().unwrap_or("");
+    let text = site["value"].as_str().unwrap_or("");
+    // ModelBase.__init__ loads the dict, or takes the one passed in: both are
+    // the dict as it stands here, whatever its guard says.
+    if op == "replace" && text.contains("load_hparams") {
+        return Ok(());
+    }
+    let guard = site["when"].as_str().unwrap_or("always");
+    if guard != "always" && !truthy(&eval.expr(guard)?) {
+        return Ok(());
+    }
+    if op == "replace" {
+        let V::J(Value::Object(next)) = eval.expr(text)? else { return Err(Unknown) };
+        *hparams = next;
+        return Ok(());
+    }
+    let target = site["key"].as_str().ok_or(Unknown)?;
+    match op {
+        "=" | "+=" => {
+            let path = hparams_path(&mut eval, target, on_local)?;
+            let value = match eval.expr(text)? {
+                V::J(value) => value,
+                _ => return Err(Unknown),
+            };
+            let value = if op == "+=" {
+                let current = path_get(hparams, &path).ok_or(Unknown)?;
+                match arith("+", &V::J(current.clone()), &V::J(value))? {
+                    V::J(value) => value,
+                    _ => return Err(Unknown),
+                }
+            } else {
+                value
+            };
+            path_set(hparams, &path, value)
+        }
+        "del" => {
+            let path = hparams_path(&mut eval, target, on_local)?;
+            path_remove(hparams, &path)
+        }
+        "pop" | "setdefault" => {
+            let mut path = hparams_path(&mut eval, target, on_local)?;
+            let V::J(Value::Array(args)) = eval.expr(&format!("[{text}]"))? else { return Err(Unknown) };
+            let key = args.first().and_then(Value::as_str).ok_or(Unknown)?;
+            path.push(Value::from(key));
+            if op == "pop" {
+                let _ = path_remove(hparams, &path);
+                Ok(())
+            } else {
+                if path_get(hparams, &path).is_none() {
+                    path_set(hparams, &path, args.get(1).cloned().unwrap_or(Value::Null))?;
+                }
+                Ok(())
+            }
+        }
+        _ => Err(Unknown),
+    }
+}
+
+/// The subscripts below self.hparams (or the passed-on local hparams) in a
+/// mutation's target, such as `self.hparams['a']['b']`.
+fn hparams_path(eval: &mut Eval, target: &str, on_local: bool) -> Ev<Vec<Value>> {
+    let tokens = lex(target).ok_or(Unknown)?;
+    let mut parser = Parser { tokens, at: 0 };
+    let mut tree = parser.test().ok_or(Unknown)?;
+    if parser.at != parser.tokens.len() {
+        return Err(Unknown);
+    }
+    let mut path = Vec::new();
+    loop {
+        match tree {
+            E::Index(base, index) => {
+                let V::J(index) = eval.eval(&index)? else { return Err(Unknown) };
+                path.push(index);
+                tree = *base;
+            }
+            E::Attr(base, name) if name == "hparams" && matches!(*base, E::Name(ref root) if root == "self") => break,
+            E::Name(name) if name == "hparams" && on_local => break,
+            _ => return Err(Unknown),
+        }
+    }
+    path.reverse();
+    Ok(path)
+}
+
+fn path_get<'a>(map: &'a Map<String, Value>, path: &[Value]) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut value = map.get(first.as_str()?)?;
+    for step in rest {
+        value = match (value, step) {
+            (Value::Object(map), Value::String(key)) => map.get(key)?,
+            (Value::Array(items), Value::Number(index)) => items.get(usize::try_from(index.as_u64()?).ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn path_set(map: &mut Map<String, Value>, path: &[Value], value: Value) -> Ev<()> {
+    let (last, parents) = path.split_last().ok_or(Unknown)?;
+    let mut container: &mut Map<String, Value> = map;
+    for step in parents {
+        container = container
+            .get_mut(step.as_str().ok_or(Unknown)?)
+            .and_then(Value::as_object_mut)
+            .ok_or(Unknown)?;
+    }
+    container.insert(last.as_str().ok_or(Unknown)?.to_string(), value);
+    Ok(())
+}
+
+fn path_remove(map: &mut Map<String, Value>, path: &[Value]) -> Ev<()> {
+    let (last, parents) = path.split_last().ok_or(Unknown)?;
+    let mut container: &mut Map<String, Value> = map;
+    for step in parents {
+        container = container
+            .get_mut(step.as_str().ok_or(Unknown)?)
+            .and_then(Value::as_object_mut)
+            .ok_or(Unknown)?;
+    }
+    container.shift_remove(last.as_str().ok_or(Unknown)?);
+    Ok(())
 }
 
 /// find(a, b) in gguf_class_parameters: find_hparam, KeyError when none is present.
@@ -829,6 +1080,7 @@ struct Ctx<'a> {
     converter: &'static Value,
     /// converter_attributes model_tensors: the tensor names after filtering.
     tensors: &'a [String],
+    hf_arch: Option<String>,
     depth: usize,
 }
 
@@ -959,7 +1211,7 @@ impl Ctx<'_> {
                     Ok(true) => run(self, found)?,
                     Err(Unknown) => {
                         // The call may or may not run: none of its keys can be evaluated.
-                        let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new() };
+                        let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
                         run(self, &mut skipped)?;
                         for key in skipped.keys.into_iter().map(|(key, _)| key).chain(skipped.unevaluated) {
                             if !found.unevaluated.contains(&key) {
@@ -1214,6 +1466,11 @@ impl Eval<'_, '_> {
     fn self_attribute(&mut self, name: &str) -> Ev<V> {
         if matches!(name, "no_mtp" | "mtp_only") {
             return Ok(V::J(Value::Bool(false)));
+        }
+        // GGUF-039: hf_arch is the top-level architectures[0] of the loaded
+        // dict, before text_config is merged.
+        if name == "hf_arch" {
+            return self.ctx.hf_arch.clone().map(|arch| V::J(Value::String(arch))).ok_or(Unknown);
         }
         if name == "model_tensors" {
             let names = self.ctx.tensors.iter().map(|name| (name.clone(), Value::Null)).collect();
@@ -1558,9 +1815,17 @@ impl Eval<'_, '_> {
             E::Dict(items) => {
                 let mut map = Map::new();
                 for (key, value) in items {
-                    let V::J(Value::String(key)) = self.eval(key)? else { return Err(Unknown) };
                     let V::J(value) = self.eval(value)? else { return Err(Unknown) };
-                    map.insert(key, value);
+                    match key {
+                        Some(key) => {
+                            let V::J(Value::String(key)) = self.eval(key)? else { return Err(Unknown) };
+                            map.insert(key, value);
+                        }
+                        None => {
+                            let Value::Object(entries) = value else { return Err(Unknown) };
+                            map.extend(entries);
+                        }
+                    }
                 }
                 Ok(V::J(Value::Object(map)))
             }
@@ -1693,7 +1958,8 @@ enum E {
     IfExp(Box<E>, Box<E>, Box<E>),
     Walrus(String, Box<E>),
     List(Vec<E>),
-    Dict(Vec<(E, E)>),
+    /// Pairs, and `**expr` unpacks (no key).
+    Dict(Vec<(Option<E>, E)>),
     /// `elt for name in iter [if cond]`, as a list (a generator in a call).
     Comp(Box<E>, String, Box<E>, Option<Box<E>>),
 }
@@ -2076,6 +2342,16 @@ impl Parser {
             Tok::Op("{") => {
                 let mut items = Vec::new();
                 while !self.eat_op("}") {
+                    if self.eat_op("**") {
+                        items.push((None, self.or_test()?));
+                        if !self.eat_op(",") {
+                            if !self.eat_op("}") {
+                                return None;
+                            }
+                            break;
+                        }
+                        continue;
+                    }
                     let key = self.test()?;
                     // A set comprehension: its items, without repeats.
                     if items.is_empty() && matches!(self.peek(), Some(Tok::Name(word)) if word == "for") {
@@ -2085,7 +2361,7 @@ impl Parser {
                     if !self.eat_op(":") {
                         return None;
                     }
-                    items.push((key, self.test()?));
+                    items.push((Some(key), self.test()?));
                     if !self.eat_op(",") {
                         if !self.eat_op("}") {
                             return None;
@@ -2122,7 +2398,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -2345,13 +2621,13 @@ mod tests {
         // NemotronH's MTP step never runs for it.
         let (p, _) = rope_params(Some(&nextn));
         let record = &index()["converters"]["NemotronHPuzzleModel"];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
         // DeepseekV4DSparkModel counts the layers in the filtered tensor names.
         let record = &index()["converters"]["DeepseekV4DSparkModel"];
         let names = ["layers.0.attn.weight".to_string(), "layers.2.ffn.weight".to_string(), "embed.weight".to_string()];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(3))));
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
@@ -2364,11 +2640,36 @@ mod tests {
     }
 
     #[test]
+    fn converters_change_the_config_dict_before_the_keys() {
+        let dir = std::path::Path::new("/nonexistent");
+        let get = |found: &ClassKeys, key: &str| found.keys.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        // TextModel.__init__ merges text_config over the loaded dict.
+        let loaded = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
+            "text_config": {"hidden_size": 16}}"#);
+        let qwen = class_keys("Qwen2Model", "qwen2", &loaded, dir).unwrap();
+        assert_eq!(get(&qwen, "qwen2.embedding_length"), Some(MetaValue::U32(16)));
+        assert!(qwen.unapplied.is_empty(), "{:?}", qwen.unapplied);
+        // CommandR2Model sets max_position_embeddings from model_max_length.
+        let command = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
+            "max_position_embeddings": 4096, "model_max_length": 131072}"#);
+        let command = class_keys("CommandR2Model", "command-r", &command, dir).unwrap();
+        assert_eq!(get(&command, "command-r.context_length"), Some(MetaValue::U32(131072)));
+        // NemotronHModel sets num_hidden_layers from layers_block_type in the
+        // local it passes on as hparams=.
+        let nemotron = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
+            "layers_block_type": ["mamba", "attention", "mamba"]}"#);
+        let record = &index()["converters"]["NemotronHModel"];
+        let mut unapplied = Vec::new();
+        let changed = apply_mutations(&nemotron, dir, "nemotron_h", record, &[], None, &mut unapplied);
+        assert_eq!(changed.get("num_hidden_layers"), Some(&Value::from(3)), "{unapplied:?}");
+    }
+
+    #[test]
     fn every_index_expression_lexes_or_is_unknown() {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, depth: 0 };
         let mut total = 0;
         for record in index()["methods"].as_object().unwrap().values() {
             let locals = record.get("locals").and_then(Value::as_object);
@@ -2454,9 +2755,20 @@ mod tests {
         assert_eq!(merged.get("eos_token_id"), Some(&Value::from(1)));
         assert_eq!(merged.get("architectures"), Some(&Value::Null));
         assert_eq!(merged.get("model_type"), Some(&Value::from("gemma3_text")));
-        let notes = defaults_notes(&Value::Object(config(r#"{"model_type": "qwen2_5_vl"}"#)));
-        assert!(notes.iter().any(|note| note.contains("qwen2_5_vl_text")), "{notes:?}");
         assert_eq!(merged["layer_types"][5], Value::from("full_attention"));
+        // qwen2_5_vl builds its text_config from the top-level keys it does not take.
+        let merged = crate::convert::merge_text_config(&Value::Object(config(
+            r#"{"model_type": "qwen2_5_vl", "hidden_size": 896, "num_hidden_layers": 2, "image_token_id": 7,
+                "architectures": ["Qwen2_5_VLForConditionalGeneration"]}"#,
+        )));
+        assert_eq!(merged.get("hidden_size"), Some(&Value::from(896)));
+        assert_eq!(merged.get("model_type"), Some(&Value::from("qwen2_5_vl_text")));
+        assert_eq!(merged.get("max_window_layers"), Some(&Value::from(80)));
+        assert_eq!(merged.get("sliding_window"), Some(&Value::Null));
+        assert!(defaults_notes(&Value::Object(config(r#"{"model_type": "qwen2_5_vl"}"#))).iter().all(|note| !note.contains("text_config")));
+        // llava takes nothing from the top level: its text_config is llama's defaults.
+        let merged = crate::convert::merge_text_config(&Value::Object(config(r#"{"model_type": "llava", "hidden_size": 8}"#)));
+        assert_eq!(merged.get("hidden_size"), Some(&Value::from(4096)));
         let merged = crate::convert::merge_text_config(&Value::Object(config(
             r#"{"model_type": "x", "llm_config": {"hidden_size": 7}, "thinker_config": {"text_config": {"hidden_size": 9}}}"#,
         )));

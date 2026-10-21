@@ -104,7 +104,8 @@ pub fn run(request: &Request) -> Result<Vec<String>> {
                 if let Some(config) = &config {
                     warnings.extend(crate::gguf_keys::defaults_notes(config));
                 }
-                hparam_keys = Some(gguf_hparams(&arch, &converter.class, map, config_dir, &model_tensors, &mut warnings)?);
+                let loaded = config.as_ref().map(loaded_config).unwrap_or_else(|| map.clone());
+                hparam_keys = Some(gguf_hparams(&arch, &converter.class, &loaded, config_dir, &model_tensors, &mut warnings)?);
             }
         }
         let gguf_values = target == FormatName::Gguf && !request.names_only;
@@ -1697,6 +1698,13 @@ fn gguf_hparams(
             .into(),
     );
     let found = crate::gguf_keys::class_keys_with(class, arch, map, dir, model_tensors)?;
+    if !found.unapplied.is_empty() {
+        warnings.push(format!(
+            "llama.cpp's {class} changes its config dict at {}, which tenspile cannot evaluate, so keys read after \
+             it may differ (GGUF-037)",
+            found.unapplied.join(", ")
+        ));
+    }
     out.extend(found.keys);
     let (sampling, skipped) = crate::gguf_keys::sampling_keys(dir);
     out.extend(sampling);
@@ -1761,16 +1769,7 @@ pub(crate) fn text_config_problem(config: &Value) -> Option<String> {
 }
 
 pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
-    let mut top = config.as_object().cloned().unwrap_or_default();
-    let _ = crate::gguf_keys::listed_defaults(&mut top);
-    if let Some(sub) = renamed_text_config(&top) {
-        top.insert("text_config".into(), sub);
-    }
-    // GGUF-039: to_dict() writes text_config as the sub-config's own full
-    // dict, with its class defaults and the common keys, and those win in the merge.
-    if let Some(sub) = top.get_mut("text_config").and_then(Value::as_object_mut) {
-        let _ = crate::gguf_keys::listed_defaults(sub);
-    }
+    let top = loaded_config(config);
     let mut merged = top.clone();
     if let Some(text) = top.get("text_config").and_then(Value::as_object) {
         for (key, value) in text {
@@ -1778,6 +1777,28 @@ pub(crate) fn merge_text_config(config: &Value) -> Map<String, Value> {
         }
     }
     merged
+}
+
+/// GGUF-039: the config dict as ModelBase.load_hparams gives it: the listed
+/// transformers defaults and the text_config renames applied, and
+/// text_config not yet merged (TextModel.__init__ merges it).
+pub(crate) fn loaded_config(config: &Value) -> Map<String, Value> {
+    let mut top = config.as_object().cloned().unwrap_or_default();
+    let _ = crate::gguf_keys::listed_defaults(&mut top);
+    if let Some(sub) = renamed_text_config(&top) {
+        top.insert("text_config".into(), sub);
+    }
+    if let Some(sub) = top.get_mut("text_config").and_then(Value::as_object_mut) {
+        // GGUF-039: to_dict() writes text_config as the sub-config's own full
+        // dict, with its class defaults and the common keys, and those win in the merge.
+        let _ = crate::gguf_keys::listed_defaults(sub);
+    } else if !top.contains_key("text_config") {
+        // A composite type builds one from the top-level keys config.json gives.
+        if let Some(built) = config.as_object().and_then(crate::gguf_keys::built_text_config) {
+            top.insert("text_config".into(), Value::Object(built));
+        }
+    }
+    top
 }
 
 pub(crate) fn language_layers(hparams: Option<&Map<String, Value>>) -> Option<u64> {
