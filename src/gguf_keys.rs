@@ -612,7 +612,7 @@ pub(crate) fn class_keys_with(
         .map(str::to_string);
     let hparams = apply_mutations(map, dir, arch, converter, tensors, hf_arch.as_deref(), &mut found.unapplied);
     let (p, _) = rope_params(Some(&hparams));
-    let mut ctx = Ctx { map: &hparams, p: &p, dir, arch, converter, tensors, hf_arch, depth: 0 };
+    let mut ctx = Ctx { map: &hparams, p: &p, dir, arch, converter, tensors, hf_arch, loaded: map, depth: 0 };
     ctx.chain(&chain, &mut found)?;
     Ok(found)
 }
@@ -639,7 +639,7 @@ fn apply_mutations(
         }
         let Some(id) = reference["site"].as_str() else { continue };
         let site = &sites[id];
-        match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch) {
+        match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch, loaded) {
             Ok(()) => {}
             Err(Unknown) => unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams"))),
         }
@@ -655,10 +655,11 @@ fn apply_mutation(
     converter: &'static Value,
     tensors: &[String],
     hf_arch: Option<&str>,
+    loaded: &Map<String, Value>,
 ) -> Ev<()> {
     let current = hparams.clone();
     let (p, _) = rope_params(Some(&current));
-    let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), depth: 0 };
+    let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), loaded, depth: 0 };
     let mut eval = Eval {
         ctx: &ctx,
         locals: None,
@@ -1081,6 +1082,8 @@ struct Ctx<'a> {
     /// converter_attributes model_tensors: the tensor names after filtering.
     tensors: &'a [String],
     hf_arch: Option<String>,
+    /// The dict as ModelBase.load_hparams returns it, before any change.
+    loaded: &'a Map<String, Value>,
     depth: usize,
 }
 
@@ -1370,6 +1373,11 @@ impl Eval<'_, '_> {
         match name {
             "self" => return Ok(V::SelfObj),
             "re" => return Ok(V::Builtin("re")),
+            // converter_attributes constructor_arguments: the converter is built
+            // as model_class(dir_model, ...) with no hparams argument.
+            "kwargs" => return Ok(V::Builtin("kwargs")),
+            "args" => return Ok(V::Builtin("args")),
+            "ModelBase" => return Ok(V::Builtin("ModelBase")),
             "int" | "float" | "len" | "bool" | "str" | "abs" | "min" | "max" | "any" | "all" | "sum" | "list" | "sorted" | "_set" => {
                 return Ok(V::Builtin(match name {
                     "_set" => "_set",
@@ -1425,6 +1433,9 @@ impl Eval<'_, '_> {
             (V::SelfObj, _) => self.self_attribute(name),
             (V::J(Value::Object(_)), "get") => Ok(V::Bound(Box::new(base), name.into())),
             (V::Builtin("re"), "match") | (V::Match(_), "group") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::Builtin("kwargs"), "pop" | "get") | (V::Builtin("ModelBase"), "load_hparams") => {
+                Ok(V::Bound(Box::new(base), name.into()))
+            }
             (V::Path(_), "is_file" | "exists") => Ok(V::Bound(Box::new(base), name.into())),
             (V::J(Value::String(_)), "endswith" | "startswith" | "lower") => Ok(V::Bound(Box::new(base), name.into())),
             _ => Err(Unknown),
@@ -1572,6 +1583,10 @@ impl Eval<'_, '_> {
                     Ok(V::J(Value::Bool(hit)))
                 }
                 (V::J(Value::String(text)), "lower") => Ok(V::J(Value::String(text.to_lowercase()))),
+                // kwargs.pop('hparams', None) and kwargs.get(...): no keyword is passed.
+                (V::Builtin("kwargs"), "pop" | "get") => Ok(args.get(1).cloned().unwrap_or(V::J(Value::Null))),
+                // A fresh GGUF-039 dict: renames applied, text_config not yet merged.
+                (V::Builtin("ModelBase"), "load_hparams") => Ok(V::J(Value::Object(self.ctx.loaded.clone()))),
                 // re.match anchors at the start of the string.
                 (V::Builtin("re"), "match") => {
                     let pattern = args.first().map(json).transpose()?.ok_or(Unknown)?;
@@ -1706,6 +1721,9 @@ impl Eval<'_, '_> {
                 let base = self.eval(base)?;
                 let index = self.eval(index)?;
                 match (base, index) {
+                    (V::Builtin("args"), V::J(Value::Number(number))) if number.as_u64() == Some(0) => {
+                        Ok(V::Path(self.ctx.dir.to_path_buf()))
+                    }
                     (V::J(Value::Object(map)), V::J(Value::String(key))) => map.get(&key).cloned().map(V::J).ok_or(Unknown),
                     (V::J(Value::Array(items)), V::J(Value::Number(number))) => {
                         let at = number.as_i64().ok_or(Unknown)?;
@@ -2398,7 +2416,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -2621,13 +2639,13 @@ mod tests {
         // NemotronH's MTP step never runs for it.
         let (p, _) = rope_params(Some(&nextn));
         let record = &index()["converters"]["NemotronHPuzzleModel"];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &nextn, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
         // DeepseekV4DSparkModel counts the layers in the filtered tensor names.
         let record = &index()["converters"]["DeepseekV4DSparkModel"];
         let names = ["layers.0.attn.weight".to_string(), "layers.2.ffn.weight".to_string(), "embed.weight".to_string()];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, loaded: &nextn, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(3))));
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
@@ -2662,6 +2680,15 @@ mod tests {
         let mut unapplied = Vec::new();
         let changed = apply_mutations(&nemotron, dir, "nemotron_h", record, &[], None, &mut unapplied);
         assert_eq!(changed.get("num_hidden_layers"), Some(&Value::from(3)), "{unapplied:?}");
+        // With experts and a next-token layer, is_moe (has_moe_params from a
+        // fresh load_hparams) is true and the MTP step adds one layer.
+        let moe = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
+            "layers_block_type": ["mamba", "attention", "mamba"], "num_experts_per_tok": 2, "num_nextn_predict_layers": 1}"#);
+        let changed = apply_mutations(&moe, dir, "nemotron_h", record, &[], None, &mut unapplied);
+        let (p, _) = rope_params(Some(&changed));
+        let ctx = Ctx { map: &changed, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &moe, depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
+        assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
     }
 
     #[test]
@@ -2669,7 +2696,7 @@ mod tests {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, depth: 0 };
         let mut total = 0;
         for record in index()["methods"].as_object().unwrap().values() {
             let locals = record.get("locals").and_then(Value::as_object);
