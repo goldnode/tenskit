@@ -610,11 +610,351 @@ pub(crate) fn class_keys_with(
         .and_then(|items| items.first())
         .and_then(Value::as_str)
         .map(str::to_string);
-    let hparams = apply_mutations(map, dir, arch, converter, tensors, hf_arch.as_deref(), &mut found.unapplied);
-    let (p, _) = rope_params(Some(&hparams));
-    let mut ctx = Ctx { map: &hparams, p: &p, dir, arch, converter, tensors, hf_arch, loaded: map, depth: 0 };
-    ctx.chain(&chain, &mut found)?;
+    let mut hparams = apply_mutations(class, map, dir, arch, converter, tensors, hf_arch.as_deref(), &mut found.unapplied)?;
+    let sequence = converter["set_gguf_parameters_sequence"]
+        .as_str()
+        .and_then(|id| index()["sequences"].get(id))
+        .and_then(Value::as_array);
+    match sequence {
+        // A class with a hand transcription follows it (gguf_class_parameters).
+        Some(events) if !chain.first().is_some_and(|owner| is_transcribed(owner)) => {
+            // Each pop in the sequence is applied by a mutation event; what it
+            // removed is collected first so a later read of its return value works.
+            let popped = popped_values(events, &hparams);
+            let base = Walk { class, dir, arch, converter, tensors, hf_arch, loaded: map, chain: &chain, popped: Some(&popped) };
+            base.run(events, &mut hparams, &mut found)?;
+        }
+        _ => {
+            let (p, _) = rope_params(Some(&hparams));
+            let mut ctx = Ctx { map: &hparams, p: &p, dir, arch, converter, tensors, hf_arch, loaded: map, overrides: None, popped: None, depth: 0 };
+            ctx.chain(&chain, &mut found)?;
+        }
+    }
     Ok(found)
+}
+
+/// The values the sequence's `pop` mutations of top-level keys remove, read
+/// from the dict before the walk. A key the walk changes before its pop is
+/// not covered.
+fn popped_values(events: &[Value], hparams: &Map<String, Value>) -> std::collections::HashMap<String, Value> {
+    let mut popped = std::collections::HashMap::new();
+    for event in events {
+        let Some(site_id) = event["hparams_mutation"].as_str() else { continue };
+        let site = &index()["assignment_sites"][site_id];
+        if site["op"].as_str() != Some("pop") || site["key"].as_str() != Some("self.hparams") {
+            continue;
+        }
+        let Some(lexed) = lex(&format!("[{}]", site["value"].as_str().unwrap_or(""))) else { continue };
+        if let Some(Tok::Str(key)) = lexed.get(1) {
+            if let Some(value) = hparams.get(key) {
+                popped.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
+    popped
+}
+
+/// GGUF-037 (round 14): a site that runs and would raise in llama.cpp's
+/// converter means llama.cpp writes no file, so tensconv stops too. A site
+/// under an `except` guard may be caught there, so it only stays unknown.
+fn stop_or_unknown(halt: Halt, class: &str, at: &str, guard: &str) -> Result<()> {
+    match halt {
+        Halt::Raise(cause) if !guard.contains("except") => Err(msg(format!(
+            "llama.cpp's {class} would stop at {at} ({cause}) and write no file, so tensconv stops too (GGUF-037)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the events from here on run: every enclosing call's guard holds
+/// (Yes), one does not (No), or one cannot be evaluated (Maybe).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Runs {
+    Yes,
+    No,
+    Maybe,
+}
+
+/// The fixed parts of a set_gguf_parameters_sequence walk.
+struct Walk<'a> {
+    class: &'a str,
+    dir: &'a std::path::Path,
+    arch: &'a str,
+    converter: &'static Value,
+    tensors: &'a [String],
+    hf_arch: Option<String>,
+    loaded: &'a Map<String, Value>,
+    chain: &'a [String],
+    popped: Option<&'a std::collections::HashMap<String, Value>>,
+}
+
+impl Walk<'_> {
+    /// GGUF-037 with the round 14 sequence: the converter's
+    /// set_gguf_parameters chain flattened into run order. Key writes, hparams
+    /// changes, and attribute assignments apply where they run, under the
+    /// guards of the calls that lead to them. Calls into TextModel's base,
+    /// the pooling helper, and a transcribed class follow their transcriptions.
+    fn run(&self, events: &'static [Value], hparams: &mut Map<String, Value>, found: &mut ClassKeys) -> Result<()> {
+        let mut overrides: std::collections::HashMap<String, Option<V>> = Default::default();
+        let mut method_vars: std::collections::HashMap<String, std::collections::HashMap<String, V>> = Default::default();
+        // Each open call: its target and whether its events run.
+        let mut stack: Vec<(String, Runs)> = Vec::new();
+        // While a call is handled by a transcription, its events are skipped
+        // until this stack depth returns.
+        let mut skip_to: Option<usize> = None;
+        let runs = |stack: &[(String, Runs)]| {
+            stack.iter().fold(Runs::Yes, |acc, (_, runs)| match (acc, *runs) {
+                (Runs::No, _) | (_, Runs::No) => Runs::No,
+                (Runs::Maybe, _) | (_, Runs::Maybe) => Runs::Maybe,
+                _ => Runs::Yes,
+            })
+        };
+        for event in events {
+            if event.get("return_from").is_some() {
+                stack.pop();
+                if skip_to.is_some_and(|depth| stack.len() < depth) {
+                    skip_to = None;
+                }
+                continue;
+            }
+            if let Some(target) = event["call"].as_str() {
+                let now = runs(&stack);
+                let guard = event["when"].as_str().unwrap_or("always");
+                let this = if now == Runs::No || skip_to.is_some() || guard == "always" {
+                    Runs::Yes
+                } else {
+                    let from = event["from"].as_str().unwrap_or("");
+                    match self.eval_in(from, hparams, &overrides, &mut method_vars, guard) {
+                        Ok(value) if truthy(&value) => Runs::Yes,
+                        Ok(_) => Runs::No,
+                        Err(_) => Runs::Maybe,
+                    }
+                };
+                stack.push((target.to_string(), this));
+                if skip_to.is_some() {
+                    continue;
+                }
+                let now = runs(&stack);
+                if now == Runs::No {
+                    skip_to = Some(stack.len());
+                    continue;
+                }
+                if self.transcribed_call(target, now, hparams, &overrides, found)? {
+                    skip_to = Some(stack.len());
+                }
+                continue;
+            }
+            if skip_to.is_some() {
+                continue;
+            }
+            let now = runs(&stack);
+            if now == Runs::No {
+                continue;
+            }
+            if let Some(method) = event["write"].as_str() {
+                let at = event["index"].as_u64().unwrap_or(0) as usize;
+                let write = &index()["methods"][method]["writes"][at];
+                self.write(method, write, now, hparams, &overrides, &mut method_vars, found)?;
+            } else if let Some(site_id) = event["hparams_mutation"].as_str() {
+                let site = &index()["assignment_sites"][site_id];
+                let applied = if now == Runs::Yes {
+                    apply_mutation(hparams, site, self.dir, self.arch, self.converter, self.tensors, self.hf_arch.as_deref(), self.loaded, self.popped)
+                } else {
+                    Err(Unknown)
+                };
+                if let Err(halt) = applied {
+                    if now == Runs::Yes {
+                        stop_or_unknown(halt, self.class, site_id, site["when"].as_str().unwrap_or(""))?;
+                    }
+                    found.unapplied.push(format!("{site_id} ({})", site["key"].as_str().unwrap_or("self.hparams")));
+                }
+            } else if let (Some(name), Some(site_id)) = (event["attribute"].as_str(), event["site"].as_str()) {
+                let value = if now == Runs::Yes { self.assignment(name, site_id, hparams, &overrides) } else { Err(Unknown) };
+                if let Err(halt) = &value {
+                    let guard = index()["assignment_sites"][site_id]["when"].as_str().unwrap_or("");
+                    stop_or_unknown(halt.clone(), self.class, site_id, guard)?;
+                }
+                match value {
+                    Ok(Some(value)) => {
+                        overrides.insert(name.to_string(), Some(value));
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        overrides.insert(name.to_string(), None);
+                    }
+                }
+            }
+        }
+        // hf_config_to_gguf rope.dimension_count: LlamaModel's rope_dim is
+        // assigned twice, so its row states the formula.
+        let rope_key = format!("{}.rope.dimension_count", self.arch);
+        if self.chain.iter().any(|owner| owner == "LlamaModel") && found.unevaluated.contains(&rope_key) {
+            llama_rope_dim(self.arch, hparams, found)?;
+        }
+        Ok(())
+    }
+
+    fn ctx<'b>(
+        &'b self,
+        hparams: &'b Map<String, Value>,
+        p: &'b Map<String, Value>,
+        overrides: &'b std::collections::HashMap<String, Option<V>>,
+    ) -> Ctx<'b> {
+        Ctx {
+            map: hparams,
+            p,
+            dir: self.dir,
+            arch: self.arch,
+            converter: self.converter,
+            tensors: self.tensors,
+            hf_arch: self.hf_arch.clone(),
+            loaded: self.loaded,
+            overrides: Some(overrides),
+            popped: self.popped,
+            depth: 0,
+        }
+    }
+
+    /// An expression in `method`, with its locals and the walrus values its
+    /// earlier guards set.
+    fn eval_in(
+        &self,
+        method: &str,
+        hparams: &Map<String, Value>,
+        overrides: &std::collections::HashMap<String, Option<V>>,
+        method_vars: &mut std::collections::HashMap<String, std::collections::HashMap<String, V>>,
+        text: &str,
+    ) -> Ev<V> {
+        let (p, _) = rope_params(Some(hparams));
+        let ctx = self.ctx(hparams, &p, overrides);
+        let locals = index()["methods"][method].get("locals").and_then(Value::as_object);
+        let vars = method_vars.remove(method).unwrap_or_default();
+        let mut eval = Eval { ctx: &ctx, locals, site_locals: None, vars, pending: Default::default(), depth: 0 };
+        let value = eval.expr(text);
+        method_vars.insert(method.to_string(), eval.vars);
+        value
+    }
+
+    /// TextModel's base rows, the pooling helper, or a transcribed class:
+    /// these follow their transcriptions instead of their events.
+    fn transcribed_call(
+        &self,
+        target: &str,
+        now: Runs,
+        hparams: &Map<String, Value>,
+        overrides: &std::collections::HashMap<String, Option<V>>,
+        found: &mut ClassKeys,
+    ) -> Result<bool> {
+        let owner = target.strip_suffix(".set_gguf_parameters");
+        let handled = target == "TextModel._try_set_pooling_type"
+            || owner.is_some_and(|owner| owner == "TextModel" || is_transcribed(owner));
+        if !handled {
+            return Ok(false);
+        }
+        let mut scratch = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
+        let into = if now == Runs::Yes { &mut *found } else { &mut scratch };
+        let (p, _) = rope_params(Some(hparams));
+        let mut ctx = self.ctx(hparams, &p, overrides);
+        if target == "TextModel._try_set_pooling_type" {
+            pooling(self.arch, hparams, self.dir, &mut into.keys)?;
+        } else if let Some(owner) = owner {
+            let from = self.chain.iter().position(|name| name == owner).unwrap_or(self.chain.len());
+            ctx.chain(&self.chain[from..], into)?;
+        }
+        if now == Runs::Maybe {
+            for key in scratch.keys.into_iter().map(|(key, _)| key).chain(scratch.unevaluated) {
+                if !found.unevaluated.contains(&key) {
+                    found.unevaluated.push(key);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &self,
+        method: &str,
+        write: &'static Value,
+        now: Runs,
+        hparams: &Map<String, Value>,
+        overrides: &std::collections::HashMap<String, Option<V>>,
+        method_vars: &mut std::collections::HashMap<String, std::collections::HashMap<String, V>>,
+        found: &mut ClassKeys,
+    ) -> Result<()> {
+        let template = write["key"].as_str().unwrap_or("");
+        if template.starts_with("general.") || template.starts_with("tokenizer.") {
+            return Ok(());
+        }
+        let key = template.replace("{arch}", self.arch);
+        let guard = write["when"].as_str().unwrap_or("always");
+        let value = if now == Runs::Maybe {
+            Err(Unknown)
+        } else {
+            let holds = if guard == "always" {
+                Ok(true)
+            } else {
+                self.eval_in(method, hparams, overrides, method_vars, guard).map(|value| truthy(&value))
+            };
+            match holds {
+                Ok(false) => return Ok(()),
+                Ok(true) => write["value"]
+                    .as_str()
+                    .ok_or(Unknown)
+                    .and_then(|text| self.eval_in(method, hparams, overrides, method_vars, text))
+                    .and_then(|value| to_meta(&value, write["type"].as_str().unwrap_or(""))),
+                Err(halt) => Err(halt),
+            }
+        };
+        if let Err(halt) = &value {
+            let at = format!("{method} line {}", write["line"].as_u64().unwrap_or(0));
+            stop_or_unknown(halt.clone(), self.class, &at, guard)?;
+        }
+        match value {
+            Ok(Some(value)) => set(&mut found.keys, key, value),
+            Ok(None) => {}
+            Err(_) => {
+                if !found.unevaluated.contains(&key) {
+                    found.unevaluated.push(key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An attribute assignment inside the sequence: its guard, then `=` or
+    /// `+=` onto the attribute's value so far.
+    fn assignment(
+        &self,
+        name: &str,
+        site_id: &str,
+        hparams: &Map<String, Value>,
+        overrides: &std::collections::HashMap<String, Option<V>>,
+    ) -> Ev<Option<V>> {
+        let site = &index()["assignment_sites"][site_id];
+        let (p, _) = rope_params(Some(hparams));
+        let ctx = self.ctx(hparams, &p, overrides);
+        let mut eval = Eval {
+            ctx: &ctx,
+            locals: None,
+            site_locals: site.get("locals").and_then(Value::as_object),
+            vars: Default::default(),
+            pending: Default::default(),
+            depth: 0,
+        };
+        let guard = site["when"].as_str().unwrap_or("always");
+        if guard != "always" && !truthy(&eval.expr(guard)?) {
+            return Ok(None);
+        }
+        let next = eval.expr(site["value"].as_str().ok_or(Unknown)?)?;
+        Ok(Some(match site["op"].as_str() {
+            Some("+=") => {
+                let current = eval.self_attribute(name)?;
+                arith("+", &current, &next)?
+            }
+            _ => next,
+        }))
+    }
 }
 
 /// converter_attributes hparams_mutations: the changes a converter makes to
@@ -622,6 +962,7 @@ pub(crate) fn class_keys_with(
 /// prepare_tensors, and prepare_metadata before set_gguf_parameters), in run
 /// order. A change that cannot be evaluated is named in `unapplied`.
 fn apply_mutations(
+    class: &str,
     loaded: &Map<String, Value>,
     dir: &std::path::Path,
     arch: &str,
@@ -629,7 +970,7 @@ fn apply_mutations(
     tensors: &[String],
     hf_arch: Option<&str>,
     unapplied: &mut Vec<String>,
-) -> Map<String, Value> {
+) -> Result<Map<String, Value>> {
     let mut hparams = loaded.clone();
     let sites = &index()["assignment_sites"];
     for reference in converter["hparams_mutations"].as_array().into_iter().flatten() {
@@ -639,12 +980,15 @@ fn apply_mutations(
         }
         let Some(id) = reference["site"].as_str() else { continue };
         let site = &sites[id];
-        match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch, loaded) {
+        match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch, loaded, None) {
             Ok(()) => {}
-            Err(Unknown) => unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams"))),
+            Err(halt) => {
+                stop_or_unknown(halt, class, id, site["when"].as_str().unwrap_or(""))?;
+                unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams")));
+            }
         }
     }
-    hparams
+    Ok(hparams)
 }
 
 fn apply_mutation(
@@ -656,10 +1000,11 @@ fn apply_mutation(
     tensors: &[String],
     hf_arch: Option<&str>,
     loaded: &Map<String, Value>,
+    popped: Option<&std::collections::HashMap<String, Value>>,
 ) -> Ev<()> {
     let current = hparams.clone();
     let (p, _) = rope_params(Some(&current));
-    let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), loaded, depth: 0 };
+    let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), loaded, overrides: None, popped, depth: 0 };
     let mut eval = Eval {
         ctx: &ctx,
         locals: None,
@@ -1084,6 +1429,14 @@ struct Ctx<'a> {
     hf_arch: Option<String>,
     /// The dict as ModelBase.load_hparams returns it, before any change.
     loaded: &'a Map<String, Value>,
+    /// Attributes assigned so far inside the set_gguf_parameters sequence
+    /// (None: assigned in a way that cannot be evaluated). Absent outside a
+    /// sequence walk.
+    overrides: Option<&'a std::collections::HashMap<String, Option<V>>>,
+    /// Top-level keys a `pop` mutation removed, with their values, so a later
+    /// local such as HunYuan's `saved = self.hparams.pop('num_experts', None)`
+    /// reads the value it returned.
+    popped: Option<&'a std::collections::HashMap<String, Value>>,
     depth: usize,
 }
 
@@ -1181,12 +1534,12 @@ impl Ctx<'_> {
                         .ok_or(Unknown)
                         .and_then(|text| eval.expr(text))
                         .and_then(|value| to_meta(&value, step["type"].as_str().unwrap_or(""))),
-                    Err(Unknown) => Err(Unknown),
+                    Err(_) => Err(Unknown),
                 };
                 match value {
                     Ok(Some(value)) => set(&mut found.keys, key, value),
                     Ok(None) => {}
-                    Err(Unknown) => {
+                    Err(_) => {
                         if !found.unevaluated.contains(&key) {
                             found.unevaluated.push(key);
                         }
@@ -1212,7 +1565,7 @@ impl Ctx<'_> {
                 match holds {
                     Ok(false) => {}
                     Ok(true) => run(self, found)?,
-                    Err(Unknown) => {
+                    Err(_) => {
                         // The call may or may not run: none of its keys can be evaluated.
                         let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
                         run(self, &mut skipped)?;
@@ -1237,11 +1590,28 @@ enum Step {
     Super,
 }
 
-/// A guard or value the evaluator cannot decide from the config.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Unknown;
+/// Why an expression has no value: the evaluator cannot decide it from the
+/// config, or llama.cpp's converter would raise there (a missing key, a
+/// non-optional find_hparam with no name present, a null passed to a key
+/// writer). GGUF-037 (round 14): a site that runs and raises stops the
+/// conversion; one that cannot be read leaves its key out with a warning.
+#[derive(Debug, Clone, PartialEq)]
+enum Halt {
+    Unknown,
+    Raise(String),
+}
 
-type Ev<T> = std::result::Result<T, Unknown>;
+#[allow(non_upper_case_globals)]
+const Unknown: Halt = Halt::Unknown;
+
+impl Halt {
+    /// A raise reached only through something unknown may not happen.
+    fn unsure(self) -> Halt {
+        Halt::Unknown
+    }
+}
+
+type Ev<T> = std::result::Result<T, Halt>;
 
 #[derive(Debug, Clone, PartialEq)]
 enum V {
@@ -1273,6 +1643,10 @@ fn truthy(value: &V) -> bool {
 fn to_meta(value: &V, kind: &str) -> Ev<Option<MetaValue>> {
     use crate::formats::gguf::{TYPE_I32, TYPE_U32, TYPE_U64};
     let V::J(value) = value else { return Err(Unknown) };
+    // gguf-py fails packing None (round 10).
+    if value.is_null() {
+        return Err(Halt::Raise("None passed to the key writer".into()));
+    }
     let scalar = match (kind, value) {
         (_, Value::Array(items)) => {
             let fixed = match kind {
@@ -1415,7 +1789,9 @@ impl Eval<'_, '_> {
         if self.depth > 16 {
             return Err(Unknown);
         }
-        let value = self.expr(text);
+        // The index gives a method local without the guard it is assigned
+        // under, so a raise in it may not happen.
+        let value = self.expr(text).map_err(Halt::unsure);
         self.depth -= 1;
         let value = value?;
         self.vars.insert(name.to_string(), value.clone());
@@ -1431,7 +1807,7 @@ impl Eval<'_, '_> {
             (V::SelfObj, "is_mistral_format") => Ok(V::J(Value::Bool(false))),
             (V::SelfObj, "find_hparam") => Ok(V::Bound(Box::new(base), name.into())),
             (V::SelfObj, _) => self.self_attribute(name),
-            (V::J(Value::Object(_)), "get") => Ok(V::Bound(Box::new(base), name.into())),
+            (V::J(Value::Object(_)), "get" | "pop") => Ok(V::Bound(Box::new(base), name.into())),
             (V::Builtin("re"), "match") | (V::Match(_), "group") => Ok(V::Bound(Box::new(base), name.into())),
             (V::Builtin("kwargs"), "pop" | "get") | (V::Builtin("ModelBase"), "load_hparams") => {
                 Ok(V::Bound(Box::new(base), name.into()))
@@ -1487,6 +1863,9 @@ impl Eval<'_, '_> {
             let names = self.ctx.tensors.iter().map(|name| (name.clone(), Value::Null)).collect();
             return Ok(V::J(Value::Object(names)));
         }
+        if let Some(assigned) = self.ctx.overrides.and_then(|overrides| overrides.get(name)) {
+            return assigned.clone().ok_or(Unknown);
+        }
         let refs = self.ctx.converter["attribute_assignments"].get(name).and_then(Value::as_array);
         let Some(refs) = refs else {
             // No index record (a unit test): block_count is TextModel's lookup.
@@ -1516,6 +1895,11 @@ impl Eval<'_, '_> {
             // an __init__ the chain never reaches, does not count.
             let phase = reference["phase"].as_str().unwrap_or("unknown");
             if matches!(phase, "never" | "after set_gguf_parameters") {
+                continue;
+            }
+            // In a sequence walk, set_gguf_parameters assignments are events of
+            // their own, applied where they run (the overrides above).
+            if phase == "set_gguf_parameters" && self.ctx.overrides.is_some() {
                 continue;
             }
             let guard = site["when"].as_str().unwrap_or("always");
@@ -1548,6 +1932,16 @@ impl Eval<'_, '_> {
         };
         match func {
             V::Bound(base, method) => match (*base, method.as_str()) {
+                // dict.pop reads like get; on self.hparams after the pop
+                // mutation ran, it gives the value that pop removed.
+                (V::J(Value::Object(map)), "pop") => {
+                    let key = args.first().map(json).transpose()?.ok_or(Unknown)?;
+                    let key = key.as_str().ok_or(Unknown)?;
+                    match map.get(key).cloned().or_else(|| self.ctx.popped.and_then(|popped| popped.get(key)).cloned()) {
+                        Some(value) => Ok(V::J(value)),
+                        None => args.get(1).cloned().ok_or(Unknown),
+                    }
+                }
                 (V::J(Value::Object(map)), "get") => {
                     let key = args.first().map(json).transpose()?.ok_or(Unknown)?;
                     let key = key.as_str().ok_or(Unknown)?;
@@ -1571,7 +1965,7 @@ impl Eval<'_, '_> {
                     if optional {
                         Ok(V::J(Value::Null))
                     } else {
-                        Err(Unknown)
+                        Err(Halt::Raise(format!("find_hparam finds none of {names}")))
                     }
                 }
                 (V::Path(path), "is_file") => Ok(V::J(Value::Bool(path.is_file()))),
@@ -1724,11 +2118,18 @@ impl Eval<'_, '_> {
                     (V::Builtin("args"), V::J(Value::Number(number))) if number.as_u64() == Some(0) => {
                         Ok(V::Path(self.ctx.dir.to_path_buf()))
                     }
-                    (V::J(Value::Object(map)), V::J(Value::String(key))) => map.get(&key).cloned().map(V::J).ok_or(Unknown),
+                    (V::J(Value::Object(map)), V::J(Value::String(key))) => {
+                        map.get(&key).cloned().map(V::J).ok_or_else(|| Halt::Raise(format!("KeyError '{key}'")))
+                    }
                     (V::J(Value::Array(items)), V::J(Value::Number(number))) => {
                         let at = number.as_i64().ok_or(Unknown)?;
                         let at = if at < 0 { items.len() as i64 + at } else { at };
-                        usize::try_from(at).ok().and_then(|at| items.get(at)).cloned().map(V::J).ok_or(Unknown)
+                        usize::try_from(at)
+                            .ok()
+                            .and_then(|at| items.get(at))
+                            .cloned()
+                            .map(V::J)
+                            .ok_or_else(|| Halt::Raise(format!("IndexError {at}")))
                     }
                     _ => Err(Unknown),
                 }
@@ -1795,7 +2196,10 @@ impl Eval<'_, '_> {
                     match self.eval(item) {
                         Ok(value) if truthy(&value) == want => return Ok(value),
                         Ok(value) => last = value,
-                        Err(Unknown) => unknown = true,
+                        // Python raises here only if no earlier operand ended
+                        // the test, which an unknown one may have done.
+                        Err(Halt::Raise(cause)) if !unknown => return Err(Halt::Raise(cause)),
+                        Err(_) => unknown = true,
                     }
                 }
                 if unknown {
@@ -1807,9 +2211,10 @@ impl Eval<'_, '_> {
             E::IfExp(then, cond, other) => match self.eval(cond) {
                 Ok(value) if truthy(&value) => self.eval(then),
                 Ok(_) => self.eval(other),
-                Err(Unknown) => {
-                    let then = self.eval(then)?;
-                    if self.eval(other)? == then {
+                Err(Halt::Raise(cause)) => Err(Halt::Raise(cause)),
+                Err(_) => {
+                    let then = self.eval(then).map_err(Halt::unsure)?;
+                    if self.eval(other).map_err(Halt::unsure)? == then {
                         Ok(then)
                     } else {
                         Err(Unknown)
@@ -2416,7 +2821,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -2438,9 +2843,12 @@ mod tests {
         yes("(1 if self.hparams['a'] > 2 else 0) == 1");
         yes("self.is_mistral_format is False");
         // A KeyError, an unknown attribute, or a missing find_hparam is unknown.
-        assert_eq!(eval_in(config, "self.hparams['zz']"), Err(Unknown));
+        // A missing key or a non-optional find_hparam raises, as in llama.cpp.
+        assert_eq!(eval_in(config, "self.hparams['zz']"), Err(Halt::Raise("KeyError 'zz'".into())));
         assert_eq!(eval_in(config, "self.something_else"), Err(Unknown));
-        assert_eq!(eval_in(config, "self.find_hparam(['zz'])"), Err(Unknown));
+        assert!(matches!(eval_in(config, "self.find_hparam(['zz'])"), Err(Halt::Raise(_))));
+        // A raise after an unknown operand may not happen.
+        assert_eq!(eval_in(config, "self.unknown or self.hparams['zz']"), Err(Unknown));
         assert_eq!(eval_in(config, "gguf.PoolingType.LAST"), Err(Unknown));
         yes("[x * 2 for x in self.hparams['l'] if x > 1] == [4, 6]");
         yes("any(t != 'sparse' for t in ['sparse', 'dense'])");
@@ -2450,7 +2858,7 @@ mod tests {
         yes("re.match('lay(\\d+)', 'lay12x').group(1) == '12'");
         yes("re.match('x', 'ax') is None");
         yes("len({x // 2 for x in self.hparams['l']}) == 2");
-        assert_eq!(eval_in(config, "[x for x in self.hparams['zz']]"), Err(Unknown));
+        assert!(matches!(eval_in(config, "[x for x in self.hparams['zz']]"), Err(Halt::Raise(_))));
         assert_eq!(eval_in(config, "[x for x in l for y in l]"), Err(Unknown));
         // An unknown operand does not hide a decided one.
         assert_eq!(eval_in(config, "self.unknown and False"), Ok(V::J(Value::Bool(false))));
@@ -2627,31 +3035,37 @@ mod tests {
     #[test]
     fn self_attributes_come_from_the_converter_record() {
         let dir = std::path::Path::new("/nonexistent");
-        let map = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2}"#);
+        let map = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "logit_scale": 0.5, "sliding_window": 4096, "vocab_size": 10, "head_dim": 4}"#);
         // Cohere2MoeModel adds next-token layers with `+= n_nextn` when there are any.
         let get = |found: &ClassKeys| found.keys.iter().find(|(key, _)| key.ends_with(".block_count")).map(|(_, value)| value.clone());
         let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &map, dir).unwrap();
         assert_eq!(get(&cohere), Some(MetaValue::U32(4)));
-        let nextn = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "num_nextn_predict_layers": 1}"#);
+        let nextn = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "num_nextn_predict_layers": 1, "logit_scale": 0.5, "sliding_window": 4096, "vocab_size": 10, "head_dim": 4}"#);
         let cohere = class_keys("Cohere2MoeModel", "cohere2moe", &nextn, dir).unwrap();
         assert_eq!(get(&cohere), Some(MetaValue::U32(5)), "{:?}", cohere.unevaluated);
         // NemotronHPuzzleModel calls GraniteHybridModel.__init__ directly, so
         // NemotronH's MTP step never runs for it.
         let (p, _) = rope_params(Some(&nextn));
         let record = &index()["converters"]["NemotronHPuzzleModel"];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &nextn, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &nextn, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
         // DeepseekV4DSparkModel counts the layers in the filtered tensor names.
         let record = &index()["converters"]["DeepseekV4DSparkModel"];
         let names = ["layers.0.attn.weight".to_string(), "layers.2.ffn.weight".to_string(), "embed.weight".to_string()];
-        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, loaded: &nextn, depth: 0 };
+        let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, loaded: &nextn, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(3))));
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
         let mtp = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "mtp_num_hidden_layers": 1}"#);
-        let qwen35 = class_keys("Qwen3_5TextModel", "qwen35", &mtp, dir).unwrap();
-        assert_eq!(get(&qwen35), Some(MetaValue::U32(5)), "{:?}", qwen35.unevaluated);
+        let (p, _) = rope_params(Some(&mtp));
+        let record = &index()["converters"]["Qwen3_5TextModel"];
+        let ctx = Ctx { map: &mtp, p: &p, dir, arch: "qwen35", converter: record, tensors: &[], hf_arch: None, loaded: &mtp, overrides: None, popped: None, depth: 0 };
+        let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
+        assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(5))));
+        // Without a key its writes read, llama.cpp's converter raises, and so does tensconv.
+        let err = class_keys("Qwen3_5TextModel", "qwen35", &mtp, dir).err().unwrap().to_string();
+        assert!(err.contains("would stop at") && err.contains("KeyError"), "{err}");
         // Qwen2Model keeps TextModel's block_count.
         let qwen = class_keys("Qwen2Model", "qwen2", &map, dir).unwrap();
         assert!(qwen.keys.iter().any(|(key, value)| key == "qwen2.block_count" && *value == MetaValue::U32(4)));
@@ -2669,26 +3083,43 @@ mod tests {
         assert!(qwen.unapplied.is_empty(), "{:?}", qwen.unapplied);
         // CommandR2Model sets max_position_embeddings from model_max_length.
         let command = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
-            "max_position_embeddings": 4096, "model_max_length": 131072}"#);
+            "max_position_embeddings": 4096, "model_max_length": 131072, "logit_scale": 0.5}"#);
         let command = class_keys("CommandR2Model", "command-r", &command, dir).unwrap();
         assert_eq!(get(&command, "command-r.context_length"), Some(MetaValue::U32(131072)));
+        // Dots1Model copies n_routed_experts in __init__: without it llama.cpp
+        // raises KeyError, and tensconv stops too.
+        let dots = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2}"#);
+        let err = class_keys("Dots1Model", "dots1", &dots, dir).err().unwrap().to_string();
+        assert!(err.contains("Dots1Model.__init__:20") && err.contains("KeyError 'n_routed_experts'"), "{err}");
         // NemotronHModel sets num_hidden_layers from layers_block_type in the
         // local it passes on as hparams=.
         let nemotron = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
             "layers_block_type": ["mamba", "attention", "mamba"]}"#);
         let record = &index()["converters"]["NemotronHModel"];
         let mut unapplied = Vec::new();
-        let changed = apply_mutations(&nemotron, dir, "nemotron_h", record, &[], None, &mut unapplied);
+        let changed = apply_mutations("NemotronHModel", &nemotron, dir, "nemotron_h", record, &[], None, &mut unapplied).unwrap();
         assert_eq!(changed.get("num_hidden_layers"), Some(&Value::from(3)), "{unapplied:?}");
         // With experts and a next-token layer, is_moe (has_moe_params from a
         // fresh load_hparams) is true and the MTP step adds one layer.
         let moe = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
             "layers_block_type": ["mamba", "attention", "mamba"], "num_experts_per_tok": 2, "num_nextn_predict_layers": 1}"#);
-        let changed = apply_mutations(&moe, dir, "nemotron_h", record, &[], None, &mut unapplied);
+        let changed = apply_mutations("NemotronHModel", &moe, dir, "nemotron_h", record, &[], None, &mut unapplied).unwrap();
         let (p, _) = rope_params(Some(&changed));
-        let ctx = Ctx { map: &changed, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &moe, depth: 0 };
+        let ctx = Ctx { map: &changed, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &moe, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
+    }
+
+    #[test]
+    fn changes_inside_set_gguf_parameters_apply_where_they_run() {
+        // HunYuanModel pops num_experts, calls the base, then puts it back only
+        // when it is > 1: the base writes no expert_count.
+        let dir = std::path::Path::new("/nonexistent");
+        let get = |found: &ClassKeys, key: &str| found.keys.iter().find(|(name, _)| name == key).map(|(_, value)| value.clone());
+        let one = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2, "num_experts": 1}"#);
+        let dense = class_keys("HunYuanModel", "hunyuan-dense", &one, dir).unwrap();
+        assert_eq!(get(&dense, "hunyuan-dense.expert_count"), None, "{:?}", dense.unapplied);
+        assert!(dense.unapplied.is_empty(), "{:?}", dense.unapplied);
     }
 
     #[test]
@@ -2696,7 +3127,7 @@ mod tests {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
         let mut total = 0;
         for record in index()["methods"].as_object().unwrap().values() {
             let locals = record.get("locals").and_then(Value::as_object);
