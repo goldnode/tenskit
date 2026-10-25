@@ -618,10 +618,17 @@ pub(crate) fn class_keys_with(
     match sequence {
         // A class with a hand transcription follows it (gguf_class_parameters).
         Some(events) if !chain.first().is_some_and(|owner| is_transcribed(owner)) => {
-            // Each pop in the sequence is applied by a mutation event; what it
-            // removed is collected first so a later read of its return value works.
-            let popped = popped_values(events, &hparams);
-            let base = Walk { class, dir, arch, converter, tensors, hf_arch, loaded: map, chain: &chain, popped: Some(&popped) };
+            let base = Walk {
+                class,
+                dir,
+                arch,
+                converter,
+                tensors,
+                hf_arch,
+                loaded: map,
+                chain: &chain,
+                popped: Default::default(),
+            };
             base.run(events, &mut hparams, &mut found)?;
         }
         _ => {
@@ -631,27 +638,6 @@ pub(crate) fn class_keys_with(
         }
     }
     Ok(found)
-}
-
-/// The values the sequence's `pop` mutations of top-level keys remove, read
-/// from the dict before the walk. A key the walk changes before its pop is
-/// not covered.
-fn popped_values(events: &[Value], hparams: &Map<String, Value>) -> std::collections::HashMap<String, Value> {
-    let mut popped = std::collections::HashMap::new();
-    for event in events {
-        let Some(site_id) = event["hparams_mutation"].as_str() else { continue };
-        let site = &index()["assignment_sites"][site_id];
-        if site["op"].as_str() != Some("pop") || site["key"].as_str() != Some("self.hparams") {
-            continue;
-        }
-        let Some(lexed) = lex(&format!("[{}]", site["value"].as_str().unwrap_or(""))) else { continue };
-        if let Some(Tok::Str(key)) = lexed.get(1) {
-            if let Some(value) = hparams.get(key) {
-                popped.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
-    }
-    popped
 }
 
 /// GGUF-037 (round 14): a site that runs and would raise in llama.cpp's
@@ -685,7 +671,7 @@ struct Walk<'a> {
     hf_arch: Option<String>,
     loaded: &'a Map<String, Value>,
     chain: &'a [String],
-    popped: Option<&'a std::collections::HashMap<String, Value>>,
+    popped: std::cell::RefCell<std::collections::HashMap<String, Value>>,
 }
 
 impl Walk<'_> {
@@ -758,9 +744,18 @@ impl Walk<'_> {
             } else if let Some(site_id) = event["hparams_mutation"].as_str() {
                 let site = &index()["assignment_sites"][site_id];
                 let applied = if now == Runs::Yes {
-                    apply_mutation(hparams, site, self.dir, self.arch, self.converter, self.tensors, self.hf_arch.as_deref(), self.loaded, self.popped)
+                    apply_mutation(hparams, site, self.dir, self.arch, self.converter, self.tensors, self.hf_arch.as_deref(), self.loaded, Some(&self.popped))
                 } else {
                     Err(Unknown)
+                };
+                let applied = match applied {
+                    Ok(returned) => {
+                        if let Some(returned) = returned {
+                            self.popped.borrow_mut().insert(site_id.to_string(), returned);
+                        }
+                        Ok(())
+                    }
+                    Err(halt) => Err(halt),
                 };
                 if let Err(halt) = applied {
                     if now == Runs::Yes {
@@ -810,7 +805,7 @@ impl Walk<'_> {
             hf_arch: self.hf_arch.clone(),
             loaded: self.loaded,
             overrides: Some(overrides),
-            popped: self.popped,
+            popped: Some(&self.popped),
             depth: 0,
         }
     }
@@ -981,7 +976,7 @@ fn apply_mutations(
         let Some(id) = reference["site"].as_str() else { continue };
         let site = &sites[id];
         match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch, loaded, None) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(halt) => {
                 stop_or_unknown(halt, class, id, site["when"].as_str().unwrap_or(""))?;
                 unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams")));
@@ -1000,8 +995,8 @@ fn apply_mutation(
     tensors: &[String],
     hf_arch: Option<&str>,
     loaded: &Map<String, Value>,
-    popped: Option<&std::collections::HashMap<String, Value>>,
-) -> Ev<()> {
+    popped: Option<&std::cell::RefCell<std::collections::HashMap<String, Value>>>,
+) -> Ev<Option<Value>> {
     let current = hparams.clone();
     let (p, _) = rope_params(Some(&current));
     let ctx = Ctx { map: &current, p: &p, dir, arch, converter, tensors, hf_arch: hf_arch.map(str::to_string), loaded, overrides: None, popped, depth: 0 };
@@ -1023,16 +1018,16 @@ fn apply_mutation(
     // ModelBase.__init__ loads the dict, or takes the one passed in: both are
     // the dict as it stands here, whatever its guard says.
     if op == "replace" && text.contains("load_hparams") {
-        return Ok(());
+        return Ok(None);
     }
     let guard = site["when"].as_str().unwrap_or("always");
     if guard != "always" && !truthy(&eval.expr(guard)?) {
-        return Ok(());
+        return Ok(None);
     }
     if op == "replace" {
         let V::J(Value::Object(next)) = eval.expr(text)? else { return Err(Unknown) };
         *hparams = next;
-        return Ok(());
+        return Ok(None);
     }
     let target = site["key"].as_str().ok_or(Unknown)?;
     match op {
@@ -1051,25 +1046,30 @@ fn apply_mutation(
             } else {
                 value
             };
-            path_set(hparams, &path, value)
+            path_set(hparams, &path, value).map(|()| None)
         }
         "del" => {
             let path = hparams_path(&mut eval, target, on_local)?;
-            path_remove(hparams, &path)
+            path_remove(hparams, &path).map(|()| None)
         }
         "pop" | "setdefault" => {
             let mut path = hparams_path(&mut eval, target, on_local)?;
             let V::J(Value::Array(args)) = eval.expr(&format!("[{text}]"))? else { return Err(Unknown) };
             let key = args.first().and_then(Value::as_str).ok_or(Unknown)?;
             path.push(Value::from(key));
+            // Both return a value, which a local may read (round 15).
             if op == "pop" {
+                let removed = match path_get(hparams, &path).cloned() {
+                    Some(value) => value,
+                    None => args.get(1).cloned().ok_or_else(|| Halt::Raise(format!("KeyError '{key}'")))?,
+                };
                 let _ = path_remove(hparams, &path);
-                Ok(())
+                Ok(Some(removed))
             } else {
                 if path_get(hparams, &path).is_none() {
                     path_set(hparams, &path, args.get(1).cloned().unwrap_or(Value::Null))?;
                 }
-                Ok(())
+                Ok(path_get(hparams, &path).cloned())
             }
         }
         _ => Err(Unknown),
@@ -1433,10 +1433,10 @@ struct Ctx<'a> {
     /// (None: assigned in a way that cannot be evaluated). Absent outside a
     /// sequence walk.
     overrides: Option<&'a std::collections::HashMap<String, Option<V>>>,
-    /// Top-level keys a `pop` mutation removed, with their values, so a later
-    /// local such as HunYuan's `saved = self.hparams.pop('num_experts', None)`
-    /// reads the value it returned.
-    popped: Option<&'a std::collections::HashMap<String, Value>>,
+    /// What each pop or setdefault on self.hparams returned when it ran, by
+    /// its site, for a local that names that site (HunYuan's
+    /// `saved_num_experts` reads `HunYuanModel.set_gguf_parameters:251`).
+    popped: Option<&'a std::cell::RefCell<std::collections::HashMap<String, Value>>>,
     depth: usize,
 }
 
@@ -1829,7 +1829,19 @@ impl Eval<'_, '_> {
             let guard = assignment["when"].as_str().unwrap_or("always");
             let holds = guard == "always" || truthy(&self.expr(guard)?);
             if holds {
-                let next = self.expr(assignment["value"].as_str().ok_or(Unknown)?)?;
+                // Round 15: a local read from a pop or setdefault names that
+                // change; its value is what the change returned when it ran.
+                let linked = assignment["hparams_mutation"].as_str().map(|site| {
+                    self.ctx
+                        .popped
+                        .and_then(|popped| popped.borrow().get(site).cloned())
+                        .map(V::J)
+                        .ok_or(Unknown)
+                });
+                let next = match linked {
+                    Some(value) => value?,
+                    None => self.expr(assignment["value"].as_str().ok_or(Unknown)?)?,
+                };
                 let next = match (assignment["op"].as_str(), &value) {
                     (Some("+="), Some(current)) => arith("+", current, &next)?,
                     (Some("+="), None) => return Err(Unknown),
@@ -1932,12 +1944,12 @@ impl Eval<'_, '_> {
         };
         match func {
             V::Bound(base, method) => match (*base, method.as_str()) {
-                // dict.pop reads like get; on self.hparams after the pop
-                // mutation ran, it gives the value that pop removed.
+                // dict.pop reads like get here; a local read from a pop on
+                // self.hparams takes the value that pop returned (site_local).
                 (V::J(Value::Object(map)), "pop") => {
                     let key = args.first().map(json).transpose()?.ok_or(Unknown)?;
                     let key = key.as_str().ok_or(Unknown)?;
-                    match map.get(key).cloned().or_else(|| self.ctx.popped.and_then(|popped| popped.get(key)).cloned()) {
+                    match map.get(key).cloned() {
                         Some(value) => Ok(V::J(value)),
                         None => args.get(1).cloned().ok_or(Unknown),
                     }
@@ -3120,6 +3132,12 @@ mod tests {
         let dense = class_keys("HunYuanModel", "hunyuan-dense", &one, dir).unwrap();
         assert_eq!(get(&dense, "hunyuan-dense.expert_count"), None, "{:?}", dense.unapplied);
         assert!(dense.unapplied.is_empty(), "{:?}", dense.unapplied);
+        // GraniteModel pops head_dim in an if test before calling its parent,
+        // so the base writes no key_length even when the config has head_dim.
+        let granite = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2, "head_dim": 4, "vocab_size": 10,
+            "embedding_multiplier": 1.0, "residual_multiplier": 1.0, "attention_multiplier": 1.0, "logits_scaling": 1.0}"#);
+        let found = class_keys("GraniteModel", "granite", &granite, dir).unwrap();
+        assert_eq!(get(&found, "granite.attention.key_length"), None, "{:?} {:?}", found.unevaluated, found.unapplied);
     }
 
     #[test]
