@@ -1698,6 +1698,12 @@ fn gguf_hparams(
             .into(),
     );
     let found = crate::gguf_keys::class_keys_with(class, arch, map, dir, model_tensors)?;
+    if !found.may_raise.is_empty() {
+        warnings.push(format!(
+            "llama.cpp's {class} may stop at {}; tenspile cannot tell from config.json whether it would (GGUF-037)",
+            found.may_raise.join(", ")
+        ));
+    }
     if !found.unapplied.is_empty() {
         warnings.push(format!(
             "llama.cpp's {class} changes its config dict at {}, which tenspile cannot evaluate, so keys read after \

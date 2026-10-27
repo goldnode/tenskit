@@ -564,6 +564,9 @@ pub(crate) struct ClassKeys {
     /// hparams_mutations that could not be applied, so the config dict the
     /// keys were read from may differ from llama.cpp's.
     pub(crate) unapplied: Vec<String>,
+    /// Explicit raises or asserts that may fire, where tenspile cannot tell
+    /// from config.json (round 15).
+    pub(crate) may_raise: Vec<String>,
 }
 
 /// GGUF-037: follow `class`'s set_gguf_parameters chain, base first.
@@ -593,7 +596,7 @@ pub(crate) fn class_keys_with(
     dir: &std::path::Path,
     tensors: &[String],
 ) -> Result<ClassKeys> {
-    let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
+    let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new(), may_raise: Vec::new() };
     let record = index()["converters"].get(class);
     let chain: Vec<String> = match record.and_then(|record| record["set_gguf_parameters"].as_array()) {
         Some(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
@@ -737,7 +740,13 @@ impl Walk<'_> {
             if now == Runs::No {
                 continue;
             }
-            if let Some(method) = event["write"].as_str() {
+            if let Some(line) = event["raise"].as_u64() {
+                let method = stack
+                    .last()
+                    .map(|(target, _)| target.clone())
+                    .unwrap_or_else(|| format!("{}.set_gguf_parameters", self.chain.first().map_or("", String::as_str)));
+                self.raise_event(&method, line, event, now, hparams, &overrides, &mut method_vars, found)?;
+            } else if let Some(method) = event["write"].as_str() {
                 let at = event["index"].as_u64().unwrap_or(0) as usize;
                 let write = &index()["methods"][method]["writes"][at];
                 self.write(method, write, now, hparams, &overrides, &mut method_vars, found)?;
@@ -846,7 +855,7 @@ impl Walk<'_> {
         if !handled {
             return Ok(false);
         }
-        let mut scratch = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
+        let mut scratch = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new(), may_raise: Vec::new() };
         let into = if now == Runs::Yes { &mut *found } else { &mut scratch };
         let (p, _) = rope_params(Some(hparams));
         let mut ctx = self.ctx(hparams, &p, overrides);
@@ -913,6 +922,58 @@ impl Walk<'_> {
                     found.unevaluated.push(key);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Round 15: an explicit raise, or an assert whose test is false. One that
+    /// fires where the walk runs stops the conversion, as it stops llama.cpp's
+    /// converter; one that may fire, or that a try in llama.cpp may catch, is
+    /// named in a warning.
+    #[allow(clippy::too_many_arguments)]
+    fn raise_event(
+        &self,
+        method: &str,
+        line: u64,
+        event: &Value,
+        now: Runs,
+        hparams: &Map<String, Value>,
+        overrides: &std::collections::HashMap<String, Option<V>>,
+        method_vars: &mut std::collections::HashMap<String, std::collections::HashMap<String, V>>,
+        found: &mut ClassKeys,
+    ) -> Result<()> {
+        let guard = event["when"].as_str().unwrap_or("always");
+        let cause = event["cause"].as_str().unwrap_or("raise");
+        let mut fires = if guard == "always" {
+            Ok(true)
+        } else {
+            self.eval_in(method, hparams, overrides, method_vars, guard).map(|value| truthy(&value))
+        };
+        if event["kind"].as_str() == Some("assert") && fires == Ok(true) {
+            let test = cause.strip_prefix("assert ").unwrap_or(cause);
+            // `assert test, message`: the message is not needed.
+            let test = self
+                .eval_in(method, hparams, overrides, method_vars, test)
+                .or_else(|_| match test.rsplit_once(", ") {
+                    Some((head, _)) => self.eval_in(method, hparams, overrides, method_vars, head),
+                    None => Err(Unknown),
+                });
+            fires = test.map(|value| !truthy(&value));
+        }
+        let at = format!("{method} line {line}");
+        let caught = event.get("inside_try_catching").is_some();
+        match fires {
+            Ok(false) => {}
+            Ok(true) if now == Runs::Yes && !caught => {
+                return Err(msg(format!(
+                    "llama.cpp's {} would stop at {at} ({cause}) and write no file, so tensconv stops too (GGUF-037)",
+                    self.class
+                )))
+            }
+            Err(halt @ Halt::Raise(_)) if now == Runs::Yes && !caught => {
+                stop_or_unknown(halt, self.class, &at, guard)?;
+            }
+            _ => found.may_raise.push(format!("{at} ({cause})")),
         }
         Ok(())
     }
@@ -1567,7 +1628,7 @@ impl Ctx<'_> {
                     Ok(true) => run(self, found)?,
                     Err(_) => {
                         // The call may or may not run: none of its keys can be evaluated.
-                        let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new() };
+                        let mut skipped = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new(), may_raise: Vec::new() };
                         run(self, &mut skipped)?;
                         for key in skipped.keys.into_iter().map(|(key, _)| key).chain(skipped.unevaluated) {
                             if !found.unevaluated.contains(&key) {
@@ -3138,6 +3199,20 @@ mod tests {
             "embedding_multiplier": 1.0, "residual_multiplier": 1.0, "attention_multiplier": 1.0, "logits_scaling": 1.0}"#);
         let found = class_keys("GraniteModel", "granite", &granite, dir).unwrap();
         assert_eq!(get(&found, "granite.attention.key_length"), None, "{:?} {:?}", found.unevaluated, found.unapplied);
+    }
+
+    #[test]
+    fn an_explicit_assert_that_fails_stops_the_conversion() {
+        // ARwkv7Model asserts wkv_version == 7 before it writes its keys.
+        let dir = std::path::Path::new("/nonexistent");
+        let wrong = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "wkv_version": 6}"#);
+        let err = class_keys("ARwkv7Model", "arwkv7", &wrong, dir).err().map(|err| err.to_string()).unwrap_or_default();
+        assert!(err.contains("assert self.hparams['wkv_version'] == 7"), "{err}");
+        // With the right version the assert passes; any other missing key is
+        // reported as such, not as the assert.
+        let right = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "wkv_version": 7}"#);
+        let result = class_keys("ARwkv7Model", "arwkv7", &right, dir);
+        assert!(result.as_ref().err().is_none_or(|err| !err.to_string().contains("assert")), "{:?}", result.err());
     }
 
     #[test]

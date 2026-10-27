@@ -144,7 +144,7 @@ How the architecture and its changes are chosen:
   - calls a non-optional `find_hparam` with none of its names present;
   - passes a null to a key writer.
 
-  Dots1 without `n_routed_experts`, or Cohere2 without `logit_scale`, stops in this way. A raise that only an unknown operand or guard may lead to, or one under an `except` guard, is not certain, so it leaves the key out with the warning instead.
+  Dots1 without `n_routed_experts`, or Cohere2 without `logit_scale`, stops in this way. So does an explicit `raise` or failed `assert` in the sequence whose guard holds, such as ARwkv7's `assert self.hparams['wkv_version'] == 7`. One whose guard cannot be evaluated, or that a `try` in llama.cpp may catch, is named in a warning as a place where llama.cpp may stop. A raise that only an unknown operand or guard may lead to, or one under an `except` guard, is not certain, so it leaves the key out with the warning instead.
 
   Classes that `gguf_class_parameters` transcribes by hand follow the transcription instead of the index:
   - **Pooling (`_try_set_pooling_type`, called by Qwen2, BERT, and about 40 converters):** `pooling_type` comes from sentence-transformers' `modules.json` and its pooling `config.json`, or from `embedding_config.json`. A plain causal LM has neither file and writes none. `classifier_pooling` and `classifier_activation` give the classifier keys. An unsupported mode stops the conversion, as it stops llama.cpp's.
