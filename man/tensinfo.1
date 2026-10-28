@@ -1,0 +1,182 @@
+.TH TENSINFO 1 "2 November 2026" "tenskit 0.1.0" "User Commands"
+.SH NAME
+tensinfo \- describe what a tensor container holds
+.SH SYNOPSIS
+.SY tensinfo
+.RB [ \-t | \-\-tensors ]
+.RB [ \-\-fold ]
+.RB [ \-\-sort ]
+.RB [ \-m | \-\-metadata ]
+.RB [ \-\-json ]
+.RB [ \-\-format
+.IR name ]
+.RB [ \-\-max\-header\-size
+.IR size ]
+.RB [ \-\-force\-single\-file ]
+.I file
+.RI [ key \ ...]
+.YS
+.SH DESCRIPTION
+.B tensinfo
+reads a tensor container and says what model it holds.
+.I file
+is a file or a model directory; a directory is the safetensors weight
+set, the same rule as
+.BR \%tenspile (1).
+.PP
+With no options it prints a short overview, one line per item.
+A line whose source is missing is left out:
+.TP
+.B file
+The path, the container format, and the size of the tensor data.
+.TP
+.B model
+For GGUF,
+.I \%general.architecture
+with the name and size label.
+For a Hugging Face model,
+.I model_type
+and
+.I \%architectures[0]
+from
+.IR config.json .
+.TP
+.B parameters
+The parameter count and the number of tensors.
+A packed quantization counts its packed values as stored.
+.TP
+.B dtypes
+Each dtype's share of the parameters.
+.TP
+.B layers
+The layer count, hidden size, attention heads (and key-value heads),
+context length, and experts, from the GGUF keys or from the
+.I config.json
+names that metadata-mapping hf_config_to_gguf lists.
+.TP
+.B vocabulary
+The vocabulary size.
+.TP
+.B quantization
+The GGUF block types present, the
+.I \%quantization_config
+or MLX
+.I quantization
+method, bits, and group size, or none.
+.TP
+.B tokenizer
+For GGUF,
+.IR \%tokenizer.ggml.model ;
+a GGUF file without it does not load in llama.cpp.
+Otherwise whether
+.I tokenizer.json
+or
+.I tokenizer.model
+is beside the weights.
+.TP
+.B embeddings
+Whether the output layer shares the input embedding.
+.TP
+.B note
+Shards and shared storage.
+The notes about file layout are in
+.B tenspile \-i
+and
+.BR \-\-json .
+.SH OPTIONS
+.TP
+.BR \-t ", " \-\-tensors
+Add the aligned tensor table: name, dtype, shape, bytes, offset, and
+parameters, with bytes and parameters scaled.
+Shard and detail columns appear when a tensor has them.
+Name
+.I key
+arguments limit the table to those tensors.
+.TP
+.B \-\-fold
+Merge a consecutive numeric name segment in the table:
+.I \%model.layers.[0\-29]
+is one copy per layer.
+A gap stays on its own line.
+Implies
+.BR \-t .
+.TP
+.B \-\-sort
+Sort the table by name.
+Name segments split at dots; a segment of digits sorts by its number,
+so
+.I layers.2
+comes before
+.IR layers.10 .
+Implies
+.BR \-t .
+.TP
+.BR \-m ", " \-\-metadata
+List every metadata key.
+Values longer than 120 characters are cut; a cut array gives its item count.
+.TP
+.B \-\-json
+One JSON document: the overview, every metadata key in full, every tensor,
+and every note.
+.TP
+.BI \-\-format " name"
+Container to read when the file does not say.
+.TP
+.BI \-\-max\-header\-size " size"
+Safetensors header cap (default 100M).
+.TP
+.BI \-\-force\-single\-file " path"
+Read this
+.I .safetensors
+file even when
+.I config.json
+is in the same directory.
+.TP
+.BR \-h ", " \-\-help
+Show the help.
+.TP
+.B \-\-version
+Show the version.
+.SH EXIT STATUS
+.TP
+.B 0
+The file was read.
+.TP
+.B 1
+An error. The message is written to stderr and starts with
+.BR "\%tensinfo: " .
+.SH EXAMPLES
+What a Hugging Face model directory holds:
+.PP
+.EX
+tensinfo model/
+.EE
+.PP
+The tensors of a GGUF file, one line per layer pattern:
+.PP
+.EX
+tensinfo \-t \-\-fold model.gguf
+.EE
+.PP
+Every metadata key, and the whole description for a script:
+.PP
+.EX
+tensinfo \-m model.gguf
+tensinfo \-\-json model.safetensors
+.EE
+.SH FILES
+.TP
+.I config.json
+Beside the file or in the directory.
+The model, layer, and vocabulary lines read it for a Hugging Face model,
+and the quantization line reads
+.I \%quantization_config
+or
+.IR quantization .
+.SH AUTHOR
+Nick Reynolds (GitHub and X: goldnode).
+.SH SEE ALSO
+.BR \%tenspile (1),
+.BR \%tensdiff (1),
+.BR \%tensconv (1),
+.BR \%tensquant (1)

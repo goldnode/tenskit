@@ -14,7 +14,7 @@ The layout and type table are [gguf.yaml](../tensdataspecs_readonly/specs/format
 | 2 | Reads it. A metadata rewrite keeps version 2. |
 | 3 | Reads the little-endian form. A big-endian file is refused. |
 
-`ggml`, `ggmf`, and `ggjt` stop with `is legacy GGML/GGMF/GGJT; tenspile reads GGUF`. A removed ggml type code stops with `was removed from GGUF`. Type 40 is `NVFP4`. `COUNT` is the sentinel after the last type, not a tensor type.
+`ggml`, `ggmf`, and `ggjt` stop with `is legacy GGML/GGMF/GGJT; tenskit reads GGUF`. A removed ggml type code stops with `was removed from GGUF`. Type 40 is `NVFP4`. `COUNT` is the sentinel after the last type, not a tensor type.
 
 ## List and info
 

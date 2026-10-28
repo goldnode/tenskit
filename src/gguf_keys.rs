@@ -111,7 +111,7 @@ pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
 /// GGUF-040's notes for a config.json: a model_type, top-level or of the
 /// text_config, that the defaults table lacks; and a composite type that
 /// transformers gives a text_config built from the top-level keys when
-/// config.json has none, which tenspile does not build.
+/// config.json has none, which tensconv does not build.
 pub(crate) fn defaults_notes(config: &Value) -> Vec<String> {
     let table = defaults_table();
     let mut notes = Vec::new();
@@ -564,7 +564,7 @@ pub(crate) struct ClassKeys {
     /// hparams_mutations that could not be applied, so the config dict the
     /// keys were read from may differ from llama.cpp's.
     pub(crate) unapplied: Vec<String>,
-    /// Explicit raises or asserts that may fire, where tenspile cannot tell
+    /// Explicit raises or asserts that may fire, where tensconv cannot tell
     /// from config.json (round 15).
     pub(crate) may_raise: Vec<String>,
 }

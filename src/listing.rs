@@ -395,7 +395,7 @@ fn parse_index(segment: &str) -> Option<u64> {
 }
 
 /// 1024-based, so a checkpoint size is `64 MiB` rather than a raw count.
-fn human_bytes(nbytes: u64) -> String {
+pub(crate) fn human_bytes(nbytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut scale = 1u128;
     let mut unit = 0;
@@ -417,7 +417,7 @@ fn human_bytes(nbytes: u64) -> String {
 }
 
 /// Thousands are decimal: 16_777_216 parameters is `16.8M`.
-fn human_count(count: u64) -> String {
+pub(crate) fn human_count(count: u64) -> String {
     const STEPS: [(u64, &str); 4] = [
         (1_000_000_000_000, "T"),
         (1_000_000_000, "G"),

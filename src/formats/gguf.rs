@@ -808,7 +808,7 @@ pub fn rewrite_metadata(
 ) -> Result<()> {
     if !(MIN_VERSION..=VERSION).contains(&src.version) {
         return Err(msg(format!(
-            "refusing to write GGUF version {}; tenspile writes little-endian versions {MIN_VERSION} and {VERSION}",
+            "refusing to write GGUF version {}; tenskit writes little-endian versions {MIN_VERSION} and {VERSION}",
             src.version
         )));
     }
@@ -1123,18 +1123,18 @@ fn unsupported_version(path: &Path, version: u32) -> crate::error::Error {
     // GGUF-002i: a version word whose low 16 bits are zero is byte-swapped.
     if version & 0xFFFF == 0 {
         return msg(format!(
-            "{} looks like big-endian GGUF, which tenspile does not read",
+            "{} looks like big-endian GGUF, which tenskit does not read",
             path.display()
         ));
     }
     if version == 1 {
         return msg(format!(
-            "{}: GGUF version 1 is not supported. That layout used 32-bit counts, string lengths, array lengths, and dimension sizes, and it was only written from 21 to 27 August 2023. llama.cpp removed the version 1 reader on 2 November 2023. tenspile reads little-endian versions {MIN_VERSION} and {VERSION}",
+            "{}: GGUF version 1 is not supported. That layout used 32-bit counts, string lengths, array lengths, and dimension sizes, and it was only written from 21 to 27 August 2023. llama.cpp removed the version 1 reader on 2 November 2023. tenskit reads little-endian versions {MIN_VERSION} and {VERSION}",
             path.display()
         ));
     }
     msg(format!(
-        "{}: GGUF version {version} is not supported; tenspile reads little-endian versions {MIN_VERSION} and {VERSION}",
+        "{}: GGUF version {version} is not supported; tenskit reads little-endian versions {MIN_VERSION} and {VERSION}",
         path.display()
     ))
 }

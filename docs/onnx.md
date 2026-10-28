@@ -55,7 +55,7 @@ dtypes:
   float32	1	256
 ```
 
-tenspile does not write external data. A model of 2 GiB or more is refused (ONNX-006).
+tenskit does not write external data. A model of 2 GiB or more is refused (ONNX-006).
 
 ## Editing a model
 

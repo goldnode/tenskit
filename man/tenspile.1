@@ -1,4 +1,4 @@
-.TH TENSPILE 1 "31 October 2026" "tenspile 0.1.0" "User Commands"
+.TH TENSPILE 1 "31 October 2026" "tenskit 0.1.0" "User Commands"
 .SH NAME
 tenspile \- inspect and edit tensor containers
 .SH SYNOPSIS
@@ -12,9 +12,6 @@ tenspile \- inspect and edit tensor containers
 .SY tenspile
 .B \-t
 .RB [ \-v ]
-.RB [ \-\-columns ]
-.RB [ \-\-fold ]
-.RB [ \-\-sort ]
 .RB [ \-f ]
 .I archive
 .RI [ key
@@ -156,43 +153,21 @@ Archive path.
 If omitted, the first operand is the archive.
 .TP
 .BR \-v ", " \-\-verbose
-Longer listing.
-Fields are separated by tabs.
-.TP
-.B \-\-columns
-Aligned listing for the console, with a heading row.
-Implies
-.BR \-v .
-Bytes and parameter counts are scaled.
-Shard and detail columns appear only when a member has them.
-Applies to list or info.
-.TP
-.B \-\-fold
-Merge a consecutive numeric name segment when the tensors match.
-Implies
-.BR \-\-columns .
-.I model.layers.[3\-5]
-is one copy of each leaf, not the sum, and the offset is
-.IR \- .
-A gap, or a second number in the name, stays on its own line.
-Applies to list or info.
-.B tensdiff \-\-fold
-folds a diff the same way..TP
-.B \-\-sort
-List members sorted by name instead of in file order.
-Names are compared one dot-separated segment at a time.
-A segment that is all digits sorts by its number, before any other segment,
-so
-.I layers.2
-comes before
-.IR layers.10 .
-Other segments sort by their bytes.
-Applies to list, and to info with
-.BR \-v ,
+Longer listing: name, dtype, shape, bytes, offset, parameters, shard,
+and detail, separated by tabs, under a heading line.
+With
+.BR \-i ,
+the summary is followed by that listing.
+An aligned, folded, sorted, or JSON listing, and an overview of the model,
+are
+.BR \%tensinfo (1)'s.
+The options
 .BR \-\-columns ,
 .BR \-\-fold ,
-or
-.BR \-\-json .
+.BR \-\-sort ,
+and
+.B \-\-json
+moved there; given to tenspile, they stop with a pointer.
 .TP
 .BR \-C ", " \-\-directory " \fIdir\fR"
 Directory for extracted files.
@@ -214,14 +189,6 @@ is rawtensor/1, a
 .I \%.rawtensor.json
 manifest plus a
 .IR .bin .
-.TP
-.B \-\-json
-Machine-readable listing or info on stdout.
-.B \-\-columns
-and
-.B \-\-fold
-do not apply to
-.BR \-\-json .
 .TP
 .BI \-\-dtype " name"
 Dtype for a headerless input file.
@@ -318,24 +285,10 @@ tenspile \-tvf model.safetensors
 .EE
 .RE
 .PP
-Read a large model in a terminal, with repeated layers folded into one block:
-.RS
-.EX
-tenspile \-t \-\-columns \-\-fold \-f model/
-.EE
-.RE
-.PP
 Show the header, metadata, and dtype tally of a GGUF file:
 .RS
 .EX
 tenspile \-i model.gguf
-.EE
-.RE
-.PP
-Print the listing as JSON for a script:
-.RS
-.EX
-tenspile \-t \-\-json \-f model.safetensors
 .EE
 .RE
 .PP
@@ -406,6 +359,7 @@ tenspile \-u \-f model.gguf \-\-metadata\-file meta.json
 .SH AUTHOR
 Nick Reynolds (GitHub and X: goldnode).
 .SH SEE ALSO
+.BR \%tensinfo (1),
 .BR \%tensdiff (1),
 .BR \%tensconv (1),
 .BR \%tensquant (1)

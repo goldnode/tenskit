@@ -105,7 +105,7 @@ pub fn temp_beside(dest: &Path) -> PathBuf {
         .and_then(|text| text.to_str())
         .unwrap_or("archive");
     let tmp_name = format!(
-        ".{name}.tenspile-tmp-{}-{}",
+        ".{name}.tenskit-tmp-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

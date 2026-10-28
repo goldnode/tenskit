@@ -365,7 +365,7 @@ pub fn write_archive_with(
     for tensor in tensors {
         if tensor.fortran {
             return Err(msg(format!(
-                "tensor {} is fortran-order; rawtensor bytes are C order (RAW-009) and tenspile does not transpose",
+                "tensor {} is fortran-order; rawtensor bytes are C order (RAW-009) and tenskit does not transpose",
                 tensor.name
             )));
         }

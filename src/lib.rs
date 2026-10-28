@@ -19,6 +19,7 @@ mod formats;
 mod ggml_dequant;
 mod gguf_keys;
 mod gguf_names;
+mod info;
 mod io_util;
 mod listing;
 mod ops;
@@ -37,7 +38,7 @@ pub use error::{Error, Result};
 /// First line is the command and version. Second line is the author.
 pub fn version_line(command: &str) -> String {
     format!(
-        "{command} {}\nNick Reynolds (GitHub and X: goldnode)",
+        "{command} {} (tenskit)\nNick Reynolds (GitHub and X: goldnode)",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -66,6 +67,10 @@ pub fn convert_main(args: &[String]) -> Result<i32> {
 
 pub fn quant_main(args: &[String]) -> Result<i32> {
     quant::quant_main(args)
+}
+
+pub fn info_main(args: &[String]) -> Result<i32> {
+    info::info_main(args)
 }
 
 /// Small GGUF v3 writer used by tests. Creating GGUF is not a CLI operation.

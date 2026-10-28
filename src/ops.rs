@@ -84,15 +84,6 @@ pub fn execute(cli: Cli) -> Result<i32> {
     if cli.output.is_some() && matches!(cli.op, Op::List | Op::Info) {
         return Err(msg("-o does not apply to list or info"));
     }
-    if cli.json && (cli.columns || cli.fold) {
-        return Err(msg("--columns and --fold do not apply to --json"));
-    }
-    if cli.columns && !matches!(cli.op, Op::List | Op::Info) {
-        return Err(msg("--columns applies to list or info"));
-    }
-    if cli.fold && !matches!(cli.op, Op::List | Op::Info) {
-        return Err(msg("--fold applies to list or info"));
-    }
     match cli.op {
         Op::List => list(&cli)?,
         Op::Info => info(&cli)?,
@@ -107,29 +98,19 @@ pub fn execute(cli: Cli) -> Result<i32> {
 
 fn list(cli: &Cli) -> Result<()> {
     let archive = open_source(cli)?;
-    let mut selected = select(&archive, &cli.operands)?;
-    sort_members(cli, &mut selected);
-    if cli.json {
-        outln!("{}", json_document(&archive, &selected)?);
-        return Ok(());
-    }
-    print_members(&selected, member_style(cli));
+    let selected = select(&archive, &cli.operands)?;
+    print_members(&selected, cli.verbose);
     Ok(())
 }
 
 fn info(cli: &Cli) -> Result<()> {
     let mut archive = open_source(cli)?;
     if let Some(path) = cli.file.as_ref().filter(|path| path.is_dir()) {
-        if let Some(note) = quantization_note(path) {
+        if let Some(note) = crate::info::quantization_note(path) {
             archive.notes.push(note);
         }
     }
-    let mut members: Vec<&Member> = archive.members.iter().collect();
-    sort_members(cli, &mut members);
-    if cli.json {
-        outln!("{}", json_document(&archive, &members)?);
-        return Ok(());
-    }
+    let members: Vec<&Member> = archive.members.iter().collect();
     outln!("format: {}", archive.format.as_str());
     outln!("version: {}", archive.version);
     outln!("path: {}", archive.path.display());
@@ -140,7 +121,7 @@ fn info(cli: &Cli) -> Result<()> {
     } else {
         outln!("metadata:");
         for (key, value) in &archive.metadata {
-            outln!("  {key}={}", short_value(value));
+            outln!("  {key}={}", crate::info::short_value(value));
         }
     }
     outln!("dtypes:");
@@ -160,89 +141,20 @@ fn info(cli: &Cli) -> Result<()> {
     for note in &archive.notes {
         outln!("note: {note}");
     }
-    if cli.verbose || cli.columns || cli.fold {
-        print_members(&members, member_style(cli));
+    if cli.verbose {
+        print_members(&members, true);
     }
     Ok(())
 }
 
-enum MemberStyle {
-    Names,
-    Tabs,
-    Columns { fold: bool },
-}
-
-fn quantization_note(dir: &Path) -> Option<String> {
-    let bytes = fs::read(dir.join("config.json")).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
-    if let Some(object) = value.get("quantization_config").and_then(Value::as_object) {
-        if let Some(method) = object.get("quant_method").and_then(Value::as_str) {
-            return Some(quantization_note_text(
-                method,
-                json_u64(object, &["bits", "w_bit"]),
-                json_u64(object, &["group_size", "q_group_size"]),
-            ));
+/// Names, or with `-v` the tab-separated fields under a heading line.
+/// The aligned, folded, and sorted views are tensinfo's.
+fn print_members(members: &[&Member], fields: bool) {
+    if !fields {
+        for member in members {
+            outln!("{}", member.name);
         }
-    }
-    let object = value.get("quantization").and_then(Value::as_object)?;
-    if !object.contains_key("bits") && !object.contains_key("group_size") {
-        return None;
-    }
-    Some(quantization_note_text(
-        "mlx",
-        object.get("bits").and_then(Value::as_u64),
-        object.get("group_size").and_then(Value::as_u64),
-    ))
-}
-
-fn json_u64(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_u64))
-}
-
-fn quantization_note_text(method: &str, bits: Option<u64>, group: Option<u64>) -> String {
-    let mut text = format!("quantization {method}");
-    if let Some(bits) = bits {
-        text.push_str(&format!(" bits {bits}"));
-    }
-    if let Some(group) = group {
-        text.push_str(&format!(" group {group}"));
-    }
-    text
-}
-
-fn sort_members(cli: &Cli, members: &mut [&Member]) {
-    if cli.sort {
-        members.sort_by(|left, right| crate::listing::name_order(&left.name, &right.name));
-    }
-}
-
-fn member_style(cli: &Cli) -> MemberStyle {
-    if cli.fold || cli.columns {
-        MemberStyle::Columns { fold: cli.fold }
-    } else if cli.verbose {
-        MemberStyle::Tabs
-    } else {
-        MemberStyle::Names
-    }
-}
-
-fn print_members(members: &[&Member], style: MemberStyle) {
-    match style {
-        MemberStyle::Names => {
-            for member in members {
-                outln!("{}", member.name);
-            }
-            return;
-        }
-        MemberStyle::Columns { fold } => {
-            let text = crate::listing::render_columns(members, fold);
-            if !text.is_empty() {
-                outln!("{text}");
-            }
-            return;
-        }
-        MemberStyle::Tabs => {}
+        return;
     }
     outln!("name\tdtype\tshape\tbytes\toffset\tparams\tshard\tdetail");
     for member in members {
@@ -261,91 +173,6 @@ fn print_members(members: &[&Member], style: MemberStyle) {
             member.file_offset
         );
     }
-}
-
-/// A metadata value for the text listing: long values such as a GGUF
-/// vocabulary are cut to their first 120 characters. `--json` prints them whole.
-/// A cut array gives its item count, then the length of its full JSON text.
-fn short_value(value: &str) -> String {
-    const SHOWN: usize = 120;
-    let Some((end, _)) = value.char_indices().nth(SHOWN) else {
-        return value.to_string();
-    };
-    let items = value
-        .starts_with('[')
-        .then(|| serde_json::from_str::<Vec<Value>>(value).ok())
-        .flatten();
-    match items {
-        Some(items) => format!(
-            "{}… ({} items; {} bytes as JSON)",
-            &value[..end],
-            items.len(),
-            value.len()
-        ),
-        None => format!("{}… ({} bytes)", &value[..end], value.len()),
-    }
-}
-
-fn json_document(archive: &Archive, members: &[&Member]) -> Result<String> {
-    let mut metadata = Map::new();
-    for (key, value) in &archive.metadata {
-        metadata.insert(key.clone(), Value::String(value.clone()));
-    }
-    let mut listed = Vec::with_capacity(members.len());
-    for member in members {
-        let mut object = Map::new();
-        object.insert("name".into(), Value::String(member.name.clone()));
-        object.insert(
-            "dtype".into(),
-            Value::String(crate::dtype::display_name(&member.dtype).to_string()),
-        );
-        object.insert(
-            "shape".into(),
-            Value::Array(member.shape.iter().copied().map(Value::from).collect()),
-        );
-        object.insert("bytes".into(), Value::from(member.nbytes));
-        object.insert("offset".into(), Value::from(member.file_offset));
-        object.insert(
-            "numel".into(),
-            match member.numel {
-                Some(count) => Value::from(count),
-                None => Value::Null,
-            },
-        );
-        object.insert(
-            "shard".into(),
-            match &member.shard {
-                Some(shard) => Value::String(shard.clone()),
-                None => Value::Null,
-            },
-        );
-        object.insert(
-            "detail".into(),
-            match &member.detail {
-                Some(detail) => Value::String(detail.clone()),
-                None => Value::Null,
-            },
-        );
-        listed.push(Value::Object(object));
-    }
-    let mut root = Map::new();
-    root.insert(
-        "format".into(),
-        Value::String(archive.format.as_str().into()),
-    );
-    root.insert("version".into(), Value::String(archive.version.clone()));
-    root.insert(
-        "path".into(),
-        Value::String(archive.path.display().to_string()),
-    );
-    root.insert("members".into(), Value::Array(listed));
-    root.insert("metadata".into(), Value::Object(metadata));
-    root.insert("data_bytes".into(), Value::from(archive.data_bytes));
-    root.insert(
-        "notes".into(),
-        Value::Array(archive.notes.iter().cloned().map(Value::String).collect()),
-    );
-    Ok(serde_json::to_string_pretty(&Value::Object(root))?)
 }
 
 fn extract(cli: &Cli) -> Result<()> {
@@ -2240,19 +2067,4 @@ fn ends_with(path: &Path, suffix: &str) -> bool {
     path.file_name()
         .and_then(|text| text.to_str())
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(suffix))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::short_value;
-
-    #[test]
-    fn a_cut_array_gives_its_item_count() {
-        let long: Vec<String> = (0..200).map(|n| n.to_string()).collect();
-        let value = serde_json::to_string(&long).unwrap();
-        let shown = short_value(&value);
-        assert!(shown.ends_with(&format!("(200 items; {} bytes as JSON)", value.len())), "{shown}");
-        let text = "x".repeat(130);
-        assert_eq!(short_value(&text), format!("{}… (130 bytes)", "x".repeat(120)));
-    }
 }

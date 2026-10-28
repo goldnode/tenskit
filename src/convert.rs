@@ -561,7 +561,7 @@ fn generated_condition(when: &str, hparams: Option<&Map<String, Value>>) -> Opti
 
 /// GGUF-030 and GGUF-035: tensors that generate_extra_tensors computes are
 /// not written. One warning, only when the spec's condition holds, or when
-/// tenspile cannot test the condition.
+/// tensconv cannot test the condition.
 fn extra_tensor_note(
     converter: &ConverterRecord,
     hparams: Option<&Map<String, Value>>,
@@ -1700,13 +1700,13 @@ fn gguf_hparams(
     let found = crate::gguf_keys::class_keys_with(class, arch, map, dir, model_tensors)?;
     if !found.may_raise.is_empty() {
         warnings.push(format!(
-            "llama.cpp's {class} may stop at {}; tenspile cannot tell from config.json whether it would (GGUF-037)",
+            "llama.cpp's {class} may stop at {}; tensconv cannot tell from config.json whether it would (GGUF-037)",
             found.may_raise.join(", ")
         ));
     }
     if !found.unapplied.is_empty() {
         warnings.push(format!(
-            "llama.cpp's {class} changes its config dict at {}, which tenspile cannot evaluate, so keys read after \
+            "llama.cpp's {class} changes its config dict at {}, which tensconv cannot evaluate, so keys read after \
              it may differ (GGUF-037)",
             found.unapplied.join(", ")
         ));
@@ -1717,7 +1717,7 @@ fn gguf_hparams(
     warnings.extend(skipped);
     if !found.unevaluated.is_empty() {
         warnings.push(format!(
-            "llama.cpp's {class} may also write {}; tenspile cannot evaluate when or what from config.json, so they are left out (GGUF-037)",
+            "llama.cpp's {class} may also write {}; tensconv cannot evaluate when or what from config.json, so they are left out (GGUF-037)",
             found.unevaluated.join(", ")
         ));
     }

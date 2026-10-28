@@ -1,17 +1,17 @@
 [package]
-name = "tenspile"
+name = "tenskit"
 version = "0.1.0"
 edition = "2021"
-description = "Inspect and edit tensor container files"
+description = "Utilities to inspect, edit, compare, convert, and quantize tensor container files"
 authors = ["Nick Reynolds (goldnode)"]
 license = "MIT"
-repository = "https://github.com/goldnode/tenspile"
+repository = "https://github.com/goldnode/tenskit"
 readme = "README.md"
 publish = false
 
 [[bin]]
 name = "tenspile"
-path = "src/main.rs"
+path = "src/tenspile.rs"
 
 [[bin]]
 name = "tensdiff"
@@ -24,6 +24,10 @@ path = "src/tensconv.rs"
 [[bin]]
 name = "tensquant"
 path = "src/tensquant.rs"
+
+[[bin]]
+name = "tensinfo"
+path = "src/tensinfo.rs"
 
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }

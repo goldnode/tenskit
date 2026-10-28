@@ -220,7 +220,7 @@ pub fn refuse_unsafe(kind: Detected, path: &Path) -> Result<()> {
             path.display()
         ))),
         Detected::LegacyGgml => Err(msg(format!(
-            "{} is legacy GGML/GGMF/GGJT; tenspile reads GGUF",
+            "{} is legacy GGML/GGMF/GGJT; tenskit reads GGUF",
             path.display()
         ))),
         _ => Ok(()),

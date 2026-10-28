@@ -192,10 +192,8 @@ fn rawtensor_fixture_matches_canonical_bytes() {
         assert_eq!(member.shape, shape);
         assert_eq!(hash_member(member), digest);
     }
-    let listed = crate::run(&[
-        "-t".into(),
+    let listed = crate::info_main(&[
         "--json".into(),
-        "-f".into(),
         vectors().join("small.safetensors").display().to_string(),
     ]);
     assert!(listed.is_ok());

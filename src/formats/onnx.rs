@@ -154,7 +154,7 @@ fn parse_graph(
             }
             Field::Bytes { id: 15, .. } => {
                 return Err(msg(
-                    "ONNX sparse initializers are not supported by tenspile",
+                    "ONNX sparse initializers are not supported by tenskit",
                 ));
             }
             _ => {}
@@ -250,7 +250,7 @@ fn parse_tensor(bytes: &[u8], base: u64, path: &Path, notes: &mut Vec<String>) -
                 }
             }
             Field::Bytes { id: 3, .. } => {
-                return Err(msg("ONNX tensor segments are not supported by tenspile"));
+                return Err(msg("ONNX tensor segments are not supported by tenskit"));
             }
             Field::Varint { id: 14, value } if value == 1 => location_external = true,
             _ => {}
@@ -378,7 +378,7 @@ fn pack_typed(
                 6 => 4,
                 _ => {
                     return Err(msg(format!(
-                        "ONNX data type {code} is not read from a typed field by tenspile"
+                        "ONNX data type {code} is not read from a typed field by tenskit"
                     )))
                 }
             };
@@ -879,7 +879,7 @@ fn external_location(tensor: &[u8]) -> Result<Option<String>> {
 fn finish(path: &Path, model: &[u8]) -> Result<()> {
     if model.len() as u64 >= 2 * 1024 * 1024 * 1024 {
         return Err(msg(
-            "the ONNX model would be 2 GiB or more; tenspile does not write external data (ONNX-006)",
+            "the ONNX model would be 2 GiB or more; tenskit does not write external data (ONNX-006)",
         ));
     }
     crate::io_util::atomic_write(path, |file: &mut File| {

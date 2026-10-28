@@ -106,13 +106,9 @@ pub struct Cli {
     pub op: Op,
     pub file: Option<PathBuf>,
     pub verbose: bool,
-    pub columns: bool,
-    pub fold: bool,
-    pub sort: bool,
     pub directory: PathBuf,
     pub output: Option<PathBuf>,
     pub format: Option<FormatName>,
-    pub json: bool,
     pub dtype: Option<String>,
     pub shape: Option<Vec<u64>>,
     pub metadata: Vec<(String, String)>,
@@ -130,13 +126,9 @@ pub struct Cli {
 pub fn parse(args: &[String]) -> Result<Parsed> {
     let mut op: Option<Op> = None;
     let mut verbose = false;
-    let mut columns = false;
-    let mut fold = false;
-    let mut sort = false;
     let mut directory = PathBuf::from(".");
     let mut output: Option<PathBuf> = None;
     let mut format: Option<FormatName> = None;
-    let mut json = false;
     let mut dtype: Option<String> = None;
     let mut shape: Option<String> = None;
     let mut metadata = Vec::new();
@@ -222,11 +214,8 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
                 "max-header-size" => {
                     max_header = parse_size(&take("max-header-size")?)?;
                 }
-                "json" => json = true,
                 "verbose" => verbose = true,
-                "columns" => columns = true,
-                "fold" => fold = true,
-                "sort" => sort = true,
+                "json" | "columns" | "fold" | "sort" => return Err(moved_to_tensinfo(name)),
                 "dry-run" => dry_run = true,
                 "force" => force = true,
                 "delete" => set_op(&mut op, Op::Delete)?,
@@ -323,13 +312,9 @@ pub fn parse(args: &[String]) -> Result<Parsed> {
         op,
         file: Some(PathBuf::from(file_marked.text)),
         verbose,
-        columns,
-        fold,
-        sort,
         directory,
         output,
         format,
-        json,
         dtype,
         shape,
         metadata,
@@ -359,6 +344,17 @@ fn marked(force_next: &mut bool, text: String) -> MarkedPath {
     let force_single = *force_next;
     *force_next = false;
     MarkedPath { text, force_single }
+}
+
+/// The console views moved to tensinfo; say where to find each.
+fn moved_to_tensinfo(name: &str) -> crate::error::Error {
+    let example = match name {
+        "json" => "tensinfo --json FILE",
+        "fold" => "tensinfo -t --fold FILE",
+        "sort" => "tensinfo -t --sort FILE",
+        _ => "tensinfo -t FILE",
+    };
+    msg(format!("--{name} moved to tensinfo: {example}"))
 }
 
 fn set_op(slot: &mut Option<Op>, op: Op) -> Result<()> {
@@ -406,7 +402,7 @@ pub fn parse_shape(text: &str) -> Result<Vec<u64>> {
     Ok(shape)
 }
 
-fn parse_size(text: &str) -> Result<u64> {
+pub(crate) fn parse_size(text: &str) -> Result<u64> {
     let text = text.trim();
     let (number, factor) = if let Some(rest) = text.strip_suffix(['K', 'k']) {
         (rest, 1024u64)
@@ -439,7 +435,7 @@ tenspile — inspect and edit tensor containers
 
 Usage:
   tenspile -c [-f] ARCHIVE [KEY=FILE ...]
-  tenspile -t [-v] [--columns] [--fold] [--sort] [-f] ARCHIVE [KEY ...]
+  tenspile -t [-v] [-f] ARCHIVE [KEY ...]
   tenspile -x [-f] ARCHIVE [KEY ...]
   tenspile -r [-f] ARCHIVE KEY=FILE ...
   tenspile -u [-f] ARCHIVE KEY=FILE ...
@@ -448,36 +444,26 @@ Usage:
 
 Operations (exactly one):
   -c, --create     Create an archive. Refuses to overwrite unless --force.
-  -t, --list       List member names. -v adds dtype, shape, bytes, offset, and parameters.
+  -t, --list       List member names. -v adds dtype, shape, bytes, offset, and parameters,
+                   separated by tabs.
   -x, --extract    Extract members. No names means all of them.
   -r, --append     Add members. Errors if a tensor key already exists.
   -u, --update     Replace a tensor key, or add it if it is missing.
   --delete         Remove tensor keys and write the archive again.
-  -i, --info       Summarize the archive from its header.
+  -i, --info       Summarize the archive from its header. -v adds the -tv fields.
 
-Compare two archives with tensdiff.
+Compare two archives with tensdiff. For an overview of the model, or an
+aligned, folded, sorted, or JSON listing, use tensinfo.
 
 Options:
   -f, --file FILE           Archive path. If omitted, the first argument is the archive.
   -v, --verbose             Longer listing. Fields are separated by tabs.
-  --columns                 Aligned listing for the console, with headings. Implies -v.
-                            Bytes and parameter counts are scaled. Shard and
-                            detail columns appear only when a member has them.
-  --fold                    Merge a consecutive numeric name segment.
-                            Implies --columns. model.layers.[3-5] is one
-                            copy per layer. A gap stays on its own line.
-                            tensdiff --fold folds a diff the same way.
-  --sort                    List members sorted by name instead of in file
-                            order. Name segments split at dots; a segment
-                            that is all digits sorts by its number, so
-                            layers.2 comes before layers.10. -t and -i -v.
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are
                             printed when the name is unknown. Which formats are
                             compiled in is local/supported-formats.txt.
                             raw is rawtensor/1 (a .rawtensor.json manifest plus a .bin).
-  --json                    Machine-readable listing or info.
   --dtype NAME              Dtype for a headerless input file (safetensors name or canonical id).
   --shape LIST              Shape for a headerless input, for example 2,2 or [2, 2].
   --metadata KEY=VALUE      Set a text metadata entry.
@@ -502,7 +488,6 @@ Members:
 
 Examples:
   tenspile -tvf model.safetensors
-  tenspile -t --columns --fold -f model.safetensors
   tenspile -i model.gguf
   tenspile -xf model.safetensors -C out embed
   tenspile -cf out.safetensors embed=embed.npy --metadata format=pt

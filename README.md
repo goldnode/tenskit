@@ -1,6 +1,6 @@
-# tenspile
+# tenskit
 
-Command-line utility for inspecting and editing tensor containers: `.safetensors`, GGUF format versions 2 and 3, `.npy`, `.npz`, rawtensor/1, PyTorch zip checkpoints, ONNX initializers, and a safetensors shard index.
+A suite of command-line utilities for tensor containers: `.safetensors`, GGUF format versions 2 and 3, `.npy`, `.npz`, rawtensor/1, PyTorch zip checkpoints, ONNX initializers, and a safetensors shard index. tenskit lists, edits, compares, converts, and quantizes them.
 
 Nick Reynolds ([goldnode](https://github.com/goldnode) on GitHub, [goldnode](https://x.com/goldnode) on X).
 
@@ -18,7 +18,7 @@ tensquant --dequant -o model-f32.safetensors model.gguf
 tensquant --quantize q8_0 -o model-q8.gguf model/
 ```
 
-Four commands share one library:
+tenskit has four utilities, which share one library:
 
 - `tenspile` lists, extracts, creates, and edits a container, like `tar` for tensors.
 - `tensdiff` compares two containers by canonical dtype, shape, bytes, and metadata. It exits 1 on a difference and 2 when a file cannot be read.
@@ -33,11 +33,11 @@ Start with [Getting started](docs/getting-started.md), a five-minute walk-throug
 
 - [Import and export](docs/import-export.md): operands, where each type can go, and what the listing columns mean
 - Formats: [safetensors](docs/safetensors.md), [shard index](docs/shards.md), [GGUF](docs/gguf.md), [NumPy `.npy` and `.npz`](docs/numpy.md), [rawtensor](docs/raw.md), [PyTorch](docs/pytorch.md), [ONNX](docs/onnx.md)
-- Commands: [tensdiff](docs/tensdiff.md), [tensconv](docs/tensconv.md), [tensquant](docs/tensquant.md)
+- Utilities: tenspile (the pages above), [tensdiff](docs/tensdiff.md), [tensconv](docs/tensconv.md), [tensquant](docs/tensquant.md)
 
 ## Specifications
 
-[tensdataspecs_readonly](tensdataspecs_readonly/README.md) is the source of truth for every format this tool reads or writes. The dtype registry, the cross-format mapping, and the format ids are loaded at build time from that tree. If a spec and this program disagree, the spec wins unless the spec maintainer changes it. Do not edit that folder here.
+[tensdataspecs_readonly](tensdataspecs_readonly/README.md) is the source of truth for every format tenskit reads or writes. The dtype registry, the cross-format mapping, and the format ids are loaded at build time from that tree. If a spec and tenskit disagree, the spec wins unless the spec maintainer changes it. Do not edit that folder here.
 
 Which of those formats are compiled in is the list in [local/supported-formats.txt](local/supported-formats.txt). `build.rs` reads it and includes only those modules from [src/formats/](src/formats/). Delete a line to leave a format out of the binary. Delete the matching file under `src/formats/` as well when you want it gone from the source tree.
 
