@@ -87,7 +87,8 @@ tensconv: renamed model.embed_tokens.weight -> token_embd.weight
 tensconv: renamed model.layers.0.self_attn.q_proj.weight -> blk.0.attn_q.weight
 …
 tensconv: renamed lm_head.weight -> output.weight
-$ tenspile -t --columns --fold -f llama.gguf
+$ tensinfo -t --fold llama.gguf
+...
 name                  dtype  shape    bytes  offset  params
 token_embd.
   weight              F32    [8, 32]  1 KiB    2304     256

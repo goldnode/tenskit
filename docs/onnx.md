@@ -7,7 +7,13 @@ The protobuf is walked directly, so no ONNX library or code generator is needed.
 ## Listing and extracting
 
 ```
-$ tenspile -t --columns -f small-typed.onnx
+$ tensinfo -t small-typed.onnx
+file:         small-typed.onnx (onnx), 69 B of tensor data
+parameters:   18 in 6 tensors
+dtypes:       F32 22%, F16 17%, I32 17%, I64 17%, I8 17%, U32 11%
+quantization: none
+tokenizer:    none beside the weights
+
 name   dtype  shape   bytes  offset  params
 t_f32  F32    [2, 2]   16 B       0       4
 t_f16  F16    [3]       6 B       0       3

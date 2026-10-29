@@ -1,5 +1,6 @@
-//! Console listing. `-v` stays tab-separated. `--columns` aligns a table and
-//! `--fold` collapses consecutive identical layers into a range.
+//! tensinfo's console table: `-t` aligns the fields, and `--fold` collapses
+//! consecutive identical layers into a range. tenspile's `-tv` stays
+//! tab-separated and does not use this module.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;

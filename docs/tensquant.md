@@ -23,7 +23,8 @@ Each float32 tensor is written to a spill file beside the output, `.<output name
 
 ```
 $ tensquant --dequant -o dequant.safetensors small.gguf
-$ tenspile -t --columns -f dequant.safetensors
+$ tensinfo -t dequant.safetensors
+...
 name    dtype  shape    bytes  offset  params
 w_f32   F32    [4, 64]  1 KiB     336     256
 b_f16   F32    [8]       32 B    1360       8
@@ -45,15 +46,15 @@ $ tensquant --dequant -o x.safetensors lone.safetensors
 tensquant: the tensor names look like a GPTQ pack, but there is no config.json quantization_config; dequant needs it
 ```
 
-`tenspile -i` on the directory shows what was found, and `tenspile -t` marks the pack tensors:
+`tensinfo` on the directory shows what was found, and its `-t` table marks the pack tensors:
 
 ```
 $ cat gptq/config.json
 {"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 32, "desc_act": false}}
-$ tenspile -i gptq | tail -2
-note: directory gptq also contains config.json
-note: quantization gptq bits 4 group 32
-$ tenspile -t --columns -f gptq
+$ tensinfo gptq | grep quantization
+quantization: gptq bits 4 group 32
+$ tensinfo -t gptq
+...
 name       dtype  shape     bytes  offset  params  detail
 gptq.
   scales   F32    [8, 32]   1 KiB     296     256  GPTQ pack; bytes stay packed
@@ -61,7 +62,8 @@ gptq.
   qweight  I32    [32, 32]  4 KiB    2344      1K  GPTQ pack; bytes stay packed
   qzeros   I32    [8, 4]    128 B    6440      32  GPTQ pack; bytes stay packed
 $ tensquant --dequant -o gptq.safetensors gptq
-$ tenspile -t --columns -f gptq.safetensors
+$ tensinfo -t gptq.safetensors
+...
 name      dtype  shape       bytes  offset  params
 gptq.
   weight  F32    [32, 256]  32 KiB      88    8.2K

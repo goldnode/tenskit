@@ -6,7 +6,8 @@ Nick Reynolds ([goldnode](https://github.com/goldnode) on GitHub, [goldnode](htt
 
 ```bash
 tenspile -tvf model.safetensors                       # list tensors with dtype, shape, and size
-tenspile -t --columns --fold -f model/                # aligned listing, repeated layers folded
+tensinfo model/                                       # short overview: model type, size, dtypes, quantization
+tensinfo -t --fold model/                             # aligned tensor table, repeated layers folded
 tenspile -i model.gguf                                # header summary and metadata
 tenspile -xf model.safetensors -C out embed           # extract one tensor as out/embed.npy
 tenspile -cf out.safetensors embed=embed.npy --metadata format=pt
@@ -18,14 +19,15 @@ tensquant --dequant -o model-f32.safetensors model.gguf
 tensquant --quantize q8_0 -o model-q8.gguf model/
 ```
 
-tenskit has four utilities, which share one library:
+tenskit has five utilities, which share one library:
 
-- `tenspile` lists, extracts, creates, and edits a container, like `tar` for tensors.
+- `tenspile` lists, extracts, creates, and edits a container, like `tar` for tensors. Its listing is plain text: names, or tab-separated fields.
+- `tensinfo` describes a container for a person: a short overview of the model, and on request an aligned tensor table, every metadata key, or JSON.
 - `tensdiff` compares two containers by canonical dtype, shape, bytes, and metadata. It exits 1 on a difference and 2 when a file cannot be read.
 - `tensconv` copies a whole container into another format. `--rename` maps Hugging Face names to GGUF.
 - `tensquant` dequantizes GGUF blocks and GPTQ, AWQ, bitsandbytes, compressed-tensors, and MLX packs, and writes Q8_0 or Q4_0 GGUF.
 
-`cargo build --release` builds all four. Each takes `-h` for a short help. Section 1 manual pages are in [man/](man/). The build copies them to `target/release/share/man/man1` (or the debug directory), so `MANPATH=target/release/share/man man tenspile` shows one.
+`cargo build --release` builds all five. Each takes `-h` for a short help. Section 1 manual pages are in [man/](man/). The build copies them to `target/release/share/man/man1` (or the debug directory), so `MANPATH=target/release/share/man man tenspile` shows one.
 
 ## Documentation
 
@@ -33,7 +35,7 @@ Start with [Getting started](docs/getting-started.md), a five-minute walk-throug
 
 - [Import and export](docs/import-export.md): operands, where each type can go, and what the listing columns mean
 - Formats: [safetensors](docs/safetensors.md), [shard index](docs/shards.md), [GGUF](docs/gguf.md), [NumPy `.npy` and `.npz`](docs/numpy.md), [rawtensor](docs/raw.md), [PyTorch](docs/pytorch.md), [ONNX](docs/onnx.md)
-- Utilities: tenspile (the pages above), [tensdiff](docs/tensdiff.md), [tensconv](docs/tensconv.md), [tensquant](docs/tensquant.md)
+- Utilities: tenspile (the pages above), [tensinfo](docs/tensinfo.md), [tensdiff](docs/tensdiff.md), [tensconv](docs/tensconv.md), [tensquant](docs/tensquant.md)
 
 ## Specifications
 

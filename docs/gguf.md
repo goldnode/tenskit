@@ -21,7 +21,14 @@ The layout and type table are [gguf.yaml](../tensdataspecs_readonly/specs/format
 Shapes on `-t` and `-i` are ggml `ne[]`: `ne[0]` is the innermost axis. A note says that a conversion reverses them. `bytes` is the tensor's own length, from its type and shape. When alignment padding follows a tensor, `detail` says how many bytes, for example `16 bytes of alignment padding follow the tensor`.
 
 ```
-$ tenspile -t --columns -f small.gguf
+$ tensinfo -t small.gguf
+file:         small.gguf (gguf v3), 1.4 KiB of tensor data
+model:        llama
+parameters:   532 in 5 tensors
+dtypes:       F32 48%, Q8_0 48%, F16 2%, BF16 1%, I32 1%
+quantization: GGUF blocks Q8_0
+tokenizer:    none: no tokenizer.ggml.model, so llama.cpp will not load the file
+
 name    dtype  shape    bytes  offset  params  detail
 w_f32   F32    [64, 4]  1 KiB     384     256
 b_f16   F16    [8]       16 B    1408       8  16 bytes of alignment padding follow the tensor

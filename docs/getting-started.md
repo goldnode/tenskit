@@ -26,10 +26,17 @@ e_bf16	BF16	[2, 3]	12	1380	6	-	-
 b_f16	F16	[8]	16	1392	8	-	-
 ```
 
-`--columns` lines the same fields up for reading, and scales the sizes:
+[tensinfo](tensinfo.md) describes the file for a person: a short overview, and with `-t` the same fields lined up for reading, with the sizes scaled:
 
 ```
-$ tenspile -t --columns -f small.gguf
+$ tensinfo -t small.gguf
+file:         small.gguf (gguf v3), 1.4 KiB of tensor data
+model:        llama
+parameters:   532 in 5 tensors
+dtypes:       F32 48%, Q8_0 48%, F16 2%, BF16 1%, I32 1%
+quantization: GGUF blocks Q8_0
+tokenizer:    none: no tokenizer.ggml.model, so llama.cpp will not load the file
+
 name    dtype  shape    bytes  offset  params  detail
 w_f32   F32    [64, 4]  1 KiB     384     256
 b_f16   F16    [8]       16 B    1408       8  16 bytes of alignment padding follow the tensor
@@ -38,7 +45,7 @@ e_bf16  BF16   [3, 2]    12 B    1472       6  20 bytes of alignment padding fol
 w_q8_0  Q8_0   [64, 4]  272 B    1504     256  16 bytes of alignment padding follow the tensor
 ```
 
-The GGUF shapes are reversed compared with safetensors. GGUF stores `ne[]` with the innermost axis first. tenspile shows the file's own order, and every conversion reverses it. `bytes` is the tensor itself; the padding after it is in `detail`.
+The GGUF shapes are reversed compared with safetensors. GGUF stores `ne[]` with the innermost axis first. tenspile and tensinfo show the file's own order, and every conversion reverses it. `bytes` is the tensor itself; the padding after it is in `detail`.
 
 `-i` summarizes the header:
 
@@ -185,7 +192,8 @@ Only the format line differs, so the tensors survived the round trip.
 
 ```
 $ tensquant --dequant -o dequant.safetensors small.gguf
-$ tenspile -t --columns -f dequant.safetensors
+$ tensinfo -t dequant.safetensors
+...
 name    dtype  shape    bytes  offset  params
 w_f32   F32    [4, 64]  1 KiB     336     256
 b_f16   F32    [8]       32 B    1360       8
@@ -198,10 +206,11 @@ See [tensconv](tensconv.md) and [tensquant](tensquant.md).
 
 ## Use it from a script
 
-`--json` prints one JSON document for a listing, for info, and for a diff:
+`tensinfo --json` and `tensdiff --json` each print one JSON document. `tenspile -tv` prints tab-separated fields, one tensor per line:
 
 ```bash
-tenspile -t --json -f small.safetensors | jq -r '.members[] | "\(.name) \(.numel)"'
+tensinfo --json small.safetensors | jq -r '.members[] | "\(.name) \(.numel)"'
+tenspile -tv -f small.safetensors | cut -f1,6
 tensdiff --json small.safetensors small.gguf | jq '.findings[] | select(.kind == "only_left")'
 ```
 
