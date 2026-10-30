@@ -2,7 +2,7 @@
 
 tenspile can create, list, extract, append, replace, and delete members in a safetensors file. String metadata lives under `__metadata__`.
 
-The layout, dtype names, and validation ids are [safetensors.yaml](../tensdataspecs_readonly/specs/formats/safetensors.yaml). `version: header+blob` is tenspile's label. The file has no format-version field.
+The layout, dtype names, and validation ids are `safetensors.yaml`. `version: header+blob` is tenspile's label. The file has no format-version field.
 
 See [Import and export](import-export.md) for operands and the JSON listing.
 

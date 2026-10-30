@@ -58,7 +58,7 @@ pub(crate) fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, 
     (p, r)
 }
 
-static DEFAULTS_JSON: &str = include_str!("../tensdataspecs_readonly/specs/tables/hf-config-defaults.json");
+static DEFAULTS_JSON: &str = include_str!("../generated/tables/hf-config-defaults.json");
 
 fn defaults_table() -> &'static Value {
     static TABLE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
@@ -549,7 +549,7 @@ pub(crate) fn sampling_keys(dir: &std::path::Path) -> (Vec<(String, MetaValue)>,
 // GGUF-037: the keys a converter class's set_gguf_parameters chain writes.
 
 static CONFIG_KEYS_JSON: &str =
-    include_str!("../tensdataspecs_readonly/specs/tables/gguf-config-keys.json");
+    include_str!("../generated/tables/gguf-config-keys.json");
 
 fn index() -> &'static Value {
     static INDEX: std::sync::OnceLock<Value> = std::sync::OnceLock::new();

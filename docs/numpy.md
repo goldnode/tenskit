@@ -2,9 +2,9 @@
 
 `.npy` is one array. `.npz` is a zip of `.npy` members. Both can be listed, and both are sources for the other containers.
 
-The readers follow [npy.yaml](../tensdataspecs_readonly/specs/formats/npy.yaml) and [npz.yaml](../tensdataspecs_readonly/specs/formats/npz.yaml). Writers emit `.npy` version 1.0 with the payload on a 64-byte boundary. Versions 1.0, 2.0, and 3.0 are read. A file whose data is not 64-byte aligned is still read, and `-i` notes NPY-005.
+The readers follow `npy.yaml` and `npz.yaml`. Writers emit `.npy` version 1.0 with the payload on a 64-byte boundary. Versions 1.0, 2.0, and 3.0 are read. A file whose data is not 64-byte aligned is still read, and `-i` notes NPY-005.
 
-See [Import and export](import-export.md) for operands. Descr codes come from [dtype-mapping.json](../tensdataspecs_readonly/specs/mappings/dtype-mapping.json). On read, `?` is accepted for `BOOL`, and `u1` / `i1` for `U8` / `I8`.
+See [Import and export](import-export.md) for operands. Descr codes come from `dtype-mapping.json`. On read, `?` is accepted for `BOOL`, and `u1` / `i1` for `U8` / `I8`.
 
 ## One `.npy`
 

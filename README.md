@@ -39,21 +39,21 @@ Start with [Getting started](docs/getting-started.md), a five-minute walk-throug
 
 ## Specifications
 
-[tensdataspecs_readonly](tensdataspecs_readonly/README.md) is the source of truth for every format tenskit reads or writes. The dtype registry, the cross-format mapping, and the format ids are loaded at build time from that tree. If a spec and tenskit disagree, the spec wins unless the spec maintainer changes it. Do not edit that folder here.
+Every format tenskit reads or writes follows a set of YAML and JSON format specifications. The specification tree is kept outside this repository. `build.rs` turns it into the files under [generated/](generated/README.md): the dtype registry, the cross-format mapping, and the format ids as Rust tables; the lookup tables the binaries embed; and the test vectors. Those files are tracked, so a clone builds from them without the specification tree. If a specification and tenskit disagree, the specification wins. The spec file names below, such as `gguf.yaml`, name files in that tree.
 
-Which of those formats are compiled in is the list in [local/supported-formats.txt](local/supported-formats.txt). `build.rs` reads it and includes only those modules from [src/formats/](src/formats/). Delete a line to leave a format out of the binary. Delete the matching file under `src/formats/` as well when you want it gone from the source tree.
+Which formats are compiled in is listed in [generated/formats.txt](generated/formats.txt). `build.rs` includes only those modules from [src/formats/](src/formats/).
 
 The formats implemented now:
 
-- [safetensors.yaml](tensdataspecs_readonly/specs/formats/safetensors.yaml), including the shard index
-- [gguf.yaml](tensdataspecs_readonly/specs/formats/gguf.yaml) — little-endian versions 2 and 3
-- [npy.yaml](tensdataspecs_readonly/specs/formats/npy.yaml) and [npz.yaml](tensdataspecs_readonly/specs/formats/npz.yaml)
-- [raw-sidecar.yaml](tensdataspecs_readonly/specs/formats/raw-sidecar.yaml) — rawtensor/1
-- [pytorch.yaml](tensdataspecs_readonly/specs/formats/pytorch.yaml) — zip checkpoints, with a restricted unpickler
-- [onnx.yaml](tensdataspecs_readonly/specs/formats/onnx.yaml) — graph initializers
+- `safetensors.yaml`, including the shard index
+- `gguf.yaml` — little-endian versions 2 and 3
+- `npy.yaml` and `npz.yaml`
+- `raw-sidecar.yaml` — rawtensor/1
+- `pytorch.yaml` — zip checkpoints, with a restricted unpickler
+- `onnx.yaml` — graph initializers
 - GPTQ, AWQ, bitsandbytes, compressed-tensors, and MLX, which are naming conventions inside those containers. Packed tensors stay packed.
 
-The other files in `tensdataspecs_readonly/specs/formats/` are in scope for this project and are not implemented yet. Overview specs stay unimplemented until they describe a byte layout. Legacy GGML, a legacy PyTorch pickle, and the PyTorch tar format are recognized and refused. Pinned upstream commits live in each spec's `sources`, not in this README.
+The other format specifications are in scope for this project and are not implemented yet. Overview specs stay unimplemented until they describe a byte layout. Legacy GGML, a legacy PyTorch pickle, and the PyTorch tar format are recognized and refused. Pinned upstream commits live in each spec's `sources`, not in this README.
 
 ## License
 

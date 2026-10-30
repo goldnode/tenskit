@@ -1,6 +1,6 @@
 use crate::error::{msg, Result};
 
-include!(concat!(env!("OUT_DIR"), "/spec_tables.rs"));
+include!("../generated/spec_tables.rs");
 
 /// A safetensors dtype name and its width in bits.
 ///

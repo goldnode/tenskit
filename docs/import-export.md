@@ -2,15 +2,15 @@
 
 tenspile moves tensors between containers. Create, append, and update read source files into an archive. Extract writes members back out. List and info read headers and leave the weight bytes on disk.
 
-Byte layouts, dtype codes, and validation rules are the files under [tensdataspecs_readonly/specs](../tensdataspecs_readonly/specs/README.md). This page says which operations exist.
+Byte layouts, dtype codes, and validation rules are in the format specifications that tenskit is built from (see the README). This page says which operations exist.
 
-- [safetensors](safetensors.md) follows [safetensors.yaml](../tensdataspecs_readonly/specs/formats/safetensors.yaml)
-- [NumPy `.npy` and `.npz`](numpy.md) follow [npy.yaml](../tensdataspecs_readonly/specs/formats/npy.yaml) and [npz.yaml](../tensdataspecs_readonly/specs/formats/npz.yaml)
-- [rawtensor/1](raw.md) follows [raw-sidecar.yaml](../tensdataspecs_readonly/specs/formats/raw-sidecar.yaml)
-- [GGUF](gguf.md) follows [gguf.yaml](../tensdataspecs_readonly/specs/formats/gguf.yaml)
+- [safetensors](safetensors.md) follows `safetensors.yaml`
+- [NumPy `.npy` and `.npz`](numpy.md) follow `npy.yaml` and `npz.yaml`
+- [rawtensor/1](raw.md) follows `raw-sidecar.yaml`
+- [GGUF](gguf.md) follows `gguf.yaml`
 - [shard index](shards.md) is the sharding section of the safetensors spec. A directory with those weights is the same archive. A `.safetensors` file next to `config.json` is refused unless `--force-single-file` is written immediately before that path.
-- [PyTorch zip checkpoints](pytorch.md) follow [pytorch.yaml](../tensdataspecs_readonly/specs/formats/pytorch.yaml). `--format pytorch` reads and writes a state_dict.
-- [ONNX initializers](onnx.md) follow [onnx.yaml](../tensdataspecs_readonly/specs/formats/onnx.yaml). `--format onnx` reads and writes those tensors, and an edit keeps the graph.
+- [PyTorch zip checkpoints](pytorch.md) follow `pytorch.yaml`. `--format pytorch` reads and writes a state_dict.
+- [ONNX initializers](onnx.md) follow `onnx.yaml`. `--format onnx` reads and writes those tensors, and an edit keeps the graph.
 
 `version` on `-i` is the file's own format version when it has one: `2` or `3` for little-endian GGUF, `1.0`, `2.0`, or `3.0` for `.npy`, `1` for rawtensor, the text of the pytorch `version` record, and `ir N` for ONNX. The other labels are tenspile's: `header+blob`, `index`, and `zip`.
 
@@ -37,7 +37,7 @@ tenspile -xf model.safetensors -o layer.npz embed norm
 
 A path that exists is a file, including a name that contains a colon. `ARCHIVE:MEMBER` applies when the whole string is not a file and the text before the last colon is a file.
 
-`--dtype` and `--shape` describe a headerless source. They are not a stored format. On a file that already has a header they have to match the header. A safetensors name (`F32`) and the canonical id (`float32`) name the same type. The ids and the per-format codes are [dtypes.yaml](../tensdataspecs_readonly/specs/mappings/dtypes.yaml) and [dtype-mapping.json](../tensdataspecs_readonly/specs/mappings/dtype-mapping.json).
+`--dtype` and `--shape` describe a headerless source. They are not a stored format. On a file that already has a header they have to match the header. A safetensors name (`F32`) and the canonical id (`float32`) name the same type. The ids and the per-format codes are `dtypes.yaml` and `dtype-mapping.json`.
 
 `--shape` accepts `2`, `2,2`, `2x2`, and `[2, 2]`. `[]` is a scalar: one element.
 

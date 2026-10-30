@@ -1,6 +1,6 @@
 # ONNX initializers
 
-An ONNX model keeps its weights as graph initializers. tenspile reads and writes those tensors. The operators, inputs, and outputs are left alone. The layout and validation ids are in [onnx.yaml](../tensdataspecs_readonly/specs/formats/onnx.yaml). `version` on `-i` is `ir N`, the model's IR version.
+An ONNX model keeps its weights as graph initializers. tenspile reads and writes those tensors. The operators, inputs, and outputs are left alone. The layout and validation ids are in `onnx.yaml`. `version` on `-i` is `ir N`, the model's IR version.
 
 The protobuf is walked directly, so no ONNX library or code generator is needed.
 

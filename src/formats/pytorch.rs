@@ -2124,7 +2124,7 @@ mod tests {
     #[test]
     fn a_rewrite_keeps_shared_storage_views_and_metadata_bits() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tensdataspecs_readonly/specs/test-vectors/small-pt-fp8.pt");
+            .join("generated/test-vectors/small-pt-fp8.pt");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fp8.pt");
         let archive = open(&source).unwrap();

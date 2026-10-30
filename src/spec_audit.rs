@@ -1,4 +1,4 @@
-//! Compare the readers with the fixtures in tensdataspecs_readonly.
+//! Compare the readers with the spec fixtures, copied to generated/test-vectors.
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use crate::dtype::{self, canonical_id};
 use crate::sha256;
 
 fn vectors() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tensdataspecs_readonly/specs/test-vectors")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("generated/test-vectors")
 }
 
 fn expected() -> Value {

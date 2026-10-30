@@ -1,8 +1,8 @@
 # rawtensor/1
 
-The stored raw format is rawtensor/1, defined by [raw-sidecar.yaml](../tensdataspecs_readonly/specs/formats/raw-sidecar.yaml). A `.rawtensor.json` manifest names every tensor. A sibling `<stem>.bin` holds the bytes in canonical layout: little-endian, C-order, packed. `version` on `-i` is `1`. `--format raw` selects this format.
+The stored raw format is rawtensor/1, defined by `raw-sidecar.yaml`. A `.rawtensor.json` manifest names every tensor. A sibling `<stem>.bin` holds the bytes in canonical layout: little-endian, C-order, packed. `version` on `-i` is `1`. `--format raw` selects this format.
 
-Headerless bytes are not an archive. `--dtype` and `--shape` exist only so a headerless file can be imported into a container. The names are safetensors names or canonical ids from [dtypes.yaml](../tensdataspecs_readonly/specs/mappings/dtypes.yaml).
+Headerless bytes are not an archive. `--dtype` and `--shape` exist only so a headerless file can be imported into a container. The names are safetensors names or canonical ids from `dtypes.yaml`.
 
 ## Create, list, and edit
 

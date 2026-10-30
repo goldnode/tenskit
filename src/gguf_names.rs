@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::archive::Archive;
 
 const ROLES_JSON: &str =
-    include_str!("../tensdataspecs_readonly/specs/tables/gguf-tensor-roles.json");
+    include_str!("../generated/tables/gguf-tensor-roles.json");
 
 struct Catalog {
     arches: Vec<Resolved>,

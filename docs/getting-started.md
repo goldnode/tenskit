@@ -1,11 +1,11 @@
 # Getting started
 
-This walk-through uses the small files that come with the specs, so every command and every line of output below can be reproduced. It takes about five minutes.
+This walk-through uses the small test files in `generated/test-vectors`, so every command and every line of output below can be reproduced. It takes about five minutes.
 
 ```bash
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
-vectors="$PWD/tensdataspecs_readonly/specs/test-vectors"
+vectors="$PWD/generated/test-vectors"
 mkdir -p /tmp/tour && cd /tmp/tour
 cp "$vectors"/{small.safetensors,small.gguf,small.npz,w_f32.npy} .
 ```
@@ -71,7 +71,7 @@ note: data starts at 384
 note: shapes are ggml ne[] (innermost first); a conversion reverses them
 ```
 
-Each `dtypes` row is the type, the number of tensors, and their total element count. A `note` is something the reader noticed. It is often a spec rule id that you can look up under `tensdataspecs_readonly/specs`.
+Each `dtypes` row is the type, the number of tensors, and their total element count. A `note` is something the reader noticed. It can name a rule id from the format specification.
 
 For a large model, `--fold` collapses repeated layers into one block. `--sort` lists the members by name, with layer numbers in numeric order, instead of in file order. The [tensconv](tensconv.md) page shows one.
 

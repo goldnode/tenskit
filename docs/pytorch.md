@@ -1,6 +1,6 @@
 # PyTorch checkpoints
 
-tenspile reads and writes the zip checkpoint that `torch.save` has written since PyTorch 1.6 (`.pt`, `.pth`, `.bin`, `.ckpt`). The layout, the pickle subset, and the validation ids are in [pytorch.yaml](../tensdataspecs_readonly/specs/formats/pytorch.yaml). `version` on `-i` is the text of the checkpoint's `version` record.
+tenspile reads and writes the zip checkpoint that `torch.save` has written since PyTorch 1.6 (`.pt`, `.pth`, `.bin`, `.ckpt`). The layout, the pickle subset, and the validation ids are in `pytorch.yaml`. `version` on `-i` is the text of the checkpoint's `version` record.
 
 ## Safe loading
 

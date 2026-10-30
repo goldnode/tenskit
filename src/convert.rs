@@ -2188,7 +2188,7 @@ mod tests {
     #[test]
     fn a_tied_pytorch_tensor_is_reported_when_written_twice() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tensdataspecs_readonly/specs/test-vectors/small-pt-fp8.pt");
+            .join("generated/test-vectors/small-pt-fp8.pt");
         let archive = archive::open(&source, None, DEFAULT_MAX_HEADER, None, None).unwrap();
         let mut warnings = Vec::new();
         tied_copy_note(&archive, &mut warnings);
@@ -2411,7 +2411,7 @@ mod tests {
     #[test]
     fn every_drop_condition_in_the_spec_parses() {
         let value: Value = serde_json::from_str(include_str!(
-            "../tensdataspecs_readonly/specs/tables/gguf-tensor-roles.json"
+            "../generated/tables/gguf-tensor-roles.json"
         ))
         .unwrap();
         let mut conditions = Vec::new();
@@ -2592,7 +2592,7 @@ mod tests {
         assert!(crate::dtype::GENERATED_TENSORS.len() >= 26);
         // Every converter's generator has a row.
         let value: Value = serde_json::from_str(include_str!(
-            "../tensdataspecs_readonly/specs/tables/gguf-tensor-roles.json"
+            "../generated/tables/gguf-tensor-roles.json"
         ))
         .unwrap();
         for arch in value["architectures"].as_object().unwrap().keys() {

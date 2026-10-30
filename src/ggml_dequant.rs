@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::dtype::{self, ggml_row};
 use crate::error::{msg, Result};
 
-const TABLES: &str = include_str!("../tensdataspecs_readonly/specs/tables/ggml-lookup-tables.json");
+const TABLES: &str = include_str!("../generated/tables/ggml-lookup-tables.json");
 
 struct Grids {
     kmask_iq2xs: Vec<u32>,

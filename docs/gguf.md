@@ -2,7 +2,7 @@
 
 tenspile lists a little-endian GGUF v2 or v3 file, prints its metadata, extracts tensors, and rewrites metadata by copying the tensor blob. Quantized tensors stay opaque block bytes. Creating a file, or adding, replacing, or deleting a tensor, is refused.
 
-The layout and type table are [gguf.yaml](../tensdataspecs_readonly/specs/formats/gguf.yaml). See [Import and export](import-export.md) for operands.
+The layout and type table are `gguf.yaml`. See [Import and export](import-export.md) for operands.
 
 ## Format version
 
