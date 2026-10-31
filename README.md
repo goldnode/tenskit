@@ -27,7 +27,7 @@ tenskit has five utilities, which share one library:
 - `tensconv` copies a whole container into another format. `--rename` maps Hugging Face names to GGUF.
 - `tensquant` dequantizes GGUF blocks and GPTQ, AWQ, bitsandbytes, compressed-tensors, and MLX packs, and writes Q8_0 or Q4_0 GGUF.
 
-`cargo build --release` builds all five. Each takes `-h` for a short help. Section 1 manual pages are in [man/](man/). The build copies them to `target/release/share/man/man1` (or the debug directory), so `MANPATH=target/release/share/man man tenspile` shows one.
+`cargo build --release` builds all five. Each takes `-h` for a short help. Section 1 manual pages are in [man/](man/). The build copies them to `target/release/share/man/man1` (or the debug directory) with the version from `Cargo.toml` filled in, so `MANPATH=target/release/share/man man tenspile` shows one.
 
 ## Documentation
 

@@ -1,6 +1,6 @@
 [package]
 name = "tenskit"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Utilities to inspect, edit, compare, convert, and quantize tensor container files"
 authors = ["Nick Reynolds (goldnode)"]

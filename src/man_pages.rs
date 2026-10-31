@@ -3,7 +3,9 @@ fn the_build_copies_pages_into_man1() {
     let dir = std::path::Path::new(env!("TENSPILE_MAN_DIR"));
     for name in ["tenspile.1", "tensdiff.1", "tensconv.1", "tensquant.1", "tensinfo.1"] {
         let page = dir.join(name);
-        assert!(page.is_file(), "missing {}", page.display());
+        let text = std::fs::read_to_string(&page).unwrap_or_else(|err| panic!("{}: {err}", page.display()));
+        let footer = concat!("\"tenskit ", env!("CARGO_PKG_VERSION"), "\"");
+        assert!(text.lines().next().unwrap().contains(footer), "{} lacks {footer}", page.display());
     }
 }
 

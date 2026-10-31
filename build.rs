@@ -191,11 +191,14 @@ fn drop_fields(value: &mut serde_json::Value, at: &[&str], fields: &[&str]) {
     }
 }
 
-/// Copy `man/*.1` to `share/man/man1` beside this profile's binaries.
+/// Copy `man/*.1` to `share/man/man1` beside this profile's binaries, with
+/// `@VERSION@` replaced by the version in Cargo.toml.
 /// `MANPATH=target/debug/share/man man tenspile` then finds the page.
 fn install_man_pages(manifest: &Path) {
     let source = manifest.join("man");
     println!("cargo:rerun-if-changed={}", source.display());
+    // The pages carry the package version, so a version change reruns this.
+    println!("cargo:rerun-if-changed={}", manifest.join("Cargo.toml").display());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     // OUT_DIR is target/<profile>/build/<pkg>/out, or the same under a target triple.
     let profile_dir = out_dir
@@ -221,9 +224,13 @@ fn install_man_pages(manifest: &Path) {
             .file_name()
             .unwrap_or_else(|| panic!("{} has no file name", path.display()));
         let target = dest.join(name);
-        fs::copy(&path, &target).unwrap_or_else(|err| {
-            panic!("copy {} to {}: {err}", path.display(), target.display())
-        });
+        let page = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        if !page.contains("@VERSION@") {
+            panic!("{} has no @VERSION@ in its .TH footer", path.display());
+        }
+        let page = page.replace("@VERSION@", &env::var("CARGO_PKG_VERSION").unwrap());
+        write_if_changed(&target, page.as_bytes());
         names.push(name.to_os_string());
     }
     if names.is_empty() {
