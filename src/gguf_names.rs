@@ -3,26 +3,94 @@
 //! Resolution follows conversion-considerations.md section 9. `{bid}` is the
 //! block index. `.weight` and `.bias` are tried when the pattern has neither.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-
-use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::archive::Archive;
 
-const ROLES_JSON: &str =
-    include_str!("../generated/tables/gguf-tensor-roles.json");
-
-struct Catalog {
-    arches: Vec<Resolved>,
-    groups: Vec<Vec<String>>,
+/// One architecture: the Hugging Face pattern to GGUF pattern pairs and the
+/// role to GGUF pattern list, resolved by `build.rs` from `mappings`,
+/// `block_mappings`, and this architecture's `overrides` (rows whose tensor
+/// is one of its roles, last write winning), and its converter records.
+pub(crate) struct ArchTable {
+    pub(crate) id: &'static str,
+    /// Indices into `PAIRS`.
+    pub(crate) pairs: Pairs,
+    /// Indices into `ROLE_PATTERNS`: role id to the GGUF pattern, `{bid}`
+    /// still in place.
+    pub(crate) roles: Pairs,
+    pub(crate) converters: &'static [ConverterSpec],
 }
 
-struct Resolved {
-    id: String,
-    pairs: Vec<(String, String)>,
-    /// Role id to the GGUF pattern, `{bid}` still in place.
-    roles: Vec<(String, String)>,
+/// A list of (key, value) string pairs held as indices into a shared table,
+/// so the architectures that share rows store them once.
+#[derive(Clone, Copy)]
+pub(crate) struct Pairs {
+    table: &'static [(&'static str, &'static str)],
+    at: &'static [u16],
+}
+
+impl Pairs {
+    fn iter(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        self.at.iter().map(move |index| self.table[*index as usize])
+    }
+
+    fn len(self) -> usize {
+        self.at.len()
+    }
+}
+
+/// A converter record of `architectures.<id>.converters`, as the spec has it.
+pub(crate) struct ConverterSpec {
+    pub(crate) class: &'static str,
+    pub(crate) hf_architectures: &'static [&'static str],
+    pub(crate) undo_permute: Option<bool>,
+    pub(crate) modify: ModifySpec,
+    pub(crate) filter: Option<FilterSpec>,
+    pub(crate) global_filters_after: &'static [&'static str],
+    pub(crate) tensor_hooks: Option<&'static [HookSpec]>,
+}
+
+pub(crate) struct ModifySpec {
+    pub(crate) complete: bool,
+    pub(crate) unexpanded: Option<&'static [&'static str]>,
+    pub(crate) branches: Option<&'static [BranchSpec]>,
+}
+
+pub(crate) struct BranchSpec {
+    pub(crate) when: &'static str,
+    pub(crate) assigns: &'static str,
+    pub(crate) expr: &'static str,
+}
+
+pub(crate) struct FilterSpec {
+    pub(crate) complete: bool,
+    pub(crate) drop_when: Option<&'static [&'static str]>,
+    /// Each link's `drop_when`.
+    pub(crate) chain: Option<&'static [Option<&'static [&'static str]>]>,
+}
+
+pub(crate) struct HookSpec {
+    pub(crate) method: &'static str,
+    pub(crate) class: &'static str,
+    pub(crate) line: u64,
+}
+
+/// `global_filters.TextModel`.
+pub(crate) struct TextModelFilter {
+    pub(crate) strip_when: &'static str,
+    pub(crate) strip_expr: &'static str,
+    pub(crate) drop_when: &'static str,
+    pub(crate) complete: Option<bool>,
+}
+
+mod roles {
+    use super::*;
+    include!("../generated/tensor_roles.rs");
+}
+
+struct Catalog {
+    arches: &'static [ArchTable],
+    groups: &'static [&'static [&'static str]],
 }
 
 pub struct NameHit {
@@ -85,123 +153,8 @@ pub fn note(arches: &[String]) -> String {
 }
 
 fn catalog() -> &'static Catalog {
-    static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(load_catalog)
-}
-
-fn load_catalog() -> Catalog {
-    let value: Value = serde_json::from_str(ROLES_JSON)
-        .unwrap_or_else(|err| panic!("gguf-tensor-roles.json: {err}"));
-    let mappings = rows(value.get("mappings"));
-    let block_mappings = rows(value.get("block_mappings"));
-    let overrides = value
-        .get("overrides")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut arches = Vec::new();
-    let object = value
-        .get("architectures")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("gguf-tensor-roles.json has no architectures"));
-    for (id, entry) in object {
-        let roles: HashSet<&str> = entry
-            .get("roles")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        let mut block = block_mappings.clone();
-        if let Some(rows) = overrides.get(id).and_then(Value::as_array) {
-            for row in row_slice(rows) {
-                if let Some(pos) = block.iter().position(|item| item.tensor == row.tensor) {
-                    block[pos] = row;
-                } else {
-                    block.push(row);
-                }
-            }
-        }
-        let mut pairs: HashMap<String, String> = HashMap::new();
-        let mut role_gguf: HashMap<String, String> = HashMap::new();
-        record(&mut pairs, &mut role_gguf, &mappings, &roles);
-        record(&mut pairs, &mut role_gguf, &block, &roles);
-        arches.push(Resolved {
-            id: id.clone(),
-            pairs: pairs.into_iter().collect(),
-            roles: role_gguf.into_iter().collect(),
-        });
-    }
-    arches.sort_by(|left, right| left.id.cmp(&right.id));
-    let groups = value
-        .get("shared_resolutions")
-        .and_then(Value::as_array)
-        .map(|groups| {
-            groups
-                .iter()
-                .filter_map(|group| {
-                    group
-                        .get("architectures")
-                        .and_then(Value::as_array)
-                        .map(|ids| {
-                            ids.iter()
-                                .filter_map(|id| id.as_str().map(str::to_string))
-                                .collect()
-                        })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Catalog { arches, groups }
-}
-
-#[derive(Clone)]
-struct Row {
-    tensor: String,
-    gguf: String,
-    hf: Vec<String>,
-}
-
-fn rows(value: Option<&Value>) -> Vec<Row> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| row_slice(items))
-        .unwrap_or_default()
-}
-
-fn row_slice(items: &[Value]) -> Vec<Row> {
-    items
-        .iter()
-        .filter_map(Value::as_object)
-        .filter_map(|row| {
-            Some(Row {
-                tensor: row.get("tensor")?.as_str()?.to_string(),
-                gguf: row.get("gguf")?.as_str()?.to_string(),
-                hf: row
-                    .get("hf")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect(),
-            })
-        })
-        .collect()
-}
-
-fn record(
-    pairs: &mut HashMap<String, String>,
-    role_gguf: &mut HashMap<String, String>,
-    rows: &[Row],
-    roles: &HashSet<&str>,
-) {
-    for row in rows {
-        if !roles.contains(row.tensor.as_str()) {
-            continue;
-        }
-        role_gguf.insert(row.tensor.clone(), row.gguf.clone());
-        for hf in &row.hf {
-            pairs.insert(hf.clone(), row.gguf.clone());
-        }
-    }
+    static CATALOG: Catalog = Catalog { arches: roles::ARCHES, groups: roles::SHARED_GROUPS };
+    &CATALOG
 }
 
 /// GGUF pattern for one role of `arch`. `{bid}` is left for the caller to fill.
@@ -213,8 +166,8 @@ pub fn role_pattern(arch: &str, role: &str) -> Option<String> {
         .and_then(|item| {
             item.roles
                 .iter()
-                .find(|(tensor, _)| tensor == role)
-                .map(|(_, pattern)| pattern.clone())
+                .find(|(tensor, _)| *tensor == role)
+                .map(|(_, pattern)| pattern.to_string())
         })
 }
 
@@ -223,7 +176,7 @@ pub fn map_tensor_name(arch: &str, name: &str, lang_layers: Option<u64>) -> Opti
     let catalog = catalog();
     let resolved = catalog.arches.iter().find(|item| item.id == arch)?;
     let prepared = prepare_name(name, arch, lang_layers);
-    lookup(&resolved.pairs, &prepared)
+    lookup(resolved.pairs, &prepared)
 }
 
 #[derive(Clone, Debug)]
@@ -265,195 +218,92 @@ pub struct TensorFilter {
 /// `global_filters.TextModel`: the drop test, run on the name with a leading
 /// `model.` removed for the test only.
 pub fn text_model_drop_when() -> Option<String> {
-    let value: Value = serde_json::from_str(ROLES_JSON).ok()?;
-    let filter = value.pointer("/global_filters/TextModel")?;
-    let strip = filter.get("local_name_before_drop_test")?;
-    if strip.get("when")?.as_str()? != "name.startswith('model.')"
-        || strip.get("expr")?.as_str()? != "name[len('model.'):]"
-        || filter.get("complete")?.as_bool() != Some(true)
+    let filter = &roles::TEXT_MODEL_FILTER;
+    if filter.strip_when != "name.startswith('model.')"
+        || filter.strip_expr != "name[len('model.'):]"
+        || filter.complete != Some(true)
     {
         return None;
     }
-    Some(filter.get("drop_when")?.as_str()?.to_string())
+    Some(filter.drop_when.to_string())
 }
 
 /// `modify_tensors_base.tensor_loop.drop_suffixes`: names that
 /// `ModelBase.prepare_tensors` skips before `modify_tensors`.
 pub fn base_drop_suffixes() -> Vec<String> {
-    let value: Value = serde_json::from_str(ROLES_JSON).unwrap_or(Value::Null);
-    value
-        .pointer("/modify_tensors_base/tensor_loop/drop_suffixes")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    roles::BASE_DROP_SUFFIXES.iter().map(|item| item.to_string()).collect()
+}
+
+/// Every architecture id in the roles table, sorted.
+#[cfg(test)]
+pub(crate) fn architecture_ids() -> impl Iterator<Item = &'static str> {
+    catalog().arches.iter().map(|arch| arch.id)
 }
 
 pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
-    let value: Value = serde_json::from_str(ROLES_JSON).unwrap_or(Value::Null);
-    let Some(list) = value
-        .get("architectures")
-        .and_then(|item| item.get(arch))
-        .and_then(|item| item.get("converters"))
-        .and_then(Value::as_array)
-    else {
+    let Some(table) = catalog().arches.iter().find(|item| item.id == arch) else {
         return Vec::new();
     };
-    list.iter()
-        .filter_map(|item| {
-            let class = item.get("class")?.as_str()?.to_string();
-            let hf_architectures = item
-                .get("hf_architectures")
-                .and_then(Value::as_array)
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(|id| id.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let modify = item.get("modify_tensors");
-            let complete = modify
-                .and_then(|item| item.get("complete"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let unexpanded = modify
-                .and_then(|item| item.get("unexpanded"))
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let branches = modify
-                .and_then(|item| item.get("branches"))
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            Some(TensorBranch {
-                                when: item.get("when")?.as_str()?.to_string(),
-                                assigns: item.get("assigns")?.as_str()?.to_string(),
-                                expr: item.get("expr")?.as_str()?.to_string(),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let drops = |method: &Value| -> Vec<String> {
-                method
-                    .get("drop_when")
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let filter = item
-                .get("filter_tensors")
-                .filter(|filter| !filter.is_null())
-                .map(|filter| {
-                    let mut drop_when = drops(filter);
-                    for link in filter
-                        .get("chain")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        drop_when.extend(drops(link));
-                    }
-                    TensorFilter {
-                        complete: filter
-                            .get("complete")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        drop_when,
-                    }
-                });
-            let global_filters_after = item
-                .get("global_filters_after")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut hooks: Vec<String> = item
-                .get("tensor_hooks")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|hook| hook.get("method")?.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+    let owned = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<String>>();
+    table
+        .converters
+        .iter()
+        .map(|item| {
+            let filter = item.filter.as_ref().map(|filter| {
+                let mut drop_when = owned(filter.drop_when.unwrap_or_default());
+                for link in filter.chain.unwrap_or_default() {
+                    drop_when.extend(owned(link.unwrap_or_default()));
+                }
+                TensorFilter { complete: filter.complete, drop_when }
+            });
+            let hooks_list = item.tensor_hooks.unwrap_or_default();
+            let mut hooks: Vec<String> = hooks_list.iter().map(|hook| hook.method.to_string()).collect();
             hooks.dedup();
-            let generator = item
-                .get("tensor_hooks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|hook| hook.get("method").and_then(Value::as_str) == Some("generate_extra_tensors"))
-                .and_then(|hook| {
-                    Some((
-                        hook.get("class")?.as_str()?.to_string(),
-                        hook.get("line")?.as_u64()?,
-                    ))
-                });
-            Some(ConverterRecord {
-                class,
-                hf_architectures,
-                undo_permute: item.get("undo_permute").and_then(Value::as_bool).unwrap_or(false),
-                complete,
-                unexpanded,
-                branches,
+            let generator = hooks_list
+                .iter()
+                .find(|hook| hook.method == "generate_extra_tensors")
+                .map(|hook| (hook.class.to_string(), hook.line));
+            ConverterRecord {
+                class: item.class.to_string(),
+                hf_architectures: owned(item.hf_architectures),
+                undo_permute: item.undo_permute.unwrap_or(false),
+                complete: item.modify.complete,
+                unexpanded: owned(item.modify.unexpanded.unwrap_or_default()),
+                branches: item
+                    .modify
+                    .branches
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|branch| TensorBranch {
+                        when: branch.when.to_string(),
+                        assigns: branch.assigns.to_string(),
+                        expr: branch.expr.to_string(),
+                    })
+                    .collect(),
                 filter,
                 hooks,
                 generator,
-                global_filters_after,
-            })
+                global_filters_after: owned(item.global_filters_after),
+            }
         })
         .collect()
 }
 
-/// `architectures[0]` to the GGUF architecture id that lists that class.
+/// `architectures[0]` to the GGUF architecture id that lists that class:
+/// the first architecture, in the spec's order, whose converters list it.
 pub fn architecture_for_hf_class(class: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(ROLES_JSON).ok()?;
-    let object = value.get("architectures")?.as_object()?;
-    for (arch, entry) in object {
-        let Some(list) = entry.get("converters").and_then(Value::as_array) else {
-            continue;
-        };
-        for converter in list {
-            let hit = converter
-                .get("hf_architectures")
-                .and_then(Value::as_array)
-                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(class)));
-            if hit {
-                return Some(arch.clone());
-            }
-        }
-    }
-    None
+    let index = roles::HF_CLASS_ARCH;
+    index
+        .binary_search_by(|(item, _)| (*item).cmp(class))
+        .ok()
+        .map(|at| index[at].1.to_string())
 }
 
 fn detect(catalog: &Catalog, names: &[String]) -> Vec<String> {
     if names.is_empty() {
         return Vec::new();
     }
-    let mut hits: Vec<&Resolved> = catalog
+    let mut hits: Vec<&ArchTable> = catalog
         .arches
         .iter()
         .filter(|arch| names.iter().all(|name| explains(arch, name)))
@@ -463,19 +313,19 @@ fn detect(catalog: &Catalog, names: &[String]) -> Vec<String> {
     }
     let smallest = hits.iter().map(|arch| arch.pairs.len()).min().unwrap();
     hits.retain(|arch| arch.pairs.len() == smallest);
-    let mut ids: Vec<String> = hits.iter().map(|arch| arch.id.clone()).collect();
+    let mut ids: Vec<String> = hits.iter().map(|arch| arch.id.to_string()).collect();
     if let Some(group) = catalog.groups.iter().find(|group| {
         group.len() == ids.len() && group.iter().all(|id| ids.iter().any(|hit| hit == id))
     }) {
-        ids = group.clone();
+        ids = group.iter().map(|id| id.to_string()).collect();
     }
     ids.sort();
     ids
 }
 
-fn explains(arch: &Resolved, name: &str) -> bool {
-    let prepared = prepare_name(name, &arch.id, Some(0));
-    lookup(&arch.pairs, &prepared).is_some() || matches_gguf(&arch.pairs, name)
+fn explains(arch: &ArchTable, name: &str) -> bool {
+    let prepared = prepare_name(name, arch.id, Some(0));
+    lookup(arch.pairs, &prepared).is_some() || matches_gguf(arch.pairs, name)
 }
 
 fn project(
@@ -500,8 +350,8 @@ fn project(
                 agree = false;
                 break;
             };
-            let prepared = prepare_name(name, &arch.id, lang_layers);
-            match lookup(&arch.pairs, &prepared) {
+            let prepared = prepare_name(name, arch.id, lang_layers);
+            match lookup(arch.pairs, &prepared) {
                 Some(gguf) if gguf_set.contains(gguf.as_str()) => {
                     if mapped.as_ref().is_some_and(|prior| prior != &gguf) {
                         agree = false;
@@ -531,7 +381,7 @@ fn project(
     pairs
 }
 
-fn lookup(pairs: &[(String, String)], name: &str) -> Option<String> {
+fn lookup(pairs: Pairs, name: &str) -> Option<String> {
     if let Some(found) = best_match(pairs, name) {
         return Some(found);
     }
@@ -546,9 +396,9 @@ fn lookup(pairs: &[(String, String)], name: &str) -> Option<String> {
     None
 }
 
-fn best_match(pairs: &[(String, String)], name: &str) -> Option<String> {
+fn best_match(pairs: Pairs, name: &str) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
-    for (pattern, gguf) in pairs {
+    for (pattern, gguf) in pairs.iter() {
         let Some(bid) = capture_bid(pattern, name) else {
             continue;
         };
@@ -560,7 +410,7 @@ fn best_match(pairs: &[(String, String)], name: &str) -> Option<String> {
     best.map(|(_, gguf)| gguf)
 }
 
-fn matches_gguf(pairs: &[(String, String)], name: &str) -> bool {
+fn matches_gguf(pairs: Pairs, name: &str) -> bool {
     pairs.iter().any(|(_, pattern)| {
         gguf_hit(pattern, name)
             || [".weight", ".bias"].iter().any(|suffix| {
@@ -731,6 +581,148 @@ fn meta_u64(archive: &Archive, key: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    fn strs(items: &[&str]) -> Value {
+        json!(items)
+    }
+
+    /// The converter records, shared groups, TextModel filter, and base drop
+    /// suffixes rebuilt from the compiled statics are the spec's, value for
+    /// value and in order.
+    #[test]
+    fn the_generated_roles_are_the_spec_table() {
+        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        let spec_arches = expected["architectures"].as_object().unwrap();
+        let mut ids: Vec<&str> = spec_arches.keys().map(String::as_str).collect();
+        ids.sort();
+        assert_eq!(ids, roles::ARCHES.iter().map(|arch| arch.id).collect::<Vec<_>>());
+        for arch in roles::ARCHES {
+            let rebuilt: Vec<Value> = arch
+                .converters
+                .iter()
+                .map(|c| {
+                    let mut modify = serde_json::Map::new();
+                    modify.insert("complete".into(), json!(c.modify.complete));
+                    if let Some(items) = c.modify.unexpanded {
+                        modify.insert("unexpanded".into(), strs(items));
+                    }
+                    if let Some(items) = c.modify.branches {
+                        let branches: Vec<Value> =
+                            items.iter().map(|b| json!({"when": b.when, "assigns": b.assigns, "expr": b.expr})).collect();
+                        modify.insert("branches".into(), Value::Array(branches));
+                    }
+                    let filter = c.filter.as_ref().map(|f| json!({"complete": f.complete, "drop_when": f.drop_when, "chain": f.chain}));
+                    let hooks = c.tensor_hooks.map(|hooks| {
+                        hooks.iter().map(|h| json!({"method": h.method, "class": h.class, "line": h.line})).collect::<Vec<_>>()
+                    });
+                    json!({
+                        "class": c.class,
+                        "hf_architectures": strs(c.hf_architectures),
+                        "undo_permute": c.undo_permute,
+                        "modify_tensors": Value::Object(modify),
+                        "filter_tensors": filter,
+                        "global_filters_after": strs(c.global_filters_after),
+                        "tensor_hooks": hooks,
+                    })
+                })
+                .collect();
+            crate::spec_expected::assert_same(
+                &Value::Array(rebuilt),
+                &spec_arches[arch.id]["converters"],
+                &format!("architectures.{}.converters", arch.id),
+            );
+        }
+        let groups: Vec<Value> = roles::SHARED_GROUPS.iter().map(|group| strs(group)).collect();
+        crate::spec_expected::assert_same(&Value::Array(groups), &expected["shared_resolutions"], "shared_resolutions");
+        let f = &roles::TEXT_MODEL_FILTER;
+        let filter = json!({"strip_when": f.strip_when, "strip_expr": f.strip_expr, "drop_when": f.drop_when, "complete": f.complete});
+        crate::spec_expected::assert_same(&filter, &expected["text_model_filter"], "text_model_filter");
+        crate::spec_expected::assert_same(&strs(roles::BASE_DROP_SUFFIXES), &expected["base_drop_suffixes"], "base_drop_suffixes");
+    }
+
+    /// The old run-time loader, on the spec JSON: per architecture, the
+    /// pattern pairs and role patterns. The generated catalog must hold the
+    /// same entries.
+    #[test]
+    fn the_generated_catalog_matches_the_old_loader() {
+        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        type Row = (String, String, Vec<String>);
+        let rows = |value: &Value| -> Vec<Row> {
+            value.as_array().unwrap().iter().map(|row| (
+                row["tensor"].as_str().unwrap().to_string(),
+                row["gguf"].as_str().unwrap().to_string(),
+                row["hf"].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect(),
+            )).collect()
+        };
+        let mappings = rows(&expected["mappings"]);
+        let block_mappings = rows(&expected["block_mappings"]);
+        let mut checked = 0;
+        for (id, entry) in expected["architectures"].as_object().unwrap() {
+            let roles: std::collections::HashSet<&str> = entry["roles"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+            let mut block = block_mappings.clone();
+            if let Some(over) = expected["overrides"].get(id) {
+                for row in rows(over) {
+                    match block.iter().position(|item| item.0 == row.0) {
+                        Some(pos) => block[pos] = row,
+                        None => block.push(row),
+                    }
+                }
+            }
+            let mut pairs: HashMap<String, String> = HashMap::new();
+            let mut role_gguf: HashMap<String, String> = HashMap::new();
+            for (tensor, gguf, hf) in mappings.iter().chain(&block) {
+                if !roles.contains(tensor.as_str()) {
+                    continue;
+                }
+                role_gguf.insert(tensor.clone(), gguf.clone());
+                for name in hf {
+                    pairs.insert(name.clone(), gguf.clone());
+                }
+            }
+            let arch = roles::ARCHES.iter().find(|arch| arch.id == id).unwrap();
+            let generated: HashMap<String, String> = arch.pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(generated.len(), arch.pairs.len(), "{id}: a pattern is listed twice");
+            assert_eq!(generated, pairs, "{id} pairs");
+            let generated: HashMap<String, String> = arch.roles.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(generated.len(), arch.roles.len(), "{id}: a role is listed twice");
+            assert_eq!(generated, role_gguf, "{id} roles");
+            checked += 1;
+        }
+        assert_eq!(checked, roles::ARCHES.len());
+    }
+
+    /// The class index gives what the old scan gave for every class: the
+    /// first architecture in the spec's order whose converters list it.
+    #[test]
+    fn the_class_index_matches_the_old_scan() {
+        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        let mut classes = std::collections::BTreeSet::new();
+        let old_scan = |class: &str| -> Option<String> {
+            for (arch, entry) in expected["architectures"].as_object().unwrap() {
+                for converter in entry["converters"].as_array().unwrap() {
+                    if converter["hf_architectures"].as_array().unwrap().iter().any(|id| id.as_str() == Some(class)) {
+                        return Some(arch.clone());
+                    }
+                }
+            }
+            None
+        };
+        for entry in expected["architectures"].as_object().unwrap().values() {
+            for converter in entry["converters"].as_array().unwrap() {
+                for id in converter["hf_architectures"].as_array().unwrap() {
+                    classes.insert(id.as_str().unwrap().to_string());
+                }
+            }
+        }
+        for class in &classes {
+            assert_eq!(architecture_for_hf_class(class), old_scan(class), "{class}");
+        }
+        assert_eq!(classes.len(), roles::HF_CLASS_ARCH.len());
+        assert_eq!(architecture_for_hf_class("NoSuchForCausalLM"), None);
+    }
+
     fn mapped(arch: &str, name: &str) -> String {
         let catalog = catalog();
         let resolved = catalog
@@ -739,7 +731,7 @@ mod tests {
             .find(|item| item.id == arch)
             .unwrap_or_else(|| panic!("missing {arch}"));
         let prepared = prepare_name(name, arch, Some(24));
-        lookup(&resolved.pairs, &prepared).unwrap_or_else(|| panic!("{arch} missed {name}"))
+        lookup(resolved.pairs, &prepared).unwrap_or_else(|| panic!("{arch} missed {name}"))
     }
 
     #[test]
@@ -774,7 +766,7 @@ mod tests {
         let group = catalog
             .groups
             .iter()
-            .find(|group| group.iter().any(|id| id == "refact"))
+            .find(|group| group.iter().any(|id| *id == "refact"))
             .unwrap();
         let counts: Vec<usize> = group
             .iter()

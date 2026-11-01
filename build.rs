@@ -8,6 +8,17 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "build/common.rs"]
+mod common;
+#[path = "build/ggml.rs"]
+mod ggml;
+#[path = "build/roles.rs"]
+mod roles;
+#[path = "build/defaults.rs"]
+mod defaults;
+#[path = "build/config_keys.rs"]
+mod config_keys;
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     install_man_pages(&manifest);
@@ -73,7 +84,28 @@ fn generate(manifest: &Path, specs: &Path, out: &Path) {
     }
     write_if_changed(&out.join("formats.txt"), list.as_bytes());
 
-    strip_tables(&specs.join("tables"), &out.join("tables"));
+    let expected = PathBuf::from(env::var("OUT_DIR").unwrap()).join("spec-expected");
+
+    let source = read_json(&specs.join("tables/ggml-lookup-tables.json"));
+    let (rust, json) = ggml::render(&source);
+    write_if_changed(&out.join("ggml_tables.rs"), rust.as_bytes());
+    write_if_changed(&expected.join("ggml-lookup-tables.json"), json.to_string().as_bytes());
+
+    let source = read_json(&specs.join("tables/gguf-tensor-roles.json"));
+    let (rust, json) = roles::render(&source);
+    write_if_changed(&out.join("tensor_roles.rs"), rust.as_bytes());
+    write_if_changed(&expected.join("gguf-tensor-roles.json"), json.to_string().as_bytes());
+
+    let source = read_json(&specs.join("tables/hf-config-defaults.json"));
+    let (rust, json) = defaults::render(&source);
+    write_if_changed(&out.join("hf_defaults.rs"), rust.as_bytes());
+    write_if_changed(&expected.join("hf-config-defaults.json"), json.to_string().as_bytes());
+
+    let source = read_json(&specs.join("tables/gguf-config-keys.json"));
+    let (rust, json) = config_keys::render(&source);
+    write_if_changed(&out.join("config_keys.rs"), rust.as_bytes());
+    write_if_changed(&expected.join("gguf-config-keys.json"), json.to_string().as_bytes());
+
     sync_dir(&specs.join("test-vectors"), &out.join("test-vectors"));
 }
 
@@ -115,80 +147,9 @@ fn sync_dir(source: &Path, dest: &Path) {
     }
 }
 
-/// The spec tables the binaries embed, minified, with the fields no code
-/// reads removed. Each entry is (file, fields to drop, where): `where` is a
-/// path of object keys from the root, with `*` for every member of an object
-/// or array. An empty path drops top-level fields.
-const STRIP: &[(&str, &[&str], &[&str])] = &[
-    ("gguf-config-keys.json", &["source", "commit", "generated_by", "note", "writer_methods"], &[]),
-    (
-        "gguf-config-keys.json",
-        &["attributes", "other_writers", "module", "model_arch", "arch", "base_reached", "super_conditional", "hf_architectures"],
-        &["converters", "*"],
-    ),
-    ("gguf-config-keys.json", &["module", "self_attributes"], &["methods", "*"]),
-    ("gguf-config-keys.json", &["at", "unpacked_from"], &["assignment_sites", "*"]),
-    ("gguf-config-keys.json", &["via"], &["sequences", "*", "*"]),
-    (
-        "gguf-tensor-roles.json",
-        &["source", "note", "resolution", "lookup_suffixes", "architecture_count", "converters_without_model_arch"],
-        &[],
-    ),
-    ("gguf-tensor-roles.json", &["enum", "tensors_without_gguf_name"], &["architectures", "*"]),
-    ("gguf-tensor-roles.json", &["module"], &["architectures", "*", "converters", "*"]),
-    ("ggml-lookup-tables.json", &["source", "note", "defines"], &[]),
-    (
-        "ggml-lookup-tables.json",
-        &["c_type", "declared_size", "count", "values_hex", "bytes_le_signed"],
-        &["tables", "*"],
-    ),
-    ("hf-config-defaults.json", &["transformers_version", "generated_by", "note"], &[]),
-    ("hf-config-defaults.json", &["config_class", "overridden"], &["model_types", "*"]),
-    ("hf-config-defaults.json", &["text_config_class", "probed_keys"], &["composite_text_config", "*"]),
-];
-
-fn strip_tables(source: &Path, dest: &Path) {
-    let mut files: Vec<&str> = STRIP.iter().map(|(file, _, _)| *file).collect();
-    files.dedup();
-    for file in files {
-        let path = source.join(file);
-        let text = fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let mut value: serde_json::Value =
-            serde_json::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-        for (_, fields, at) in STRIP.iter().filter(|(name, _, _)| *name == file) {
-            drop_fields(&mut value, at, fields);
-        }
-        let out = serde_json::to_string(&value).unwrap();
-        // The binaries parse this text again; it must give the same values.
-        let back: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert!(back == value, "{file}: the minified table does not read back the same");
-        write_if_changed(&dest.join(file), out.as_bytes());
-    }
-}
-
-fn drop_fields(value: &mut serde_json::Value, at: &[&str], fields: &[&str]) {
-    let Some((first, rest)) = at.split_first() else {
-        if let Some(map) = value.as_object_mut() {
-            for field in fields {
-                map.shift_remove(*field);
-            }
-        }
-        return;
-    };
-    match (value, *first) {
-        (serde_json::Value::Object(map), "*") => {
-            map.values_mut().for_each(|item| drop_fields(item, rest, fields))
-        }
-        (serde_json::Value::Array(items), "*") => {
-            items.iter_mut().for_each(|item| drop_fields(item, rest, fields))
-        }
-        (serde_json::Value::Object(map), key) => {
-            if let Some(item) = map.get_mut(key) {
-                drop_fields(item, rest, fields);
-            }
-        }
-        _ => {}
-    }
+fn read_json(path: &Path) -> serde_json::Value {
+    let text = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
 }
 
 /// Copy `man/*.1` to `share/man/man1` beside this profile's binaries, with

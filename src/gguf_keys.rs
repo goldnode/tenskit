@@ -58,11 +58,68 @@ pub(crate) fn rope_params(hparams: Option<&Map<String, Value>>) -> (Map<String, 
     (p, r)
 }
 
-static DEFAULTS_JSON: &str = include_str!("../generated/tables/hf-config-defaults.json");
+/// A JSON value held as a constant: the table values that are copied into a
+/// config dict, which is JSON. Numbers keep serde_json's kinds. Every kind is
+/// kept, though today's tables have no negative integer.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum Lit {
+    Null,
+    Bool(bool),
+    PosInt(u64),
+    NegInt(i64),
+    Float(f64),
+    Str(&'static str),
+    Arr(&'static [Lit]),
+    Obj(&'static [(&'static str, Lit)]),
+}
 
-fn defaults_table() -> &'static Value {
-    static TABLE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| serde_json::from_str(DEFAULTS_JSON).expect("hf-config-defaults.json parses"))
+impl Lit {
+    pub(crate) fn to_value(&self) -> Value {
+        match self {
+            Lit::Null => Value::Null,
+            Lit::Bool(flag) => Value::Bool(*flag),
+            Lit::PosInt(number) => Value::from(*number),
+            Lit::NegInt(number) => Value::from(*number),
+            Lit::Float(number) => Value::from(*number),
+            Lit::Str(text) => Value::from(*text),
+            Lit::Arr(items) => Value::Array(items.iter().map(Lit::to_value).collect()),
+            Lit::Obj(members) => Value::Object(members.iter().map(|(key, value)| (key.to_string(), value.to_value())).collect()),
+        }
+    }
+}
+
+/// tables/hf-config-defaults.json, generated as Rust by build.rs.
+pub(crate) mod hf_defaults {
+    use super::Lit;
+
+    /// A model_type's defaults: `derived` is each derived key with its
+    /// value_when_all_absent (None when the table gives none).
+    pub(crate) struct ModelTypeDefaults {
+        pub(crate) model_type: &'static str,
+        pub(crate) defaults: &'static [(&'static str, Lit)],
+        pub(crate) derived: &'static [(&'static str, Option<Lit>)],
+        /// rope_scaling_type_copied_to_rope_type; None where the table has null.
+        pub(crate) rope_copy: Option<bool>,
+    }
+
+    pub(crate) struct Composite {
+        pub(crate) model_type: &'static str,
+        pub(crate) created_when_absent: Option<bool>,
+        pub(crate) default_text_model_type: Option<&'static str>,
+        pub(crate) copied_top_level_keys: Option<&'static [&'static str]>,
+        pub(crate) default_text_config: Option<&'static [(&'static str, Lit)]>,
+    }
+
+    include!("../generated/hf_defaults.rs");
+
+    pub(crate) fn model_type(name: &str) -> Option<&'static ModelTypeDefaults> {
+        MODEL_TYPES.binary_search_by(|row| row.model_type.cmp(name)).ok().map(|at| &MODEL_TYPES[at])
+    }
+
+    pub(crate) fn composite(name: &str) -> Option<&'static Composite> {
+        COMPOSITES.binary_search_by(|row| row.model_type.cmp(name)).ok().map(|at| &COMPOSITES[at])
+    }
 }
 
 /// GGUF-039 and GGUF-040: the defaults transformers' to_dict() adds, as
@@ -71,22 +128,21 @@ fn defaults_table() -> &'static Value {
 /// config.json lacks the key. For another model_type only the common keys
 /// are added, and the returned note says so.
 pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
-    let table = defaults_table();
     if let Some(dtype) = top.remove("torch_dtype") {
         top.entry("dtype").or_insert(dtype);
     }
     let given = top.clone();
     let model_type = given.get("model_type").and_then(Value::as_str).unwrap_or("").to_string();
-    let entry = table["model_types"].get(model_type.as_str());
+    let entry = hf_defaults::model_type(model_type.as_str());
     if let Some(entry) = entry {
-        let derived = entry["derived"].as_object();
-        for (key, value) in entry["defaults"].as_object().into_iter().flatten() {
-            if !given.contains_key(key) && !derived.is_some_and(|derived| derived.contains_key(key)) {
-                top.insert(key.clone(), value.clone());
+        let derived = entry.derived;
+        for (key, value) in entry.defaults {
+            if !given.contains_key(*key) && !derived.iter().any(|(name, _)| name == key) {
+                top.insert(key.to_string(), value.to_value());
             }
         }
-        derived_keys(&model_type, &given, top, derived);
-        if entry["rope_scaling_type_copied_to_rope_type"] == Value::Bool(true) {
+        derived_keys(&model_type, &given, top, Some(derived));
+        if entry.rope_copy == Some(true) {
             if let Some(scaling) = top.get_mut("rope_scaling").and_then(Value::as_object_mut) {
                 if !scaling.contains_key("rope_type") {
                     if let Some(kind) = scaling.get("type").cloned() {
@@ -96,8 +152,8 @@ pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
             }
         }
     }
-    for (key, value) in table["common"].as_object().into_iter().flatten() {
-        top.entry(key.clone()).or_insert_with(|| value.clone());
+    for (key, value) in hf_defaults::COMMON {
+        top.entry(key.to_string()).or_insert_with(|| value.to_value());
     }
     match entry {
         Some(_) => None,
@@ -113,12 +169,11 @@ pub(crate) fn listed_defaults(top: &mut Map<String, Value>) -> Option<String> {
 /// transformers gives a text_config built from the top-level keys when
 /// config.json has none, which tensconv does not build.
 pub(crate) fn defaults_notes(config: &Value) -> Vec<String> {
-    let table = defaults_table();
     let mut notes = Vec::new();
     let top_type = config.get("model_type").and_then(Value::as_str).unwrap_or("");
     let text = config.get("text_config").filter(|text| text.is_object());
     let mut unlisted = |model_type: &str| {
-        if table["model_types"].get(model_type).is_none() {
+        if hf_defaults::model_type(model_type).is_none() {
             let mut scratch = Map::new();
             scratch.insert("model_type".into(), Value::from(model_type));
             notes.extend(listed_defaults(&mut scratch));
@@ -128,10 +183,10 @@ pub(crate) fn defaults_notes(config: &Value) -> Vec<String> {
     if let Some(text_type) = text.and_then(|text| text.get("model_type")).and_then(Value::as_str) {
         unlisted(text_type);
     }
-    let composite = &table["composite_text_config"][top_type];
-    if text.is_none() && composite["created_when_absent"] == Value::Bool(true) {
-        let text_type = composite["default_text_model_type"].as_str().unwrap_or("?");
-        if table["model_types"].get(text_type).is_none() {
+    let composite = hf_defaults::composite(top_type);
+    if text.is_none() && composite.and_then(|composite| composite.created_when_absent) == Some(true) {
+        let text_type = composite.and_then(|composite| composite.default_text_model_type).unwrap_or("?");
+        if hf_defaults::model_type(text_type).is_none() {
             notes.push(format!(
                 "model_type {top_type} gets a {text_type} text_config, built from its defaults; {text_type} \
                  is not in tables/hf-config-defaults.json, so its derived keys may differ from llama.cpp's (GGUF-040)"
@@ -165,13 +220,12 @@ fn composite_takes(top_type: &str) -> Option<&'static [&'static str]> {
 /// copied_top_level_keys), then the text model_type's defaults and derived
 /// formulas, then default_text_config for anything still missing.
 pub(crate) fn built_text_config(raw: &Map<String, Value>) -> Option<Map<String, Value>> {
-    let table = defaults_table();
     let top_type = raw.get("model_type").and_then(Value::as_str)?;
-    let composite = &table["composite_text_config"][top_type];
-    if composite["created_when_absent"] != Value::Bool(true) {
+    let composite = hf_defaults::composite(top_type)?;
+    if composite.created_when_absent != Some(true) {
         return None;
     }
-    let text_type = composite["default_text_model_type"].as_str()?;
+    let text_type = composite.default_text_model_type?;
     let mut built = Map::new();
     match composite_takes(top_type) {
         Some(taken) => {
@@ -182,19 +236,19 @@ pub(crate) fn built_text_config(raw: &Map<String, Value>) -> Option<Map<String, 
             }
         }
         None => {
-            for key in composite["copied_top_level_keys"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                if let Some(value) = raw.get(key) {
+            for key in composite.copied_top_level_keys.unwrap_or_default() {
+                if let Some(value) = raw.get(*key) {
                     built.insert(key.to_string(), value.clone());
                 }
             }
         }
     }
     built.insert("model_type".into(), Value::from(text_type));
-    if table["model_types"].get(text_type).is_some() {
+    if hf_defaults::model_type(text_type).is_some() {
         let _ = listed_defaults(&mut built);
     }
-    for (key, value) in composite["default_text_config"].as_object().into_iter().flatten() {
-        built.entry(key.clone()).or_insert_with(|| value.clone());
+    for (key, value) in composite.default_text_config.unwrap_or_default() {
+        built.entry(key.to_string()).or_insert_with(|| value.to_value());
     }
     Some(built)
 }
@@ -204,7 +258,7 @@ fn derived_keys(
     model_type: &str,
     given: &Map<String, Value>,
     top: &mut Map<String, Value>,
-    derived: Option<&Map<String, Value>>,
+    derived: Option<&[(&str, Option<Lit>)]>,
 ) {
     let int = |top: &Map<String, Value>, key: &str| top.get(key).and_then(Value::as_u64);
     // The value a derived key has before its formula: as given, else the table's.
@@ -212,7 +266,11 @@ fn derived_keys(
         given
             .get(key)
             .cloned()
-            .or_else(|| derived.and_then(|derived| derived.get(key)).map(|row| row["value_when_all_absent"].clone()))
+            .or_else(|| {
+                derived
+                    .and_then(|derived| derived.iter().find(|(name, _)| *name == key))
+                    .map(|(_, value)| value.as_ref().map_or(Value::Null, Lit::to_value))
+            })
     };
     let absent_or_null = |key: &str| given.get(key).is_none_or(Value::is_null);
     if model_type == "llama" && absent_or_null("head_dim") {
@@ -548,12 +606,155 @@ pub(crate) fn sampling_keys(dir: &std::path::Path) -> (Vec<(String, MetaValue)>,
 // ---------------------------------------------------------------------------
 // GGUF-037: the keys a converter class's set_gguf_parameters chain writes.
 
-static CONFIG_KEYS_JSON: &str =
-    include_str!("../generated/tables/gguf-config-keys.json");
+/// tables/gguf-config-keys.json, generated as Rust by build.rs: typed
+/// records, sorted for binary search, with every cross-reference resolved to
+/// an index and checked at build time.
+pub(crate) mod index {
+    /// An index into `METHODS`.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) struct MethodId(pub(crate) u16);
+    /// An index into `SITES`.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) struct SiteId(pub(crate) u16);
+    /// An index into `SEQUENCES`.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub(crate) struct SeqId(pub(crate) u16);
 
-fn index() -> &'static Value {
-    static INDEX: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| serde_json::from_str(CONFIG_KEYS_JSON).expect("gguf-config-keys.json parses"))
+    /// A write's key or value: a string, or a list where the spec gives one.
+    /// The walk reads only strings; the list is kept so the table round-trips.
+    #[derive(Debug)]
+    pub(crate) enum StrOrList {
+        Str(&'static str),
+        #[allow(dead_code)]
+        List(&'static [&'static str]),
+    }
+
+    impl StrOrList {
+        pub(crate) fn as_str(&self) -> Option<&'static str> {
+            match self {
+                StrOrList::Str(text) => Some(text),
+                StrOrList::List(_) => None,
+            }
+        }
+    }
+
+    pub(crate) struct Converter {
+        pub(crate) class: &'static str,
+        /// set_gguf_parameters: the class chain, the class first.
+        pub(crate) chain: &'static [&'static str],
+        pub(crate) sequence: Option<SeqId>,
+        pub(crate) hparams_mutations: &'static [SiteRef],
+        pub(crate) attribute_assignments: &'static [(&'static str, &'static [SiteRef])],
+        /// self.<m>() as this converter resolves it.
+        pub(crate) self_calls: &'static [(&'static str, &'static str)],
+    }
+
+    impl Converter {
+        pub(crate) fn assignments(&self, name: &str) -> Option<&'static [SiteRef]> {
+            self.attribute_assignments.iter().find(|(item, _)| *item == name).map(|(_, refs)| *refs)
+        }
+
+        pub(crate) fn self_call(&self, name: &str) -> Option<&'static str> {
+            self.self_calls.iter().find(|(item, _)| *item == name).map(|(_, target)| *target)
+        }
+    }
+
+    pub(crate) struct SiteRef {
+        pub(crate) phase: &'static str,
+        pub(crate) site: SiteId,
+    }
+
+    pub(crate) struct Method {
+        pub(crate) name: &'static str,
+        pub(crate) writes: Option<&'static [Write]>,
+        /// Each local with the expressions assigned to it.
+        pub(crate) locals: Option<&'static [(&'static str, &'static [&'static str])]>,
+        pub(crate) self_calls: Option<&'static [Call]>,
+        pub(crate) super_calls: Option<&'static [Call]>,
+    }
+
+    pub(crate) struct Write {
+        pub(crate) key: StrOrList,
+        pub(crate) value: Option<StrOrList>,
+        /// The write's `type`.
+        pub(crate) kind: Option<&'static str>,
+        pub(crate) when: &'static str,
+        pub(crate) line: u64,
+    }
+
+    pub(crate) struct Call {
+        pub(crate) line: u64,
+        pub(crate) method: &'static str,
+        pub(crate) when: &'static str,
+    }
+
+    pub(crate) struct Site {
+        pub(crate) id: &'static str,
+        pub(crate) op: &'static str,
+        pub(crate) value: &'static str,
+        pub(crate) when: &'static str,
+        /// None: no key field; Some(None): key is null.
+        pub(crate) key: Option<Option<&'static str>>,
+        pub(crate) on: Option<&'static str>,
+        pub(crate) locals: Option<&'static [(&'static str, &'static [SiteLocal])]>,
+    }
+
+    impl Site {
+        pub(crate) fn key(&self) -> Option<&'static str> {
+            self.key.flatten()
+        }
+    }
+
+    pub(crate) struct SiteLocal {
+        pub(crate) when: &'static str,
+        pub(crate) value: &'static str,
+        pub(crate) op: &'static str,
+        /// The site id of the pop or setdefault this local reads.
+        pub(crate) hparams_mutation: Option<&'static str>,
+    }
+
+    /// A set_gguf_parameters_sequence event, as the walk reads it. The
+    /// return's method is kept so the table round-trips.
+    pub(crate) enum Event {
+        Return {
+            #[allow(dead_code)]
+            from: &'static str,
+        },
+        Call { target: &'static str, from: &'static str, when: &'static str },
+        Raise { line: u64, when: &'static str, cause: &'static str, kind: &'static str, caught: bool },
+        Write { method: MethodId, index: u32 },
+        Mutation { site: SiteId },
+        Attribute { name: &'static str, site: SiteId },
+    }
+
+    #[allow(dead_code)]
+    mod generated {
+        use super::*;
+        include!("../generated/config_keys.rs");
+    }
+    pub(crate) use generated::{CONVERTERS, METHODS, SEQUENCES, SITES};
+    #[cfg(test)]
+    pub(crate) use generated::SEQUENCE_IDS;
+
+    pub(crate) fn converter(class: &str) -> Option<&'static Converter> {
+        CONVERTERS.binary_search_by(|item| item.class.cmp(class)).ok().map(|at| &CONVERTERS[at])
+    }
+
+    pub(crate) fn method(name: &str) -> Option<&'static Method> {
+        METHODS.binary_search_by(|item| item.name.cmp(name)).ok().map(|at| &METHODS[at])
+    }
+
+    pub(crate) fn method_at(id: MethodId) -> &'static Method {
+        &METHODS[id.0 as usize]
+    }
+
+    pub(crate) fn site(id: SiteId) -> &'static Site {
+        &SITES[id.0 as usize]
+    }
+
+    pub(crate) fn sequence(id: SeqId) -> &'static [Event] {
+        SEQUENCES[id.0 as usize]
+    }
 }
 
 /// What a class's chain writes: the keys, and the listed keys whose guard or
@@ -597,16 +798,16 @@ pub(crate) fn class_keys_with(
     tensors: &[String],
 ) -> Result<ClassKeys> {
     let mut found = ClassKeys { keys: Vec::new(), unevaluated: Vec::new(), unapplied: Vec::new(), may_raise: Vec::new() };
-    let record = index()["converters"].get(class);
-    let chain: Vec<String> = match record.and_then(|record| record["set_gguf_parameters"].as_array()) {
-        Some(items) => items.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+    let record = index::converter(class);
+    let chain: Vec<String> = match record {
+        Some(record) => record.chain.iter().map(|item| item.to_string()).collect(),
         None => {
             return Err(msg(format!(
                 "{class} is not in tables/gguf-config-keys.json, so its GGUF keys are not known (GGUF-037)"
             )))
         }
     };
-    let converter = &index()["converters"][class];
+    let converter = record;
     let hf_arch = map
         .get("architectures")
         .and_then(Value::as_array)
@@ -614,10 +815,7 @@ pub(crate) fn class_keys_with(
         .and_then(Value::as_str)
         .map(str::to_string);
     let mut hparams = apply_mutations(class, map, dir, arch, converter, tensors, hf_arch.as_deref(), &mut found.unapplied)?;
-    let sequence = converter["set_gguf_parameters_sequence"]
-        .as_str()
-        .and_then(|id| index()["sequences"].get(id))
-        .and_then(Value::as_array);
+    let sequence = converter.and_then(|converter| converter.sequence).map(index::sequence);
     match sequence {
         // A class with a hand transcription follows it (gguf_class_parameters).
         Some(events) if !chain.first().is_some_and(|owner| is_transcribed(owner)) => {
@@ -669,7 +867,7 @@ struct Walk<'a> {
     class: &'a str,
     dir: &'a std::path::Path,
     arch: &'a str,
-    converter: &'static Value,
+    converter: Option<&'static index::Converter>,
     tensors: &'a [String],
     hf_arch: Option<String>,
     loaded: &'a Map<String, Value>,
@@ -683,7 +881,7 @@ impl Walk<'_> {
     /// changes, and attribute assignments apply where they run, under the
     /// guards of the calls that lead to them. Calls into TextModel's base,
     /// the pooling helper, and a transcribed class follow their transcriptions.
-    fn run(&self, events: &'static [Value], hparams: &mut Map<String, Value>, found: &mut ClassKeys) -> Result<()> {
+    fn run(&self, events: &'static [index::Event], hparams: &mut Map<String, Value>, found: &mut ClassKeys) -> Result<()> {
         let mut overrides: std::collections::HashMap<String, Option<V>> = Default::default();
         let mut method_vars: std::collections::HashMap<String, std::collections::HashMap<String, V>> = Default::default();
         // Each open call: its target and whether its events run.
@@ -699,20 +897,19 @@ impl Walk<'_> {
             })
         };
         for event in events {
-            if event.get("return_from").is_some() {
+            if let index::Event::Return { .. } = event {
                 stack.pop();
                 if skip_to.is_some_and(|depth| stack.len() < depth) {
                     skip_to = None;
                 }
                 continue;
             }
-            if let Some(target) = event["call"].as_str() {
+            if let index::Event::Call { target, from, when } = *event {
                 let now = runs(&stack);
-                let guard = event["when"].as_str().unwrap_or("always");
+                let guard = when;
                 let this = if now == Runs::No || skip_to.is_some() || guard == "always" {
                     Runs::Yes
                 } else {
-                    let from = event["from"].as_str().unwrap_or("");
                     match self.eval_in(from, hparams, &overrides, &mut method_vars, guard) {
                         Ok(value) if truthy(&value) => Runs::Yes,
                         Ok(_) => Runs::No,
@@ -740,18 +937,20 @@ impl Walk<'_> {
             if now == Runs::No {
                 continue;
             }
-            if let Some(line) = event["raise"].as_u64() {
+            if let index::Event::Raise { line, .. } = *event {
                 let method = stack
                     .last()
                     .map(|(target, _)| target.clone())
                     .unwrap_or_else(|| format!("{}.set_gguf_parameters", self.chain.first().map_or("", String::as_str)));
                 self.raise_event(&method, line, event, now, hparams, &overrides, &mut method_vars, found)?;
-            } else if let Some(method) = event["write"].as_str() {
-                let at = event["index"].as_u64().unwrap_or(0) as usize;
-                let write = &index()["methods"][method]["writes"][at];
-                self.write(method, write, now, hparams, &overrides, &mut method_vars, found)?;
-            } else if let Some(site_id) = event["hparams_mutation"].as_str() {
-                let site = &index()["assignment_sites"][site_id];
+            } else if let index::Event::Write { method, index: at } = *event {
+                let method = index::method_at(method);
+                // build.rs checked that the method has this write.
+                let write = &method.writes.unwrap_or_default()[at as usize];
+                self.write(method.name, write, now, hparams, &overrides, &mut method_vars, found)?;
+            } else if let index::Event::Mutation { site } = *event {
+                let site = index::site(site);
+                let site_id = site.id;
                 let applied = if now == Runs::Yes {
                     apply_mutation(hparams, site, self.dir, self.arch, self.converter, self.tensors, self.hf_arch.as_deref(), self.loaded, Some(&self.popped))
                 } else {
@@ -768,15 +967,15 @@ impl Walk<'_> {
                 };
                 if let Err(halt) = applied {
                     if now == Runs::Yes {
-                        stop_or_unknown(halt, self.class, site_id, site["when"].as_str().unwrap_or(""))?;
+                        stop_or_unknown(halt, self.class, site_id, site.when)?;
                     }
-                    found.unapplied.push(format!("{site_id} ({})", site["key"].as_str().unwrap_or("self.hparams")));
+                    found.unapplied.push(format!("{site_id} ({})", site.key().unwrap_or("self.hparams")));
                 }
-            } else if let (Some(name), Some(site_id)) = (event["attribute"].as_str(), event["site"].as_str()) {
-                let value = if now == Runs::Yes { self.assignment(name, site_id, hparams, &overrides) } else { Err(Unknown) };
+            } else if let index::Event::Attribute { name, site } = *event {
+                let value = if now == Runs::Yes { self.assignment(name, site, hparams, &overrides) } else { Err(Unknown) };
                 if let Err(halt) = &value {
-                    let guard = index()["assignment_sites"][site_id]["when"].as_str().unwrap_or("");
-                    stop_or_unknown(halt.clone(), self.class, site_id, guard)?;
+                    let site = index::site(site);
+                    stop_or_unknown(halt.clone(), self.class, site.id, site.when)?;
                 }
                 match value {
                     Ok(Some(value)) => {
@@ -831,7 +1030,7 @@ impl Walk<'_> {
     ) -> Ev<V> {
         let (p, _) = rope_params(Some(hparams));
         let ctx = self.ctx(hparams, &p, overrides);
-        let locals = index()["methods"][method].get("locals").and_then(Value::as_object);
+        let locals = index::method(method).and_then(|record| record.locals);
         let vars = method_vars.remove(method).unwrap_or_default();
         let mut eval = Eval { ctx: &ctx, locals, site_locals: None, vars, pending: Default::default(), depth: 0 };
         let value = eval.expr(text);
@@ -879,19 +1078,19 @@ impl Walk<'_> {
     fn write(
         &self,
         method: &str,
-        write: &'static Value,
+        write: &'static index::Write,
         now: Runs,
         hparams: &Map<String, Value>,
         overrides: &std::collections::HashMap<String, Option<V>>,
         method_vars: &mut std::collections::HashMap<String, std::collections::HashMap<String, V>>,
         found: &mut ClassKeys,
     ) -> Result<()> {
-        let template = write["key"].as_str().unwrap_or("");
+        let template = write.key.as_str().unwrap_or("");
         if template.starts_with("general.") || template.starts_with("tokenizer.") {
             return Ok(());
         }
         let key = template.replace("{arch}", self.arch);
-        let guard = write["when"].as_str().unwrap_or("always");
+        let guard = write.when;
         let value = if now == Runs::Maybe {
             Err(Unknown)
         } else {
@@ -902,16 +1101,18 @@ impl Walk<'_> {
             };
             match holds {
                 Ok(false) => return Ok(()),
-                Ok(true) => write["value"]
-                    .as_str()
+                Ok(true) => write
+                    .value
+                    .as_ref()
+                    .and_then(index::StrOrList::as_str)
                     .ok_or(Unknown)
                     .and_then(|text| self.eval_in(method, hparams, overrides, method_vars, text))
-                    .and_then(|value| to_meta(&value, write["type"].as_str().unwrap_or(""))),
+                    .and_then(|value| to_meta(&value, write.kind.unwrap_or(""))),
                 Err(halt) => Err(halt),
             }
         };
         if let Err(halt) = &value {
-            let at = format!("{method} line {}", write["line"].as_u64().unwrap_or(0));
+            let at = format!("{method} line {}", write.line);
             stop_or_unknown(halt.clone(), self.class, &at, guard)?;
         }
         match value {
@@ -935,21 +1136,22 @@ impl Walk<'_> {
         &self,
         method: &str,
         line: u64,
-        event: &Value,
+        event: &index::Event,
         now: Runs,
         hparams: &Map<String, Value>,
         overrides: &std::collections::HashMap<String, Option<V>>,
         method_vars: &mut std::collections::HashMap<String, std::collections::HashMap<String, V>>,
         found: &mut ClassKeys,
     ) -> Result<()> {
-        let guard = event["when"].as_str().unwrap_or("always");
-        let cause = event["cause"].as_str().unwrap_or("raise");
+        let index::Event::Raise { when: guard, cause, kind, caught, .. } = *event else {
+            return Ok(());
+        };
         let mut fires = if guard == "always" {
             Ok(true)
         } else {
             self.eval_in(method, hparams, overrides, method_vars, guard).map(|value| truthy(&value))
         };
-        if event["kind"].as_str() == Some("assert") && fires == Ok(true) {
+        if kind == "assert" && fires == Ok(true) {
             let test = cause.strip_prefix("assert ").unwrap_or(cause);
             // `assert test, message`: the message is not needed.
             let test = self
@@ -961,7 +1163,6 @@ impl Walk<'_> {
             fires = test.map(|value| !truthy(&value));
         }
         let at = format!("{method} line {line}");
-        let caught = event.get("inside_try_catching").is_some();
         match fires {
             Ok(false) => {}
             Ok(true) if now == Runs::Yes && !caught => {
@@ -983,28 +1184,28 @@ impl Walk<'_> {
     fn assignment(
         &self,
         name: &str,
-        site_id: &str,
+        site_id: index::SiteId,
         hparams: &Map<String, Value>,
         overrides: &std::collections::HashMap<String, Option<V>>,
     ) -> Ev<Option<V>> {
-        let site = &index()["assignment_sites"][site_id];
+        let site = index::site(site_id);
         let (p, _) = rope_params(Some(hparams));
         let ctx = self.ctx(hparams, &p, overrides);
         let mut eval = Eval {
             ctx: &ctx,
             locals: None,
-            site_locals: site.get("locals").and_then(Value::as_object),
+            site_locals: site.locals,
             vars: Default::default(),
             pending: Default::default(),
             depth: 0,
         };
-        let guard = site["when"].as_str().unwrap_or("always");
+        let guard = site.when;
         if guard != "always" && !truthy(&eval.expr(guard)?) {
             return Ok(None);
         }
-        let next = eval.expr(site["value"].as_str().ok_or(Unknown)?)?;
-        Ok(Some(match site["op"].as_str() {
-            Some("+=") => {
+        let next = eval.expr(site.value)?;
+        Ok(Some(match site.op {
+            "+=" => {
                 let current = eval.self_attribute(name)?;
                 arith("+", &current, &next)?
             }
@@ -1022,25 +1223,24 @@ fn apply_mutations(
     loaded: &Map<String, Value>,
     dir: &std::path::Path,
     arch: &str,
-    converter: &'static Value,
+    converter: Option<&'static index::Converter>,
     tensors: &[String],
     hf_arch: Option<&str>,
     unapplied: &mut Vec<String>,
 ) -> Result<Map<String, Value>> {
     let mut hparams = loaded.clone();
-    let sites = &index()["assignment_sites"];
-    for reference in converter["hparams_mutations"].as_array().into_iter().flatten() {
-        let phase = reference["phase"].as_str().unwrap_or("unknown");
+    for reference in converter.map(|converter| converter.hparams_mutations).unwrap_or_default() {
+        let phase = reference.phase;
         if !matches!(phase, "init" | "prepare_tensors" | "prepare_metadata, before set_gguf_parameters") {
             continue;
         }
-        let Some(id) = reference["site"].as_str() else { continue };
-        let site = &sites[id];
+        let site = index::site(reference.site);
+        let id = site.id;
         match apply_mutation(&mut hparams, site, dir, arch, converter, tensors, hf_arch, loaded, None) {
             Ok(_) => {}
             Err(halt) => {
-                stop_or_unknown(halt, class, id, site["when"].as_str().unwrap_or(""))?;
-                unapplied.push(format!("{id} ({})", site["key"].as_str().unwrap_or("self.hparams")));
+                stop_or_unknown(halt, class, id, site.when)?;
+                unapplied.push(format!("{id} ({})", site.key().unwrap_or("self.hparams")));
             }
         }
     }
@@ -1049,10 +1249,10 @@ fn apply_mutations(
 
 fn apply_mutation(
     hparams: &mut Map<String, Value>,
-    site: &'static Value,
+    site: &'static index::Site,
     dir: &std::path::Path,
     arch: &str,
-    converter: &'static Value,
+    converter: Option<&'static index::Converter>,
     tensors: &[String],
     hf_arch: Option<&str>,
     loaded: &Map<String, Value>,
@@ -1064,24 +1264,24 @@ fn apply_mutation(
     let mut eval = Eval {
         ctx: &ctx,
         locals: None,
-        site_locals: site.get("locals").and_then(Value::as_object),
+        site_locals: site.locals,
         vars: Default::default(),
         pending: Default::default(),
         depth: 0,
     };
     // A local passed on as hparams= is the dict itself (constructor_arguments).
-    let on_local = site["on"].as_str().is_some_and(|on| on.starts_with("local hparams"));
+    let on_local = site.on.is_some_and(|on| on.starts_with("local hparams"));
     if on_local {
         eval.vars.insert("hparams".into(), V::J(Value::Object(current.clone())));
     }
-    let op = site["op"].as_str().unwrap_or("");
-    let text = site["value"].as_str().unwrap_or("");
+    let op = site.op;
+    let text = site.value;
     // ModelBase.__init__ loads the dict, or takes the one passed in: both are
     // the dict as it stands here, whatever its guard says.
     if op == "replace" && text.contains("load_hparams") {
         return Ok(None);
     }
-    let guard = site["when"].as_str().unwrap_or("always");
+    let guard = site.when;
     if guard != "always" && !truthy(&eval.expr(guard)?) {
         return Ok(None);
     }
@@ -1090,7 +1290,7 @@ fn apply_mutation(
         *hparams = next;
         return Ok(None);
     }
-    let target = site["key"].as_str().ok_or(Unknown)?;
+    let target = site.key().ok_or(Unknown)?;
     match op {
         "=" | "+=" => {
             let path = hparams_path(&mut eval, target, on_local)?;
@@ -1484,7 +1684,7 @@ struct Ctx<'a> {
     arch: &'a str,
     /// The converter's record: its self_calls map resolves self.<m>() for
     /// this converter, since a method record's resolves_to may say "per converter".
-    converter: &'static Value,
+    converter: Option<&'static index::Converter>,
     /// converter_attributes model_tensors: the tensor names after filtering.
     tensors: &'a [String],
     hf_arch: Option<String>,
@@ -1532,7 +1732,7 @@ impl Ctx<'_> {
     /// The block_count row writes self.block_count, which 40 converters assign
     /// again in their own __init__ (converter_attributes).
     fn reassigned_block_count(&mut self, found: &mut ClassKeys) -> Result<()> {
-        if self.converter["attribute_assignments"].get("block_count").is_none() {
+        if self.converter.and_then(|converter| converter.assignments("block_count")).is_none() {
             return Ok(());
         }
         let key = self.key("{arch}.block_count");
@@ -1554,47 +1754,54 @@ impl Ctx<'_> {
     /// super() call to the rest of the chain, in line order: a few classes
     /// write keys before they call super().
     fn method(&mut self, name: &str, rest: &[String], found: &mut ClassKeys) -> Result<()> {
-        let Some(record) = index()["methods"].get(name) else {
+        let Some(record) = index::method(name) else {
             return Ok(());
         };
         self.depth += 1;
         if self.depth > 16 {
             return Err(msg(format!("{name}: self calls nest too deeply")));
         }
-        let locals = record.get("locals").and_then(Value::as_object);
-        let mut steps: Vec<(u64, &Value, Step)> = Vec::new();
-        for write in record["writes"].as_array().into_iter().flatten() {
-            steps.push((write["line"].as_u64().unwrap_or(0), write, Step::Write));
+        let locals = record.locals;
+        // A step is a write, or a self or super() call.
+        let mut steps: Vec<(u64, Option<&'static index::Write>, Option<&'static index::Call>, Step)> = Vec::new();
+        for write in record.writes.unwrap_or_default() {
+            steps.push((write.line, Some(write), None, Step::Write));
         }
-        for call in record["self_calls"].as_array().into_iter().flatten() {
-            steps.push((call["line"].as_u64().unwrap_or(0), call, Step::SelfCall));
+        for call in record.self_calls.unwrap_or_default() {
+            steps.push((call.line, None, Some(call), Step::SelfCall));
         }
         if !rest.is_empty() {
-            for call in record["super_calls"].as_array().into_iter().flatten() {
-                if call["method"].as_str() == Some("set_gguf_parameters") {
-                    steps.push((call["line"].as_u64().unwrap_or(0), call, Step::Super));
+            for call in record.super_calls.unwrap_or_default() {
+                if call.method == "set_gguf_parameters" {
+                    steps.push((call.line, None, Some(call), Step::Super));
                 }
             }
         }
         steps.sort_by_key(|step| step.0);
-        for (_, step, kind) in steps {
+        for (_, write, call, kind) in steps {
             let is_write = kind == Step::Write;
             let mut eval = Eval { ctx: self, locals, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
-            let guard = step["when"].as_str().unwrap_or("always");
+            let guard = match (write, call) {
+                (Some(write), _) => write.when,
+                (_, Some(call)) => call.when,
+                _ => "always",
+            };
             let holds = if guard == "always" { Ok(true) } else { eval.expr(guard).map(|value| truthy(&value)) };
-            if is_write {
-                let template = step["key"].as_str().unwrap_or("");
+            if let (true, Some(step)) = (is_write, write) {
+                let template = step.key.as_str().unwrap_or("");
                 if template.starts_with("general.") || template.starts_with("tokenizer.") {
                     continue;
                 }
                 let key = self.key(template);
                 let value = match holds {
                     Ok(false) => continue,
-                    Ok(true) => step["value"]
-                        .as_str()
+                    Ok(true) => step
+                        .value
+                        .as_ref()
+                        .and_then(index::StrOrList::as_str)
                         .ok_or(Unknown)
                         .and_then(|text| eval.expr(text))
-                        .and_then(|value| to_meta(&value, step["type"].as_str().unwrap_or(""))),
+                        .and_then(|value| to_meta(&value, step.kind.unwrap_or(""))),
                     Err(_) => Err(Unknown),
                 };
                 match value {
@@ -1608,10 +1815,7 @@ impl Ctx<'_> {
                 }
             } else {
                 let target = if kind == Step::SelfCall {
-                    step["method"]
-                        .as_str()
-                        .and_then(|name| self.converter["self_calls"].get(name))
-                        .and_then(Value::as_str)
+                    call.and_then(|call| self.converter.and_then(|converter| converter.self_call(call.method)))
                 } else {
                     None
                 };
@@ -1779,10 +1983,10 @@ fn inferred_array(items: &[Value]) -> Ev<MetaValue> {
 
 struct Eval<'c, 'a> {
     ctx: &'c Ctx<'a>,
-    locals: Option<&'static Map<String, Value>>,
+    locals: Option<&'static [(&'static str, &'static [&'static str])]>,
     /// The locals of an attribute assignment site: each assignment in run
     /// order, with its op and its own guard.
-    site_locals: Option<&'static Map<String, Value>>,
+    site_locals: Option<&'static [(&'static str, &'static [index::SiteLocal])]>,
     vars: std::collections::HashMap<String, V>,
     /// Site locals being evaluated, so a guard that reads its own local
     /// before it has a value is unknown rather than endless.
@@ -1833,18 +2037,20 @@ impl Eval<'_, '_> {
             }
             _ => {}
         }
-        if let Some(assignments) = self.site_locals.and_then(|locals| locals.get(name)).and_then(Value::as_array) {
+        if let Some(assignments) =
+            self.site_locals.and_then(|locals| locals.iter().find(|(local, _)| *local == name)).map(|(_, items)| *items)
+        {
             return self.site_local(name, assignments);
         }
         // A local with one assignment in the method is that expression. With
         // more than one, which applies depends on code the index does not give.
         let assigned = self
             .locals
-            .and_then(|locals| locals.get(name))
-            .and_then(Value::as_array)
+            .and_then(|locals| locals.iter().find(|(local, _)| *local == name))
+            .map(|(_, items)| *items)
             .ok_or(Unknown)?;
-        let [only] = assigned.as_slice() else { return Err(Unknown) };
-        let text = only.as_str().ok_or(Unknown)?;
+        let [only] = assigned else { return Err(Unknown) };
+        let text: &str = only;
         let text = text.split_once(": ").map_or(text, |(_, rest)| rest);
         self.depth += 1;
         if self.depth > 16 {
@@ -1881,18 +2087,18 @@ impl Eval<'_, '_> {
 
     /// A site local: its assignments run in order, each when its own guard
     /// holds, with `=` replacing and `+=` adding.
-    fn site_local(&mut self, name: &str, assignments: &'static [Value]) -> Ev<V> {
+    fn site_local(&mut self, name: &str, assignments: &'static [index::SiteLocal]) -> Ev<V> {
         if !self.pending.insert(name.to_string()) {
             return Err(Unknown);
         }
         let mut value: Option<V> = None;
         for assignment in assignments {
-            let guard = assignment["when"].as_str().unwrap_or("always");
+            let guard = assignment.when;
             let holds = guard == "always" || truthy(&self.expr(guard)?);
             if holds {
                 // Round 15: a local read from a pop or setdefault names that
                 // change; its value is what the change returned when it ran.
-                let linked = assignment["hparams_mutation"].as_str().map(|site| {
+                let linked = assignment.hparams_mutation.map(|site| {
                     self.ctx
                         .popped
                         .and_then(|popped| popped.borrow().get(site).cloned())
@@ -1901,11 +2107,11 @@ impl Eval<'_, '_> {
                 });
                 let next = match linked {
                     Some(value) => value?,
-                    None => self.expr(assignment["value"].as_str().ok_or(Unknown)?)?,
+                    None => self.expr(assignment.value)?,
                 };
-                let next = match (assignment["op"].as_str(), &value) {
-                    (Some("+="), Some(current)) => arith("+", current, &next)?,
-                    (Some("+="), None) => return Err(Unknown),
+                let next = match (assignment.op, &value) {
+                    ("+=", Some(current)) => arith("+", current, &next)?,
+                    ("+=", None) => return Err(Unknown),
                     _ => next,
                 };
                 self.vars.insert(name.to_string(), next.clone());
@@ -1939,10 +2145,10 @@ impl Eval<'_, '_> {
         if let Some(assigned) = self.ctx.overrides.and_then(|overrides| overrides.get(name)) {
             return assigned.clone().ok_or(Unknown);
         }
-        let refs = self.ctx.converter["attribute_assignments"].get(name).and_then(Value::as_array);
+        let refs = self.ctx.converter.and_then(|converter| converter.assignments(name));
         let Some(refs) = refs else {
             // No index record (a unit test): block_count is TextModel's lookup.
-            if name == "block_count" && self.ctx.converter.is_null() {
+            if name == "block_count" && self.ctx.converter.is_none() {
                 return lookup(self.ctx.map, &["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
                     .map(|value| V::J(value.clone()))
                     .ok_or(Unknown);
@@ -1952,21 +2158,20 @@ impl Eval<'_, '_> {
         if self.depth > 16 {
             return Err(Unknown);
         }
-        let sites = &index()["assignment_sites"];
         let mut value: Option<V> = None;
         for reference in refs {
-            let site = &sites[reference["site"].as_str().ok_or(Unknown)?];
+            let site = index::site(reference.site);
             let mut eval = Eval {
                 ctx: self.ctx,
                 locals: None,
-                site_locals: site.get("locals").and_then(Value::as_object),
+                site_locals: site.locals,
                 vars: Default::default(),
                 pending: Default::default(),
                 depth: self.depth + 1,
             };
             // converter_attributes run_order: a phase after the key writes, or
             // an __init__ the chain never reaches, does not count.
-            let phase = reference["phase"].as_str().unwrap_or("unknown");
+            let phase = reference.phase;
             if matches!(phase, "never" | "after set_gguf_parameters") {
                 continue;
             }
@@ -1975,7 +2180,7 @@ impl Eval<'_, '_> {
             if phase == "set_gguf_parameters" && self.ctx.overrides.is_some() {
                 continue;
             }
-            let guard = site["when"].as_str().unwrap_or("always");
+            let guard = site.when;
             let holds = guard == "always" || truthy(&eval.expr(guard)?);
             if !holds {
                 continue;
@@ -1988,10 +2193,10 @@ impl Eval<'_, '_> {
             ) {
                 return Err(Unknown);
             }
-            let next = eval.expr(site["value"].as_str().ok_or(Unknown)?)?;
-            value = Some(match (site["op"].as_str(), &value) {
-                (Some("+="), Some(current)) => arith("+", current, &next)?,
-                (Some("+="), None) => return Err(Unknown),
+            let next = eval.expr(site.value)?;
+            value = Some(match (site.op, &value) {
+                ("+=", Some(current)) => arith("+", current, &next)?,
+                ("+=", None) => return Err(Unknown),
                 _ => next,
             });
         }
@@ -2875,6 +3080,164 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// Sort an object's keys, for a table the code reads by key only.
+    fn by_key(value: &Value) -> Value {
+        let mut keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        keys.sort();
+        Value::Object(keys.into_iter().map(|key| (key.clone(), value[key].clone())).collect())
+    }
+
+    fn lit_map(members: &[(&str, Lit)]) -> Value {
+        Value::Object(members.iter().map(|(key, value)| (key.to_string(), value.to_value())).collect())
+    }
+
+    /// The defaults rebuilt from the compiled statics are the spec's.
+    #[test]
+    fn the_generated_defaults_are_the_spec_table() {
+        let Some(expected) = crate::spec_expected::load("hf-config-defaults.json") else { return };
+        let mut model_types = Map::new();
+        for row in hf_defaults::MODEL_TYPES {
+            let derived: Map<String, Value> = row
+                .derived
+                .iter()
+                .map(|(key, value)| (key.to_string(), json!({ "value_when_all_absent": value.as_ref().map(Lit::to_value) })))
+                .collect();
+            model_types.insert(
+                row.model_type.to_string(),
+                json!({
+                    "defaults": lit_map(row.defaults),
+                    "derived": derived,
+                    "rope_scaling_type_copied_to_rope_type": row.rope_copy,
+                }),
+            );
+        }
+        let mut composites = Map::new();
+        for row in hf_defaults::COMPOSITES {
+            composites.insert(
+                row.model_type.to_string(),
+                json!({
+                    "created_when_absent": row.created_when_absent,
+                    "default_text_model_type": row.default_text_model_type,
+                    "copied_top_level_keys": row.copied_top_level_keys,
+                    "default_text_config": row.default_text_config.map(lit_map),
+                }),
+            );
+        }
+        let check = crate::spec_expected::assert_same;
+        check(&lit_map(hf_defaults::COMMON), &expected["common"], "common");
+        check(&Value::Object(model_types), &by_key(&expected["model_types"]), "model_types");
+        check(&Value::Object(composites), &by_key(&expected["composite_text_config"]), "composite_text_config");
+    }
+
+    fn str_or_list(value: &index::StrOrList) -> Value {
+        match value {
+            index::StrOrList::Str(text) => json!(text),
+            index::StrOrList::List(items) => json!(items),
+        }
+    }
+
+    /// The config-keys index rebuilt from the compiled statics is the spec's:
+    /// every record, field, and resolved reference.
+    #[test]
+    fn the_generated_index_is_the_spec_table() {
+        let Some(expected) = crate::spec_expected::load("gguf-config-keys.json") else { return };
+        let site_name = |id: index::SiteId| index::site(id).id;
+        let refs = |items: &[index::SiteRef]| -> Value {
+            Value::Array(items.iter().map(|item| json!({"phase": item.phase, "site": site_name(item.site)})).collect())
+        };
+        let mut converters = Map::new();
+        for row in index::CONVERTERS {
+            converters.insert(
+                row.class.to_string(),
+                json!({
+                    "set_gguf_parameters": row.chain,
+                    "set_gguf_parameters_sequence": row.sequence.map(|id| index::SEQUENCE_IDS[id.0 as usize]),
+                    "hparams_mutations": refs(row.hparams_mutations),
+                    "attribute_assignments": row.attribute_assignments.iter().map(|(name, items)| (name.to_string(), refs(items))).collect::<Map<String, Value>>(),
+                    "self_calls": row.self_calls.iter().map(|(name, target)| (name.to_string(), json!(target))).collect::<Map<String, Value>>(),
+                }),
+            );
+        }
+        let calls = |items: Option<&[index::Call]>| {
+            items.map(|items| items.iter().map(|call| json!({"line": call.line, "method": call.method, "when": call.when})).collect::<Vec<_>>())
+        };
+        let mut methods = Map::new();
+        for row in index::METHODS {
+            let writes = row.writes.map(|items| {
+                items
+                    .iter()
+                    .map(|write| json!({
+                        "key": str_or_list(&write.key),
+                        "value": write.value.as_ref().map(str_or_list),
+                        "type": write.kind,
+                        "when": write.when,
+                        "line": write.line,
+                    }))
+                    .collect::<Vec<_>>()
+            });
+            methods.insert(
+                row.name.to_string(),
+                json!({
+                    "writes": writes,
+                    "locals": row.locals.map(|locals| locals.iter().map(|(name, items)| (name.to_string(), json!(items))).collect::<Map<String, Value>>()),
+                    "self_calls": calls(row.self_calls),
+                    "super_calls": calls(row.super_calls),
+                }),
+            );
+        }
+        let mut sites = Map::new();
+        for row in index::SITES {
+            let locals = row.locals.map(|locals| {
+                locals
+                    .iter()
+                    .map(|(name, items)| {
+                        let items: Vec<Value> = items
+                            .iter()
+                            .map(|item| json!({"when": item.when, "value": item.value, "op": item.op, "hparams_mutation": item.hparams_mutation}))
+                            .collect();
+                        (name.to_string(), Value::Array(items))
+                    })
+                    .collect::<Map<String, Value>>()
+            });
+            sites.insert(
+                row.id.to_string(),
+                json!({
+                    "op": row.op,
+                    "value": row.value,
+                    "when": row.when,
+                    "key": row.key.flatten(),
+                    "key_present": row.key.is_some(),
+                    "on": row.on,
+                    "locals": locals,
+                }),
+            );
+        }
+        let mut sequences = Map::new();
+        for (id, events) in index::SEQUENCE_IDS.iter().zip(index::SEQUENCES) {
+            let events: Vec<Value> = events
+                .iter()
+                .map(|event| match *event {
+                    index::Event::Return { from } => json!({"return_from": from}),
+                    index::Event::Call { target, from, when } => json!({"call": target, "from": from, "when": when}),
+                    index::Event::Raise { line, when, cause, kind, caught } => {
+                        json!({"raise": line, "when": when, "cause": cause, "kind": kind, "caught": caught})
+                    }
+                    index::Event::Write { method, index: at } => json!({"write": index::method_at(method).name, "index": at}),
+                    index::Event::Mutation { site } => json!({"hparams_mutation": site_name(site)}),
+                    index::Event::Attribute { name, site } => json!({"attribute": name, "site": site_name(site)}),
+                })
+                .collect();
+            sequences.insert(id.to_string(), Value::Array(events));
+        }
+        let check = crate::spec_expected::assert_same;
+        check(&Value::Object(converters), &by_key(&expected["converters"]), "converters");
+        check(&Value::Object(methods), &by_key(&expected["methods"]), "methods");
+        check(&Value::Object(sites), &by_key(&expected["assignment_sites"]), "assignment_sites");
+        check(&Value::Object(sequences), &expected["sequences"], "sequences");
+    }
+
 
     fn config(text: &str) -> Map<String, Value> {
         serde_json::from_str::<Value>(text).unwrap().as_object().unwrap().clone()
@@ -2894,7 +3257,7 @@ mod tests {
         let map = config(config_text);
         let (p, _) = rope_params(Some(&map));
         let dir = std::path::Path::new("/nonexistent");
-        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir, arch: "t", converter: None, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         eval.expr(expr)
     }
@@ -3119,12 +3482,12 @@ mod tests {
         // NemotronHPuzzleModel calls GraniteHybridModel.__init__ directly, so
         // NemotronH's MTP step never runs for it.
         let (p, _) = rope_params(Some(&nextn));
-        let record = &index()["converters"]["NemotronHPuzzleModel"];
+        let record = index::converter("NemotronHPuzzleModel");
         let ctx = Ctx { map: &nextn, p: &p, dir, arch: "nemotron_h", converter: record, tensors: &[], hf_arch: None, loaded: &nextn, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(4))));
         // DeepseekV4DSparkModel counts the layers in the filtered tensor names.
-        let record = &index()["converters"]["DeepseekV4DSparkModel"];
+        let record = index::converter("DeepseekV4DSparkModel");
         let names = ["layers.0.attn.weight".to_string(), "layers.2.ffn.weight".to_string(), "embed.weight".to_string()];
         let ctx = Ctx { map: &nextn, p: &p, dir, arch: "x", converter: record, tensors: &names, hf_arch: None, loaded: &nextn, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
@@ -3132,7 +3495,7 @@ mod tests {
         // Qwen3.5's MTP mixin: num_hidden_layers, then += mtp_num_hidden_layers.
         let mtp = config(r#"{"num_hidden_layers": 4, "hidden_size": 8, "num_attention_heads": 2, "mtp_num_hidden_layers": 1}"#);
         let (p, _) = rope_params(Some(&mtp));
-        let record = &index()["converters"]["Qwen3_5TextModel"];
+        let record = index::converter("Qwen3_5TextModel");
         let ctx = Ctx { map: &mtp, p: &p, dir, arch: "qwen35", converter: record, tensors: &[], hf_arch: None, loaded: &mtp, overrides: None, popped: None, depth: 0 };
         let mut eval = Eval { ctx: &ctx, locals: None, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
         assert_eq!(eval.self_attribute("block_count"), Ok(V::J(Value::from(5))));
@@ -3168,7 +3531,7 @@ mod tests {
         // local it passes on as hparams=.
         let nemotron = config(r#"{"num_hidden_layers": 2, "hidden_size": 8, "num_attention_heads": 2,
             "layers_block_type": ["mamba", "attention", "mamba"]}"#);
-        let record = &index()["converters"]["NemotronHModel"];
+        let record = index::converter("NemotronHModel");
         let mut unapplied = Vec::new();
         let changed = apply_mutations("NemotronHModel", &nemotron, dir, "nemotron_h", record, &[], None, &mut unapplied).unwrap();
         assert_eq!(changed.get("num_hidden_layers"), Some(&Value::from(3)), "{unapplied:?}");
@@ -3220,13 +3583,13 @@ mod tests {
         // The evaluator must never panic on the index; unparsable text is unknown.
         let map = config(r#"{"num_hidden_layers": 2}"#);
         let (p, _) = rope_params(Some(&map));
-        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: &Value::Null, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
+        let ctx = Ctx { map: &map, p: &p, dir: std::path::Path::new("/nonexistent"), arch: "t", converter: None, tensors: &[], hf_arch: None, loaded: &map, overrides: None, popped: None, depth: 0 };
         let mut total = 0;
-        for record in index()["methods"].as_object().unwrap().values() {
-            let locals = record.get("locals").and_then(Value::as_object);
-            for write in record["writes"].as_array().into_iter().flatten() {
-                for field in ["when", "value"] {
-                    if let Some(text) = write[field].as_str() {
+        for record in index::METHODS {
+            let locals = record.locals;
+            for write in record.writes.unwrap_or_default() {
+                for text in [Some(write.when), write.value.as_ref().and_then(index::StrOrList::as_str)] {
+                    if let Some(text) = text {
                         let mut eval = Eval { ctx: &ctx, locals, site_locals: None, vars: Default::default(), pending: Default::default(), depth: 0 };
                         let _ = eval.expr(text);
                         total += 1;

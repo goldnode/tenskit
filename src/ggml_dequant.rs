@@ -1,88 +1,48 @@
 //! GGML block dequantization from `formats/gguf.yaml` `dtypes[].dequantize`.
 //!
-//! Q8_1 is marked inferred and is refused. Lookup grids come from
-//! `tables/ggml-lookup-tables.json`.
-
-use std::sync::OnceLock;
-
-use serde_json::Value;
+//! Q8_1 is marked inferred and is refused. Lookup grids are the Rust arrays
+//! `build.rs` generates from `tables/ggml-lookup-tables.json`.
 
 use crate::dtype::{self, ggml_row};
 use crate::error::{msg, Result};
 
-const TABLES: &str = include_str!("../generated/tables/ggml-lookup-tables.json");
+mod lookup {
+    include!("../generated/ggml_tables.rs");
+}
 
 struct Grids {
-    kmask_iq2xs: Vec<u32>,
-    ksigns_iq2xs: Vec<u32>,
-    kvalues_iq4nl: Vec<f32>,
-    kvalues_fp4: Vec<f32>,
-    iq2xxs_grid: Vec<Vec<f32>>,
-    iq2xs_grid: Vec<Vec<f32>>,
-    iq2s_grid: Vec<Vec<f32>>,
-    iq3xxs_grid: Vec<Vec<f32>>,
-    iq3s_grid: Vec<Vec<f32>>,
-    iq1s_grid: Vec<Vec<f32>>,
+    kmask_iq2xs: &'static [u32],
+    ksigns_iq2xs: &'static [u32],
+    kvalues_iq4nl: &'static [f32],
+    kvalues_fp4: &'static [f32],
+    iq2xxs_grid: &'static [[f32; 8]],
+    iq2xs_grid: &'static [[f32; 8]],
+    iq2s_grid: &'static [[f32; 8]],
+    iq3xxs_grid: &'static [[f32; 4]],
+    iq3s_grid: &'static [[f32; 4]],
+    iq1s_grid: &'static [[f32; 8]],
 }
+
+static GRIDS: Grids = Grids {
+    kmask_iq2xs: &lookup::KMASK_IQ2XS,
+    ksigns_iq2xs: &lookup::KSIGNS_IQ2XS,
+    kvalues_iq4nl: &lookup::KVALUES_IQ4NL,
+    kvalues_fp4: &lookup::KVALUES_FP4,
+    iq2xxs_grid: &lookup::IQ2XXS_GRID,
+    iq2xs_grid: &lookup::IQ2XS_GRID,
+    iq2s_grid: &lookup::IQ2S_GRID,
+    iq3xxs_grid: &lookup::IQ3XXS_GRID,
+    iq3s_grid: &lookup::IQ3S_GRID,
+    iq1s_grid: &lookup::IQ1S_GRID,
+};
 
 fn grids() -> &'static Grids {
-    static GRIDS: OnceLock<Grids> = OnceLock::new();
-    GRIDS.get_or_init(load_grids)
+    &GRIDS
 }
 
-fn load_grids() -> Grids {
-    let value: Value = serde_json::from_str(TABLES).expect("ggml-lookup-tables.json");
-    let tables = value.get("tables").expect("tables");
-    Grids {
-        kmask_iq2xs: ints(tables, "kmask_iq2xs"),
-        ksigns_iq2xs: ints(tables, "ksigns_iq2xs"),
-        kvalues_iq4nl: floats(tables, "kvalues_iq4nl"),
-        kvalues_fp4: floats(tables, "kvalues_fp4"),
-        iq2xxs_grid: grid_rows(tables, "iq2xxs_grid"),
-        iq2xs_grid: grid_rows(tables, "iq2xs_grid"),
-        iq2s_grid: grid_rows(tables, "iq2s_grid"),
-        iq3xxs_grid: grid_rows(tables, "iq3xxs_grid"),
-        iq3s_grid: grid_rows(tables, "iq3s_grid"),
-        iq1s_grid: grid_rows(tables, "iq1s_grid"),
-    }
-}
-
-fn ints(tables: &Value, name: &str) -> Vec<u32> {
-    tables[name]["values"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{name} values"))
-        .iter()
-        .map(|item| item.as_u64().unwrap() as u32)
-        .collect()
-}
-
-fn floats(tables: &Value, name: &str) -> Vec<f32> {
-    tables[name]["values"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{name} values"))
-        .iter()
-        .map(|item| item.as_f64().unwrap() as f32)
-        .collect()
-}
-
-fn grid_rows(tables: &Value, name: &str) -> Vec<Vec<f32>> {
-    tables[name]["bytes_le"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{name} bytes"))
-        .iter()
-        .map(|row| {
-            row.as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item.as_i64().unwrap() as f32)
-                .collect()
-        })
-        .collect()
-}
-
-fn at<'a>(grid: &'a [Vec<f32>], index: usize, name: &str) -> Result<&'a [f32]> {
+fn at<'a, const N: usize>(grid: &'a [[f32; N]], index: usize, name: &str) -> Result<&'a [f32]> {
     grid.get(index)
-        .map(Vec::as_slice)
+        .map(|row| row.as_slice())
         .ok_or_else(|| msg(format!("{name} index {index} is outside the lookup table")))
 }
 
@@ -930,6 +890,34 @@ fn nibble(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_generated_grids_are_the_spec_table() {
+        let Some(expected) = crate::spec_expected::load("ggml-lookup-tables.json") else { return };
+        let g = grids();
+        let list = |values: &[f32]| serde_json::json!({ "values": values.iter().map(|v| *v as i64).collect::<Vec<_>>() });
+        let ints = |values: &[u32]| serde_json::json!({ "values": values });
+        fn rows<const N: usize>(grid: &[[f32; N]]) -> serde_json::Value {
+            serde_json::json!({ "bytes_le": grid.iter().map(|row| row.iter().map(|v| *v as i64).collect::<Vec<_>>()).collect::<Vec<_>>() })
+        }
+        // Every value is a small integer; the f32 must be exactly it.
+        for value in g.kvalues_iq4nl.iter().chain(g.kvalues_fp4) {
+            assert_eq!(*value, value.trunc());
+        }
+        let rebuilt = serde_json::json!({ "tables": {
+            "kmask_iq2xs": ints(g.kmask_iq2xs),
+            "ksigns_iq2xs": ints(g.ksigns_iq2xs),
+            "kvalues_iq4nl": list(g.kvalues_iq4nl),
+            "kvalues_fp4": list(g.kvalues_fp4),
+            "iq2xxs_grid": rows(g.iq2xxs_grid),
+            "iq2xs_grid": rows(g.iq2xs_grid),
+            "iq2s_grid": rows(g.iq2s_grid),
+            "iq3xxs_grid": rows(g.iq3xxs_grid),
+            "iq3s_grid": rows(g.iq3s_grid),
+            "iq1s_grid": rows(g.iq1s_grid),
+        }});
+        crate::spec_expected::assert_same(&rebuilt, &expected, "ggml-lookup-tables.json");
+    }
 
     #[test]
     fn q8_0_dequant_matches_a_hand_built_block() {

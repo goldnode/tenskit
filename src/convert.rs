@@ -2410,28 +2410,13 @@ mod tests {
 
     #[test]
     fn every_drop_condition_in_the_spec_parses() {
-        let value: Value = serde_json::from_str(include_str!(
-            "../generated/tables/gguf-tensor-roles.json"
-        ))
-        .unwrap();
+        // Every converter's drop tests, its own and its chain's.
         let mut conditions = Vec::new();
-        fn walk(value: &Value, out: &mut Vec<String>) {
-            match value {
-                Value::Object(map) => {
-                    if let Some(list) = map
-                        .get("filter_tensors")
-                        .and_then(|filter| filter.get("drop_when"))
-                        .and_then(Value::as_array)
-                    {
-                        out.extend(list.iter().filter_map(|item| item.as_str().map(str::to_string)));
-                    }
-                    map.values().for_each(|item| walk(item, out));
-                }
-                Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
-                _ => {}
+        for arch in gguf_names::architecture_ids() {
+            for record in gguf_names::converter_records(arch) {
+                conditions.extend(record.filter.map(|filter| filter.drop_when).unwrap_or_default());
             }
         }
-        walk(&value, &mut conditions);
         assert!(!conditions.is_empty());
         conditions.push(gguf_names::text_model_drop_when().expect("TextModel drop test"));
         for when in &conditions {
@@ -2591,11 +2576,7 @@ mod tests {
     fn generated_tensors_follow_gguf_035() {
         assert!(crate::dtype::GENERATED_TENSORS.len() >= 26);
         // Every converter's generator has a row.
-        let value: Value = serde_json::from_str(include_str!(
-            "../generated/tables/gguf-tensor-roles.json"
-        ))
-        .unwrap();
-        for arch in value["architectures"].as_object().unwrap().keys() {
+        for arch in gguf_names::architecture_ids() {
             for record in gguf_names::converter_records(arch) {
                 if record.generator.is_some() {
                     assert!(generated_row(&record).is_some(), "{}", record.class);

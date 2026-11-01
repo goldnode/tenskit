@@ -33,6 +33,9 @@ mod man_pages;
 #[cfg(test)]
 mod spec_audit;
 
+#[cfg(test)]
+mod spec_expected;
+
 pub use error::{Error, Result};
 
 /// First line is the command and version. Second line is the author.
