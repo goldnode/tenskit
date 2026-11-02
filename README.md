@@ -2,8 +2,6 @@
 
 A suite of command-line utilities for tensor containers: `.safetensors`, GGUF format versions 2 and 3, `.npy`, `.npz`, rawtensor/1, PyTorch zip checkpoints, ONNX initializers, and a safetensors shard index. tenskit lists, edits, compares, converts, and quantizes them.
 
-Nick Reynolds ([goldnode](https://github.com/goldnode) on GitHub, [goldnode](https://x.com/goldnode) on X).
-
 ```bash
 tenspile -tvf model.safetensors                       # list tensors with dtype, shape, and size
 tensinfo model/                                       # short overview: model type, size, dtypes, quantization

@@ -1,0 +1,24 @@
+# Every spec format id. + is compiled in, - is not.
++ safetensors
++ gguf
++ npz
++ pytorch
++ onnx
++ npy
++ mlx
++ gptq
++ awq
++ bitsandbytes
++ compressed-tensors
++ raw-sidecar
+- arrow-parquet
+- coreml
+- exl2
+- ggml-legacy
+- hdf5
+- matlab-mat
+- sentencepiece
+- tensorrt-llm
+- text-csv-tsv-json
+- tokenizer-hf
+- zarr
