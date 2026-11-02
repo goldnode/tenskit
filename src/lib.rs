@@ -41,7 +41,7 @@ pub use error::{Error, Result};
 /// First line is the command and version. Second line is the author.
 pub fn version_line(command: &str) -> String {
     format!(
-        "{command} {} (tenskit.org)\nNick Reynolds [goldnode] (nicks.net)",
+        "{command} {} (tenskit.org)\nNick Reynolds (goldnode)",
         env!("CARGO_PKG_VERSION")
     )
 }
