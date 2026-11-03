@@ -1,0 +1,10 @@
+# Proposes updates to the actions pinned in .github/workflows as pull requests.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

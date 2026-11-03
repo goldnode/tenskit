@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 env:
+  # When changing this, also update nfpm_sha256 in the build matrix below.
   NFPM_VERSION: 2.48.0
 
 jobs:
@@ -24,14 +25,16 @@ jobs:
             target: x86_64-unknown-linux-musl
             arch: amd64
             nfpm_asset: Linux_x86_64
+            nfpm_sha256: 6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             arch: arm64
             nfpm_asset: Linux_arm64
+            nfpm_sha256: a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4
     env:
       CARGO_PROFILE_RELEASE_STRIP: symbols
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -44,8 +47,10 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      # This action has no version tags. A pin must be a commit on its master branch.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Test
@@ -57,19 +62,18 @@ jobs:
       - name: Install nFPM
         env:
           ASSET: nfpm_${{ env.NFPM_VERSION }}_${{ matrix.nfpm_asset }}.tar.gz
+          SHA256: ${{ matrix.nfpm_sha256 }}
         run: |
-          base="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
-          curl -fsSLO "$base/$ASSET"
-          curl -fsSLO "$base/checksums.txt"
-          grep " $ASSET\$" checksums.txt | sha256sum -c -
+          curl -fsSLO "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/$ASSET"
+          echo "$SHA256  $ASSET" | sha256sum -c -
           tar -xzf "$ASSET" -C "$RUNNER_TEMP" nfpm
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          rm "$ASSET" checksums.txt
+          rm "$ASSET"
 
       - name: Package
         run: bash packaging/package.sh ${{ matrix.target }} ${{ matrix.arch }}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: packages-${{ matrix.arch }}
           path: target/dist/*
@@ -95,11 +99,11 @@ jobs:
           - opensuse/leap:16.0
           - opensuse/tumbleweed:latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: packages-*
           merge-multiple: true
@@ -121,7 +125,7 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: packages-*
           merge-multiple: true
@@ -131,7 +135,7 @@ jobs:
         working-directory: dist
         run: sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
 
-      - uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-checksums: dist/SHA256SUMS
 
