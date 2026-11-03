@@ -1,0 +1,70 @@
+{
+ "format": "rawtensor",
+ "version": 1,
+ "byte_order": "little",
+ "alignment": 64,
+ "tensors": [
+  {
+   "name": "w_f32",
+   "dtype": "float32",
+   "shape": [
+    4,
+    64
+   ],
+   "file": "small.bin",
+   "offset": 0,
+   "nbytes": 1024,
+   "sha256": "4ed1917f5709205c73dcda28285f09df130ea6f31bccdb9b833046d4aef0c258"
+  },
+  {
+   "name": "b_f16",
+   "dtype": "float16",
+   "shape": [
+    8
+   ],
+   "file": "small.bin",
+   "offset": 1024,
+   "nbytes": 16,
+   "sha256": "5a142745ab01796a0c1e38660a6543d72da776bf4e61abcd1a982d68c2daf18a"
+  },
+  {
+   "name": "e_bf16",
+   "dtype": "bfloat16",
+   "shape": [
+    2,
+    3
+   ],
+   "file": "small.bin",
+   "offset": 1088,
+   "nbytes": 12,
+   "sha256": "d0e97233cd086ff5000e93fcd4866cda96613a30b41779130a45ee15c344439d"
+  },
+  {
+   "name": "i_i32",
+   "dtype": "int32",
+   "shape": [
+    3,
+    2
+   ],
+   "file": "small.bin",
+   "offset": 1152,
+   "nbytes": 24,
+   "sha256": "cd9a54ed1f18bf97db08914e280ea7349e11ca2c4885a4d8052552ceba84208d"
+  },
+  {
+   "name": "s_f32",
+   "dtype": "float32",
+   "shape": [],
+   "file": "small.bin",
+   "offset": 1216,
+   "nbytes": 4,
+   "sha256": "e21712a06022eecab9f5bd25414b4af9adeb316bb03947134cea060c78afd2d9"
+  }
+ ],
+ "metadata": {
+  "source": {
+   "type": "string",
+   "value": "tensor-format-specs test vector"
+  }
+ }
+}

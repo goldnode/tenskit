@@ -1,0 +1,34 @@
+{
+ "safetensors-unpadded.bin": {
+  "bytes": 91,
+  "check": "safetensors"
+ },
+ "safetensors-v030-mispad.bin": {
+  "bytes": 98,
+  "check": "safetensors"
+ },
+ "npy-align16.npy": {
+  "bytes": 84,
+  "check": "npy16"
+ },
+ "gguf-v3-be.gguf": {
+  "bytes": 51,
+  "check": "gguf-be"
+ },
+ "gguf-v1-header.gguf": {
+  "bytes": 8,
+  "check": "gguf-v1"
+ },
+ "safetensors-n640.bin": {
+  "bytes": 652,
+  "check": "safetensors-n640"
+ },
+ "gguf-v3-no-tensors.gguf": {
+  "bytes": 51,
+  "check": "gguf-no-tensors"
+ },
+ "gguf-orig-shape.gguf": {
+  "bytes": 248,
+  "check": "gguf-orig-shape"
+ }
+}

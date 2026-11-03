@@ -1,0 +1,992 @@
+{
+ "note": "sha256 of canonical bytes (LE, C order). GGUF shapes here are canonical (reversed ne). GGUF cannot store rank 0: s_f32 is not in small.gguf. A converter stores that scalar as shape [1] (same bytes) and records that the canonical shape was []. See gguf_scalar.",
+ "gguf_scalar": {
+  "name": "s_f32",
+  "dtype": "float32",
+  "canonical_shape": [],
+  "gguf_shape": [
+   1
+  ],
+  "sha256": "e21712a06022eecab9f5bd25414b4af9adeb316bb03947134cea060c78afd2d9",
+  "in_small_gguf": false,
+  "reason": "n_dims is at least 1. The stored shape would be [1], which must not replace the canonical shape []."
+ },
+ "tensors": {
+  "w_f32": {
+   "dtype": "float32",
+   "shape": [
+    4,
+    64
+   ],
+   "sha256": "4ed1917f5709205c73dcda28285f09df130ea6f31bccdb9b833046d4aef0c258"
+  },
+  "b_f16": {
+   "dtype": "float16",
+   "shape": [
+    8
+   ],
+   "sha256": "5a142745ab01796a0c1e38660a6543d72da776bf4e61abcd1a982d68c2daf18a"
+  },
+  "e_bf16": {
+   "dtype": "bfloat16",
+   "shape": [
+    2,
+    3
+   ],
+   "sha256": "d0e97233cd086ff5000e93fcd4866cda96613a30b41779130a45ee15c344439d"
+  },
+  "i_i32": {
+   "dtype": "int32",
+   "shape": [
+    3,
+    2
+   ],
+   "sha256": "cd9a54ed1f18bf97db08914e280ea7349e11ca2c4885a4d8052552ceba84208d"
+  },
+  "s_f32": {
+   "dtype": "float32",
+   "shape": [],
+   "sha256": "e21712a06022eecab9f5bd25414b4af9adeb316bb03947134cea060c78afd2d9"
+  },
+  "w_q8_0 (gguf, dequantized to float32)": {
+   "dtype": "float32",
+   "shape": [
+    4,
+    64
+   ],
+   "sha256": "44d400baa0763c095dabc84d29934e61ecedc3ac968c6a378071a7ec08cf6b46",
+   "raw_blocks_sha256": "0b2ff567485973ab68ab21c0b26c5d11e08380b99157a6fdb401d8366ab64fd2"
+  },
+  "gptq.qweight": {
+   "dtype": "int32",
+   "shape": [
+    32,
+    32
+   ],
+   "sha256": "4199c64605a3534bd05c66d933cf435efe7bb4f77f5b8b3bef81a6fd5f0d8b60"
+  },
+  "gptq.qzeros": {
+   "dtype": "int32",
+   "shape": [
+    8,
+    4
+   ],
+   "sha256": "d84a714f014043714e26aea7c3dd985ebea526d49e754c71b3d4aef640402bbb"
+  },
+  "gptq.scales": {
+   "dtype": "float32",
+   "shape": [
+    8,
+    32
+   ],
+   "sha256": "893a106828fbdb9521e1d868c985aab7ad2ae2f606edc55329265a5e7676006c"
+  },
+  "gptq.g_idx": {
+   "dtype": "int32",
+   "shape": [
+    256
+   ],
+   "sha256": "29d6122827fdb88747cbfae110172df28f75612d0da88f6b8030df003c26c47c"
+  },
+  "awq.qweight": {
+   "dtype": "int32",
+   "shape": [
+    64,
+    4
+   ],
+   "sha256": "df7a8053cbe6dd3bb2d653823f6e95cec6abda944bd57a5fbf7f7606e7d11592"
+  },
+  "awq.qzeros": {
+   "dtype": "int32",
+   "shape": [
+    1,
+    4
+   ],
+   "sha256": "4c989d0c271e1e403d5f908f9adcd48d1cd17c96523b854ee558128a4fb20fc5"
+  },
+  "awq.scales": {
+   "dtype": "float32",
+   "shape": [
+    1,
+    32
+   ],
+   "sha256": "b638277a8690e175a9137feff1e43c067f9faf4e2f600caf468fb05b0403b717"
+  },
+  "bnb.weight": {
+   "dtype": "uint8",
+   "shape": [
+    32,
+    1
+   ],
+   "sha256": "217c53c9ac12a53a11e2856516d42a35117a67a6bd8e5c62e89a8fad3ce23623"
+  },
+  "bnb.absmax": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ],
+   "sha256": "1dc696776d9f004b2ad5780836956a10b9278ef200a07311587e40269a5a068d"
+  },
+  "ct.weight_packed": {
+   "dtype": "int32",
+   "shape": [
+    2,
+    1
+   ],
+   "sha256": "010b2b435012d2625d1e4c94f4981a4f2d16e8d5210837b4d86758f098427a2a"
+  },
+  "sd.u16": {
+   "dtype": "uint16",
+   "shape": [
+    2
+   ],
+   "sha256": "16b8cb1fe734fbc60c6763c94c9e4cc55840ae966e7e508ba82f539d82702511"
+  },
+  "sd.u32": {
+   "dtype": "uint32",
+   "shape": [
+    3
+   ],
+   "sha256": "de25d19943926b201c1693709bc5eca70ecf04229c1668e2f276249f9bebe043"
+  },
+  "sd.u64": {
+   "dtype": "uint64",
+   "shape": [
+    3
+   ],
+   "sha256": "1d061c03f2900d230e5e97e32dd72f594e90ecf145341334e57e40fd7371c1ad"
+  },
+  "sd.lin.weight": {
+   "dtype": "float32",
+   "shape": [
+    3,
+    4
+   ],
+   "sha256": "9abad9a5e05cc1dedef0ec5a49d329eb0ab06f4014e371bd93956a999d5e7870"
+  },
+  "sd.lin.bias": {
+   "dtype": "float32",
+   "shape": [
+    3
+   ],
+   "sha256": "3936cb53fb19caeebc68eab4f99b30f7e46cb2b76b0d5ffb34008af4da7cb916"
+  },
+  "onnx.t_f32": {
+   "dtype": "float32",
+   "shape": [
+    2,
+    2
+   ],
+   "sha256": "87b2b8a1133117a63648e54e7a1c248f28459fcc1aa61fa117e015dbe9b0f654"
+  },
+  "onnx.t_f16": {
+   "dtype": "float16",
+   "shape": [
+    3
+   ],
+   "sha256": "a796e894152e04ed91ec87418d3c3f07146d13215bdb788813f369daa88ae10e"
+  },
+  "onnx.t_i8": {
+   "dtype": "int8",
+   "shape": [
+    3
+   ],
+   "sha256": "5e1a380160b10e6ef4c9f650f57b6dae9ce4d70c8407f902551943fee37969c6"
+  },
+  "onnx.t_i32": {
+   "dtype": "int32",
+   "shape": [
+    3
+   ],
+   "sha256": "6d2424dfeec62db911a138c736c23013b57d1763ab62e9b7673a7b50a5f9021a"
+  },
+  "onnx.t_i64": {
+   "dtype": "int64",
+   "shape": [
+    3
+   ],
+   "sha256": "602d6eb086ba17e222a518986ee3b23c10738835fc6d4facd4c9abc04c22a5ef"
+  },
+  "onnx.t_u32": {
+   "dtype": "uint32",
+   "shape": [
+    2
+   ],
+   "sha256": "5981693c8df83eea16da42a0f748facb299546688544a0c2887ed5ffbf086e86"
+  },
+  "bnbhf.layer.weight": {
+   "dtype": "uint8",
+   "shape": [
+    64,
+    1
+   ],
+   "sha256": "91f4b81212bd9f6834208adf2491d1e18e6f71a4c56880109fc90ee0db7708f2"
+  },
+  "bnbhf.layer.weight.absmax": {
+   "dtype": "float32",
+   "shape": [
+    2
+   ],
+   "sha256": "f8f7419aab92de03a536748451debe3b725d3fa6fbb3465c9c3e7a1975c22d47"
+  },
+  "bnbhf.layer.weight.quant_map": {
+   "dtype": "float32",
+   "shape": [
+    16
+   ],
+   "sha256": "8501941daa1b8a90ad1bbfeb632e5101b5dddbc4bb52d6e55abcfd777e60c06a"
+  },
+  "bnbhf.layer.weight.quant_state.bitsandbytes__nf4": {
+   "dtype": "uint8",
+   "shape": [
+    76
+   ],
+   "sha256": "35c14dc086ccfc4dd50bdea1388ac0ef17ce6e1f2fcdd9ea1960da42aa39313a"
+  },
+  "ctg.weight_packed": {
+   "dtype": "int32",
+   "shape": [
+    2,
+    2
+   ],
+   "sha256": "b703ddde7a6f4a61a48d927dc984c2cba6dff47d19c3aaa72a3e1b5ae83b389c"
+  },
+  "ctg.weight_scale": {
+   "dtype": "bfloat16",
+   "shape": [
+    2,
+    2
+   ],
+   "sha256": "585d2c07c8ce39bea01bc607fb2c27c944f8e3b2ce262b8fa67cd6e985ebeba5"
+  },
+  "ctg.weight_shape": {
+   "dtype": "int64",
+   "shape": [
+    2
+   ],
+   "sha256": "6dfbf18ddab8270a3b5271ed78e7740a973cc100bf70740006fc9c55c63a8edc"
+  },
+  "gptqv2.qweight": {
+   "dtype": "int32",
+   "shape": [
+    32,
+    32
+   ],
+   "sha256": "4199c64605a3534bd05c66d933cf435efe7bb4f77f5b8b3bef81a6fd5f0d8b60"
+  },
+  "gptqv2.qzeros": {
+   "dtype": "int32",
+   "shape": [
+    8,
+    4
+   ],
+   "sha256": "078d4a4542bc9ad5e4ec69d4ed68fc49ca3cdd86b6f755462c5686f6ed6bd2a0"
+  },
+  "gptqv2.scales": {
+   "dtype": "float32",
+   "shape": [
+    8,
+    32
+   ],
+   "sha256": "893a106828fbdb9521e1d868c985aab7ad2ae2f606edc55329265a5e7676006c"
+  },
+  "gptqv2.g_idx": {
+   "dtype": "int32",
+   "shape": [
+    256
+   ],
+   "sha256": "29d6122827fdb88747cbfae110172df28f75612d0da88f6b8030df003c26c47c"
+  },
+  "cta.weight_packed": {
+   "dtype": "int32",
+   "shape": [
+    10,
+    4
+   ],
+   "sha256": "5496436cb74e3acbdab6317960881bd62b8ab3dc672f00efcf4e7111bb4dece9"
+  },
+  "cta.weight_scale": {
+   "dtype": "bfloat16",
+   "shape": [
+    10,
+    4
+   ],
+   "sha256": "9f54e468509b6c965c85b70c1cf8de4d6f3b2fe2943c98a87f5810c2a72da823"
+  },
+  "cta.weight_zero_point": {
+   "dtype": "int32",
+   "shape": [
+    2,
+    4
+   ],
+   "sha256": "fd68ed67ff66c9753e2eb50583c610482f7a7cd797c81ae5417f568d675dbdd1"
+  },
+  "cta.weight_shape": {
+   "dtype": "int64",
+   "shape": [
+    2
+   ],
+   "sha256": "027107c847fe4af53ab8f557a916184b04d581dec86bd0a042c64590900532d9"
+  },
+  "bnbn.layer.weight": {
+   "dtype": "uint8",
+   "shape": [
+    512,
+    1
+   ],
+   "sha256": "e700c3587dad698deaf2e9e60e706a0853e762e406ad704776fcf3429d6d4832"
+  },
+  "bnbn.layer.weight.absmax": {
+   "dtype": "uint8",
+   "shape": [
+    16
+   ],
+   "sha256": "d655d361a65e57ebc9a7e7ded508c3105bcf2b7bfc7eae8f28ed5fab908a7dc6"
+  },
+  "bnbn.layer.weight.quant_map": {
+   "dtype": "float32",
+   "shape": [
+    16
+   ],
+   "sha256": "8501941daa1b8a90ad1bbfeb632e5101b5dddbc4bb52d6e55abcfd777e60c06a"
+  },
+  "bnbn.layer.weight.nested_absmax": {
+   "dtype": "float32",
+   "shape": [
+    1
+   ],
+   "sha256": "37bf9d83133c7db076c4d62c9e691f78ae103a3fbf8a62769e59aedfe8dae60b"
+  },
+  "bnbn.layer.weight.nested_quant_map": {
+   "dtype": "float32",
+   "shape": [
+    256
+   ],
+   "sha256": "e732639a65f497b4ad684bb166a4467708255edd5207757de8b8f0c7e1fda89c"
+  },
+  "bnbn.layer.weight.quant_state.bitsandbytes__nf4": {
+   "dtype": "uint8",
+   "shape": [
+    166
+   ],
+   "sha256": "b2dd75bd76b0c3dd03063a363ff5ab42fb870b7c3adb7ed29bb54a1ab9c24ba1"
+  },
+  "mlxe.weight": {
+   "dtype": "uint32",
+   "shape": [
+    2,
+    16,
+    4
+   ],
+   "sha256": "ad0565f3b1b085674bcd1d4ef7b68df7f0a9f1202cd6c048a0dbd5a97dd07ac8"
+  },
+  "mlxe.scales": {
+   "dtype": "uint8",
+   "shape": [
+    2,
+    16,
+    2
+   ],
+   "sha256": "3f77ee58f86fef2c8a69f4e662264f65420ce402828620115ad21ff25a3a1637"
+  },
+  "mlxe.global_scale": {
+   "dtype": "float32",
+   "shape": [
+    2
+   ],
+   "sha256": "f2c43bbf7f08eb7c7ed5273e0c1df019f26f2d6b111ca9dad35b9f943fa0b318"
+  },
+  "cti.weight": {
+   "dtype": "int8",
+   "shape": [
+    6,
+    20
+   ],
+   "sha256": "0cb3492d005feea646ac2e7f582f89c717f327c851f7a13ad1a33bbafbadfced"
+  },
+  "cti.weight_scale": {
+   "dtype": "bfloat16",
+   "shape": [
+    6,
+    1
+   ],
+   "sha256": "d880e87d8ede8c3199b5c582d7004c4a2cf20b0ca12075947cb38b21a68d3200"
+  },
+  "ctf.weight": {
+   "dtype": "float8_e4m3fn",
+   "shape": [
+    6,
+    20
+   ],
+   "sha256": "a3fbfc39cc7f4e9a6f91c8fecfcc19f10ccc84f6ca32577ac850d96ccca5fa0f"
+  },
+  "ctf.weight_scale": {
+   "dtype": "bfloat16",
+   "shape": [
+    2,
+    3
+   ],
+   "sha256": "a28d4b9f2addc3880c1d130335b8900b96a89a62cb449e5eec18aa54171262dc"
+  },
+  "pt8.f8e4m3": {
+   "dtype": "float8_e4m3fn",
+   "shape": [
+    2,
+    3
+   ],
+   "sha256": "ea9425c950cb4567f744b7fa4e2f11cd19f37baaa584c017bc5745d67b87941d"
+  },
+  "pt8.f8e5m2": {
+   "dtype": "float8_e5m2",
+   "shape": [
+    4
+   ],
+   "sha256": "bdd67b68f038e6908751984c8d5a7b3fb4d392c09e12ddfd58f6cf938eb69300"
+  },
+  "pt8.c64_conj": {
+   "dtype": "complex64",
+   "shape": [
+    2
+   ],
+   "sha256": "480c4a600899b1d9b587827585b851c43c4d7c618b5f2370b71e31a483c2b913"
+  },
+  "pt8.imag_neg": {
+   "dtype": "float32",
+   "shape": [
+    2
+   ],
+   "sha256": "a17d6a4c886255a5a499e8de9b7309177656e2489f3c1f3ad3a2f768f3ea00e2"
+  },
+  "pt8.tied_a": {
+   "dtype": "float32",
+   "shape": [
+    2,
+    2
+   ],
+   "sha256": "ad73b9acd6e4a74b2f5bb5386658ce3bb146cd040a1867646ab3b973fb6632b1"
+  },
+  "pt8.tied_b": {
+   "dtype": "float32",
+   "shape": [
+    2,
+    2
+   ],
+   "sha256": "ad73b9acd6e4a74b2f5bb5386658ce3bb146cd040a1867646ab3b973fb6632b1"
+  },
+  "pt8.row1": {
+   "dtype": "float32",
+   "shape": [
+    2
+   ],
+   "sha256": "986c627ee6ef1bcc3d746256a7045624ceeb44c4ed557ca055b2d43933de3489"
+  }
+ },
+ "fixtures": [
+  {
+   "file": "w_f32.npy",
+   "tool": "numpy",
+   "version": "2.5.4",
+   "tensors": [
+    "w_f32"
+   ],
+   "note": "single array; no name inside the file"
+  },
+  {
+   "file": "i_i32.tensor.json",
+   "tool": "python-json",
+   "version": "3.12",
+   "tensors": [
+    "i_i32"
+   ],
+   "note": "text; hash is the parsed canonical bytes, not the file bytes"
+  },
+  {
+   "file": "i_i32.tensor.csv",
+   "tool": "tensor-csv/1",
+   "version": "this spec",
+   "tensors": [
+    "i_i32"
+   ],
+   "note": "text; hash is the parsed canonical bytes, not the file bytes"
+  },
+  {
+   "file": "small.pt",
+   "tool": "torch",
+   "version": "2.14.1+cu130",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "e_bf16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "torch.save zip archive, distinct from small.bin"
+  },
+  {
+   "file": "small.onnx",
+   "tool": "onnx",
+   "version": "1.23.2",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "e_bf16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "graph initializers only; ir_version 10"
+  },
+  {
+   "file": "small.h5",
+   "tool": "h5py",
+   "version": "3.16.0",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "HDF5 2.0.0. e_bf16 omitted: h5py has no bfloat16 dtype id"
+  },
+  {
+   "file": "small.zarr/",
+   "tool": "zarr",
+   "version": "3.4.1",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "zarr_format 3 directory store. e_bf16 omitted"
+  },
+  {
+   "file": "small-v2.zarr/",
+   "tool": "zarr",
+   "version": "3.4.1",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "zarr_format 2 directory store. e_bf16 omitted"
+  },
+  {
+   "file": "small.mat",
+   "tool": "scipy",
+   "version": "1.18.1",
+   "tensors": [
+    "w_f32",
+    "i_i32"
+   ],
+   "note": "Level 5 via scipy.io.savemat format='5'. scipy wrote float16 back as float64 and the 0-d value as shape (1, 1), so b_f16 and s_f32 are absent. v7.3 was not written: scipy cannot write it, and the MATLAB_class layout is still MAT-Q1. e_bf16 omitted"
+  },
+  {
+   "file": "small.arrow",
+   "tool": "pyarrow",
+   "version": "26.0.0",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "e_bf16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "TensorTable: one row per tensor, data is canonical bytes"
+  },
+  {
+   "file": "small.parquet",
+   "tool": "pyarrow",
+   "version": "26.0.0",
+   "tensors": [
+    "w_f32",
+    "b_f16",
+    "e_bf16",
+    "i_i32",
+    "s_f32"
+   ],
+   "note": "same TensorTable written as Parquet"
+  },
+  {
+   "file": "small-gptq.safetensors",
+   "tool": "AutoGPTQ QuantLinear.pack",
+   "version": "9f7d37072917",
+   "tensors": [
+    "gptq.qweight",
+    "gptq.qzeros",
+    "gptq.scales",
+    "gptq.g_idx"
+   ],
+   "note": "pinned qlinear_cuda.py, bits=4, in=256, out=32, group=32. CUDA extension was not installed; pack() is numpy."
+  },
+  {
+   "file": "small-awq.safetensors",
+   "tool": "AutoAWQ WQLinear_GEMM.from_linear",
+   "version": "88e4c76b2075",
+   "tensors": [
+    "awq.qweight",
+    "awq.qzeros",
+    "awq.scales"
+   ],
+   "note": "pinned gemm.py, w_bit=4, in=64, out=32, group=64. CPU torch only."
+  },
+  {
+   "file": "small-bnb.safetensors",
+   "tool": "bitsandbytes",
+   "version": "0.50.2",
+   "tensors": [
+    "bnb.weight",
+    "bnb.absmax"
+   ],
+   "note": "quantize_4bit nf4, blocksize 64, 64 float32 values. PyPI wheel, not the spec pin 833649043474."
+  },
+  {
+   "file": "small-ct.safetensors",
+   "tool": "compressed-tensors pack_to_int32",
+   "version": "6b1309c9bd05",
+   "tensors": [
+    "ct.weight_packed"
+   ],
+   "note": "pinned helpers.py, num_bits=4, int8 codes packed on dim 1. CPU round trip matched."
+  }
+ ],
+ "not_written": [
+  {
+   "format": "mlx",
+   "reason": "pip mlx 0.32.4 installs core.cpython-312-x86_64-linux-gnu.so, and ldd reports libmlx.so not found. The wheel does not ship that library. The pinned mlx tree was not built."
+  },
+  {
+   "format": "exl2",
+   "reason": "adaptivegptq.pack at 7dc12af3a81f moves q_groups to cuda:0 and calls ext_c.pack_rows_4. No CUDA device is available, so no file was written."
+  }
+ ],
+ "review_fixtures": [
+  {
+   "file": "small-state-dict.pt",
+   "tool": "torch",
+   "version": "2.15.0+cpu",
+   "tensors": [
+    "sd.u16",
+    "sd.u32",
+    "sd.u64",
+    "sd.lin.weight",
+    "sd.lin.bias"
+   ],
+   "note": "torch.save(nn.Module.state_dict()). Pickle opcodes: BINGET BININT1 BINPERSID BINPUT BINUNICODE BUILD EMPTY_DICT EMPTY_TUPLE GLOBAL MARK NEWFALSE PROTO REDUCE SETITEM SETITEMS STOP TUPLE TUPLE1 TUPLE2. Keys in the file have no 'sd.' prefix; the prefix only names them in expected.json. _metadata == {'': {'version': 1}, 'lin': {'version': 1}}."
+  },
+  {
+   "file": "small-typed.onnx",
+   "tool": "onnx",
+   "version": "1.23.2",
+   "tensors": [
+    "onnx.t_f32",
+    "onnx.t_f16",
+    "onnx.t_i8",
+    "onnx.t_i32",
+    "onnx.t_i64",
+    "onnx.t_u32"
+   ],
+   "note": "initializers in typed fields, no raw_data: t_f32 float_data, t_f16 int32_data, t_i8 int32_data, t_i32 int32_data, t_i64 int64_data, t_u32 uint64_data. FLOAT16 stores the uint16 bit pattern per int32_data entry. Names in the file have no 'onnx.' prefix."
+  },
+  {
+   "file": "small-bnb-hf.safetensors",
+   "tool": "bitsandbytes",
+   "version": "0.50.2",
+   "tensors": [
+    "bnbhf.layer.weight",
+    "bnbhf.layer.weight.absmax",
+    "bnbhf.layer.weight.quant_map",
+    "bnbhf.layer.weight.quant_state.bitsandbytes__nf4"
+   ],
+   "note": "quantize_4bit nf4 blocksize 64 of an [8, 16] float32 weight. Keys are QuantState.as_dict(packed=True) joined as '<module>.weight.<key>', the loop in Linear4bit._save_to_state_dict at 833649043474. The packed U8 weight is [64, 1]; the logical shape [8, 16] is only in the quant_state JSON. Names in the file have no 'bnbhf.' prefix. PyPI wheel, not the spec pin."
+  },
+  {
+   "file": "small-ct-group.safetensors",
+   "tool": "compressed-tensors pack_to_int32",
+   "version": "6b1309c9bd05",
+   "tensors": [
+    "ctg.weight_packed",
+    "ctg.weight_scale",
+    "ctg.weight_shape"
+   ],
+   "note": "num_bits 4, symmetric, strategy group, group_size 8, weight [2, 16]. weight_scale BF16 [2, 2]. Names in the file are ct.*; expected.json uses ctg.* so they do not collide with small-ct.safetensors."
+  },
+  {
+   "file": "small-gptq-v2.safetensors",
+   "tool": "numpy (GPTQModel convert_gptq_v1_to_v2_format_module arithmetic)",
+   "version": "bbe3ae8d2a2f",
+   "tensors": [
+    "gptqv2.qweight",
+    "gptqv2.qzeros",
+    "gptqv2.scales",
+    "gptqv2.g_idx"
+   ],
+   "note": "qweight, scales, and g_idx are those of small-gptq.safetensors. qzeros holds the true zero point per nibble (v1 nibble + 1), which is the v1 words + 0x11111111 when no v1 nibble is 15. Names in the file are gptq.*. safetensors metadata checkpoint_format=gptq_v2 is informational; a reader takes the format from config.json."
+  },
+  {
+   "file": "small-ct-asym.safetensors",
+   "tool": "compressed-tensors pack_to_int32",
+   "version": "6b1309c9bd05",
+   "tensors": [
+    "cta.weight_packed",
+    "cta.weight_scale",
+    "cta.weight_zero_point",
+    "cta.weight_shape"
+   ],
+   "note": "num_bits 4, asymmetric, strategy group, group_size 8, weight [10, 32]. weight_zero_point is the int8 zero point [10, 4] packed with pack_to_int32(packed_dim=0): int32 [2, 4], rows 8 and 9 in the second row. Names in the file are ct.*; expected.json uses cta.*."
+  },
+  {
+   "file": "small-bnb-nested.safetensors",
+   "tool": "bitsandbytes",
+   "version": "0.50.2",
+   "tensors": [
+    "bnbn.layer.weight",
+    "bnbn.layer.weight.absmax",
+    "bnbn.layer.weight.quant_map",
+    "bnbn.layer.weight.nested_absmax",
+    "bnbn.layer.weight.nested_quant_map",
+    "bnbn.layer.weight.quant_state.bitsandbytes__nf4"
+   ],
+   "note": "quantize_4bit nf4 blocksize 64, compress_statistics=True, of a [16, 64] float32 weight. absmax is uint8 codes; nested_absmax and nested_quant_map are tensors; nested_blocksize, nested_dtype, and nested_offset are in the quant_state JSON. Key grammar as small-bnb-hf.safetensors. Names in the file have no 'bnbn.' prefix."
+  },
+  {
+   "file": "small-mlx-nvfp4-experts.safetensors",
+   "tool": "mlx",
+   "version": "0.32.4",
+   "tensors": [
+    "mlxe.weight",
+    "mlxe.scales",
+    "mlxe.global_scale"
+   ],
+   "note": "Two experts, [2, 16, 32] float32 quantized nvfp4 (group 16, bits 4) the way mlx-lm _quantize_experts does at ba8a08fd2ed7. weight uint32 [2, 16, 4], scales uint8 [2, 16, 2], global_scale float32 [2]. mx.save_safetensors with metadata format=mlx. PyPI wheel (CPU), not the spec pin. Names in the file are model.layers.0.mlp.switch_mlp.gate_proj.*."
+  },
+  {
+   "file": "small-ct-int8.safetensors",
+   "tool": "compressed-tensors IntQuantizationCompressor",
+   "version": "0.20.1",
+   "tensors": [
+    "cti.weight",
+    "cti.weight_scale"
+   ],
+   "note": "weight [6, 20] bf16 quantized by IntQuantizationCompressor.compress: weight stored as int8 [6, 20], weight_scale bf16 [6, 1]. No weight_shape, no packing, no code offset. Names in the file are ct.*; expected.json uses cti.*. PyPI wheel, not the spec pin."
+  },
+  {
+   "file": "small-ct-fp8-block.safetensors",
+   "tool": "compressed-tensors FloatQuantizationCompressor",
+   "version": "0.20.1",
+   "tensors": [
+    "ctf.weight",
+    "ctf.weight_scale"
+   ],
+   "note": "weight [6, 20] bf16 quantized by FloatQuantizationCompressor.compress: weight stored as float8_e4m3fn [6, 20], weight_scale bf16 [2, 3]. No weight_shape, no packing, no code offset. Names in the file are ct.*; expected.json uses ctf.*. PyPI wheel, not the spec pin."
+  },
+  {
+   "file": "small-pt-fp8.pt",
+   "tool": "torch",
+   "version": "2.15.0+cpu",
+   "tensors": [
+    "pt8.f8e4m3",
+    "pt8.f8e5m2",
+    "pt8.c64_conj",
+    "pt8.imag_neg",
+    "pt8.tied_a",
+    "pt8.tied_b",
+    "pt8.row1"
+   ],
+   "note": "torch.save of a dict. f8e4m3 [2, 3] and f8e5m2 [4] go through _rebuild_tensor_v3 with UntypedStorage (numel counts bytes) and no metadata argument. c64_conj is a conj view: _rebuild_tensor_v2 gets an 8th argument {'conj': True} and the stored bytes are the un-conjugated values; imag_neg is c.conj().imag: a float32 view (offset 1, stride 2) of a complex storage with metadata {'neg': True}. tied_a and tied_b are one tensor and row1 is a view of it: the three share one data/ record (5 records in all). Hashes are of the logical values (conj and neg applied, made contiguous), as torch.load returns them (PT-010, PT-011). Keys in the file have no 'pt8.' prefix."
+  }
+ ],
+ "dequantized": {
+  "small-bnb-hf.safetensors layer.weight": {
+   "dtype": "float32",
+   "shape": [
+    8,
+    16
+   ],
+   "sha256": "6b113ad885f567d3068afb64bfe3b057d036c5ecd23f4028231f3d951d3aa1c0",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "bitsandbytes.functional.dequantize_4bit 0.50.2",
+   "quant_state": {
+    "quant_type": "nf4",
+    "blocksize": 64,
+    "dtype": "float32",
+    "shape": [
+     8,
+     16
+    ]
+   }
+  },
+  "small-ct-group.safetensors ct.weight": {
+   "dtype": "bfloat16",
+   "shape": [
+    2,
+    16
+   ],
+   "sha256": "da0c182651926ed25fc1d67cd481f45e028d1b39974612675c7a2c22794859d0",
+   "tool": "compressed_tensors dequantize 0.20.1 (matches the formula)",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "config": {
+    "format": "pack-quantized",
+    "num_bits": 4,
+    "type": "int",
+    "symmetric": true,
+    "strategy": "group",
+    "group_size": 8
+   }
+  },
+  "small-gptq.safetensors": {
+   "dtype": "float32",
+   "shape": [
+    32,
+    256
+   ],
+   "sha256": "d8f5a0e9b1d3f2274abae5c85f923d64e98a5987a6420de071e2b82b0d7ff3c7",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "numpy port of dequant_gptq in llama.cpp conversion/base.py at 6050b467c07a (checkpoint_format gptq: zeros + 1)"
+  },
+  "small-gptq-v2.safetensors": {
+   "dtype": "float32",
+   "shape": [
+    32,
+    256
+   ],
+   "sha256": "d8f5a0e9b1d3f2274abae5c85f923d64e98a5987a6420de071e2b82b0d7ff3c7",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "GPTQModel dequantize_weight formula at bbe3ae8d2a2f, scales[g] * (q - z[g]) with no + 1. Equal to the small-gptq.safetensors entry.",
+   "config": {
+    "bits": 4,
+    "group_size": 32,
+    "checkpoint_format": "gptq_v2"
+   }
+  },
+  "small-awq.safetensors": {
+   "dtype": "float32",
+   "shape": [
+    32,
+    64
+   ],
+   "sha256": "1a6890a98153c3285b180f78ef2851bef1b28d1eeade6bc674ec080fa64a08dd",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "AutoAWQ awq/utils/packing_utils.py dequantize_gemm at 88e4c76b2075, transposed. That function returns [in_features, out_features].",
+   "dequantize_gemm_sha256": "3baa6e694997160098aeec5108686daffdf9ddaa4a50c4801d1aef491e9b784d",
+   "dequantize_gemm_shape": [
+    64,
+    32
+   ]
+  },
+  "small-bnb.safetensors": {
+   "dtype": "float32",
+   "shape": [
+    64
+   ],
+   "sha256": "5e15360fc371dffc902c6f86e367080acef99dfbdbfbe1d6ee1fb403afd79033",
+   "orientation": "1-D, no axes to order",
+   "tool": "bitsandbytes.functional.dequantize_4bit 0.50.2 with quant_type nf4, blocksize 64, shape [64]. The file has no quant_state, so these are passed in."
+  },
+  "small-ct.safetensors": {
+   "not_applicable": "the file holds int8 codes packed by pack_to_int32 and no weight_scale. Use small-ct-group.safetensors."
+  },
+  "small-ct-asym.safetensors ct.weight": {
+   "dtype": "bfloat16",
+   "shape": [
+    10,
+    32
+   ],
+   "sha256": "c6d57fa33549fe682a0ad48abd418729aa0775fca2c23137dfa6f4bcbafb9d76",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "compressed_tensors PackedQuantizationCompressor.decompress 0.20.1 on the file (matches the formula)",
+   "config": {
+    "format": "pack-quantized",
+    "num_bits": 4,
+    "type": "int",
+    "symmetric": false,
+    "strategy": "group",
+    "group_size": 8
+   }
+  },
+  "small-bnb-nested.safetensors layer.weight": {
+   "dtype": "float32",
+   "shape": [
+    16,
+    64
+   ],
+   "sha256": "a382e0b7831c7a1d897f04b608125b724b623ab6db723eb9091965795f412f99",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "bitsandbytes QuantState.from_dict on the file, then dequantize_4bit 0.50.2",
+   "quant_state": {
+    "quant_type": "nf4",
+    "blocksize": 64,
+    "dtype": "float32",
+    "shape": [
+     16,
+     64
+    ],
+    "nested_blocksize": 256,
+    "nested_dtype": "float32",
+    "nested_offset": 2.8386151790618896
+   }
+  },
+  "small-mlx-nvfp4-experts.safetensors model.layers.0.mlp.switch_mlp.gate_proj.weight": {
+   "dtype": "float32",
+   "shape": [
+    2,
+    16,
+    32
+   ],
+   "sha256": "a968c14cfebc5f25c480a5eb130c55b5fae488c5a6d8d4a592c21d693ec7e608",
+   "orientation": "[num_experts, out_features, in_features]; expert e is [out_features, in_features] (CONV-003)",
+   "tool": "mlx 0.32.4 mx.dequantize per expert with global_scale[e] (a vector global_scale is refused)",
+   "config": {
+    "quantization": {
+     "group_size": 16,
+     "bits": 4,
+     "mode": "nvfp4",
+     "model.layers.0.mlp.switch_mlp.gate_proj": {
+      "group_size": 16,
+      "bits": 4,
+      "mode": "nvfp4",
+      "global_scale": true
+     }
+    }
+   }
+  },
+  "small-ct-int8.safetensors ct.weight": {
+   "dtype": "bfloat16",
+   "shape": [
+    6,
+    20
+   ],
+   "sha256": "1edab1eb0fee30f076031544cc95703a9d027de1bc8dfb63aaf4f7f07793b26b",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "compressed_tensors IntQuantizationCompressor.decompress 0.20.1 on the file (matches the formula)",
+   "config": {
+    "format": "int-quantized",
+    "num_bits": 8,
+    "type": "int",
+    "symmetric": true,
+    "strategy": "channel"
+   }
+  },
+  "small-ct-fp8-block.safetensors ct.weight": {
+   "dtype": "bfloat16",
+   "shape": [
+    6,
+    20
+   ],
+   "sha256": "85a7294342905b00dcef92bd1f8965f73a97e436f3ad4e655b5d3587d14a2b77",
+   "orientation": "[out_features, in_features] (CONV-003)",
+   "tool": "compressed_tensors FloatQuantizationCompressor.decompress 0.20.1 on the file (matches the formula)",
+   "config": {
+    "format": "float-quantized",
+    "num_bits": 8,
+    "type": "float",
+    "symmetric": true,
+    "strategy": "block",
+    "block_structure": [
+     4,
+     8
+    ]
+   }
+  }
+ }
+}

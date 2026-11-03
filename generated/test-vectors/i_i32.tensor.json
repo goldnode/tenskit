@@ -1,0 +1,25 @@
+{
+ "format": "tensor-json",
+ "version": 1,
+ "name": "i_i32",
+ "dtype": "int32",
+ "shape": [
+  3,
+  2
+ ],
+ "order": "C",
+ "data": [
+  [
+   0,
+   1
+  ],
+  [
+   2,
+   3
+  ],
+  [
+   4,
+   5
+  ]
+ ]
+}
