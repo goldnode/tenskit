@@ -1,0 +1,142 @@
+name: Release
+
+# A v* tag builds, tests and publishes. Running this by hand from the Actions tab
+# does everything except publish, as a dry run.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: 2.48.0
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: amd64
+            nfpm_asset: Linux_x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: arm64
+            nfpm_asset: Linux_arm64
+    env:
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Install nFPM
+        env:
+          ASSET: nfpm_${{ env.NFPM_VERSION }}_${{ matrix.nfpm_asset }}.tar.gz
+        run: |
+          base="https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION"
+          curl -fsSLO "$base/$ASSET"
+          curl -fsSLO "$base/checksums.txt"
+          grep " $ASSET\$" checksums.txt | sha256sum -c -
+          tar -xzf "$ASSET" -C "$RUNNER_TEMP" nfpm
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          rm "$ASSET" checksums.txt
+
+      - name: Package
+        run: bash packaging/package.sh ${{ matrix.target }} ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  smoke:
+    name: Install on ${{ matrix.image }} (${{ matrix.runner }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        image:
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - ubuntu:26.04
+          - registry.access.redhat.com/ubi9/ubi
+          - registry.access.redhat.com/ubi10/ubi
+          - fedora:latest
+          - opensuse/leap:16.0
+          - opensuse/tumbleweed:latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install and check
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker run --rm -v "$PWD:/src:ro" -w /src "$IMAGE" sh packaging/smoke-test.sh dist
+
+  publish:
+    name: Publish
+    needs: [build, smoke]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.deb *.rpm *.tar.gz > SHA256SUMS
+
+      - uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "tenskit ${GITHUB_REF_NAME#v}"

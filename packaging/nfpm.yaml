@@ -1,0 +1,61 @@
+# One config for the .deb and the .rpm. Run through packaging/package.sh, which
+# sets ARCH and VERSION and fills target/package-stage.
+name: tenskit
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: utils
+priority: optional
+maintainer: Nick Reynolds <pkgs@goldnode.org>
+description: Utilities to inspect, edit, compare, convert, and quantize tensor container files
+homepage: https://tenskit.org
+license: MIT
+
+contents:
+  - src: target/package-stage/bin/tenspile
+    dst: /usr/bin/tenspile
+    file_info: {mode: 0755}
+  - src: target/package-stage/bin/tensinfo
+    dst: /usr/bin/tensinfo
+    file_info: {mode: 0755}
+  - src: target/package-stage/bin/tensdiff
+    dst: /usr/bin/tensdiff
+    file_info: {mode: 0755}
+  - src: target/package-stage/bin/tensconv
+    dst: /usr/bin/tensconv
+    file_info: {mode: 0755}
+  - src: target/package-stage/bin/tensquant
+    dst: /usr/bin/tensquant
+    file_info: {mode: 0755}
+
+  - src: target/package-stage/man/tenspile.1.gz
+    dst: /usr/share/man/man1/tenspile.1.gz
+    file_info: {mode: 0644}
+  - src: target/package-stage/man/tensinfo.1.gz
+    dst: /usr/share/man/man1/tensinfo.1.gz
+    file_info: {mode: 0644}
+  - src: target/package-stage/man/tensdiff.1.gz
+    dst: /usr/share/man/man1/tensdiff.1.gz
+    file_info: {mode: 0644}
+  - src: target/package-stage/man/tensconv.1.gz
+    dst: /usr/share/man/man1/tensconv.1.gz
+    file_info: {mode: 0644}
+  - src: target/package-stage/man/tensquant.1.gz
+    dst: /usr/share/man/man1/tensquant.1.gz
+    file_info: {mode: 0644}
+
+  - src: README.md
+    dst: /usr/share/doc/tenskit/README.md
+    file_info: {mode: 0644}
+
+  # Each format has its own place for the license.
+  - src: LICENSE
+    dst: /usr/share/doc/tenskit/copyright
+    packager: deb
+    file_info: {mode: 0644}
+  - src: LICENSE
+    dst: /usr/share/licenses/tenskit/LICENSE
+    type: license
+    packager: rpm
+    file_info: {mode: 0644}
