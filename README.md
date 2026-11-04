@@ -27,6 +27,14 @@ tenskit has five utilities, which share one library:
 
 `cargo build --release` builds all five. Each takes `-h` for a short help. Section 1 manual pages are in [man/](man/). The build copies them to `target/release/share/man/man1` (or the debug directory) with the version from `Cargo.toml` filled in, so `MANPATH=target/release/share/man man tenspile` shows one.
 
+## Install
+
+Binaries for Linux on 64-bit Intel and ARM are available from the [Releases](https://github.com/goldnode/tenskit/releases) page. macOS and Windows to follow.
+
+On Linux, packages can also be installed and updated using your OS tools, such as `apt`, `dnf`, and `zypper`. See [packages.goldnode.org](https://packages.goldnode.org/) for how to set this up.
+
+[Installing tenskit](docs/install.md) has detailed instructions, including how to install without root and how to clone and build with Cargo.
+
 ## Documentation
 
 Start with [Getting started](docs/getting-started.md), a five-minute walk-through on the small files that come with the specs.
