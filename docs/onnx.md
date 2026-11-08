@@ -58,7 +58,7 @@ data_bytes: 1024
 metadata:
   producer=demo
 dtypes:
-  float32	1	256
+  F32	1	256
 ```
 
 tenskit does not write external data. A model of 2 GiB or more is refused (ONNX-006).

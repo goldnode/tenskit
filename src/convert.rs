@@ -186,7 +186,8 @@ fn load_tensors(archive: &Archive) -> Result<Vec<Tensor>> {
                 member.name
             )));
         }
-        let canonical = dtype::canonical_id(&member.dtype)?;
+        let canonical = dtype::canonical_id(&member.dtype)
+            .map_err(|err| msg(format!("tensor {}: {err}", member.name)))?;
         if dtype::canon_kind(canonical) == Some("block") {
             return Err(msg(format!(
                 "tensor {} is quantized; dequantize it with tensquant",
@@ -2444,7 +2445,6 @@ mod tests {
         let record = |class: &str, hooks: &[&str], filter: Option<(bool, &[&str])>| ConverterRecord {
             class: class.into(),
             hf_architectures: Vec::new(),
-            undo_permute: false,
             complete: true,
             unexpanded: Vec::new(),
             branches: Vec::new(),
@@ -2513,7 +2513,6 @@ mod tests {
         let record = |class: &str| ConverterRecord {
             class: class.into(),
             hf_architectures: Vec::new(),
-            undo_permute: true,
             complete: false,
             unexpanded: Vec::new(),
             branches: Vec::new(),

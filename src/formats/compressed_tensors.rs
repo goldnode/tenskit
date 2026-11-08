@@ -1,9 +1,7 @@
 //! compressed-tensors pack names.
 //!
 //! `weight_packed` stays a packed integer tensor. ModelOpt nibble order is an
-//! open question in the spec and is not invented here. Remove this file and
-//! the `compressed-tensors` line in `local/supported-formats.txt` to drop the
-//! format.
+//! open question in the spec and is not invented here.
 
 /// `weight_packed`, and the tensors stored beside it for the same module
 /// (compressed-tensors.yaml `hierarchical_names`).

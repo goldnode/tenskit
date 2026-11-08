@@ -1,8 +1,6 @@
 //! AWQ GEMM names inside a container.
 //!
 //! Bytes stay packed. A group that also has `g_idx` is GPTQ, not this pack.
-//! Remove this file and the `awq` line in `local/supported-formats.txt` to
-//! drop the format.
 
 pub fn detail(name: &str, peers: &[&str]) -> Option<&'static str> {
     let (prefix, suffix) = name.rsplit_once('.')?;

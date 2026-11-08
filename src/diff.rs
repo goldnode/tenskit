@@ -627,28 +627,37 @@ fn order_word(fortran: bool) -> String {
     }
 }
 
+/// The first byte offset where the two payloads differ. Each side is read
+/// once, front to back, through one open reader.
 fn first_mismatch(left: &Payload, right: &Payload) -> Result<Option<u64>> {
     let shared = left.len().min(right.len());
-    let mut at = 0u64;
-    let mut left_buf = vec![0u8; CHUNK];
-    let mut right_buf = vec![0u8; CHUNK];
-    while at < shared {
-        let take = ((shared - at) as usize).min(CHUNK);
-        left.read_at(at, &mut left_buf[..take])?;
-        right.read_at(at, &mut right_buf[..take])?;
-        if let Some(index) = left_buf[..take]
-            .iter()
-            .zip(&right_buf[..take])
-            .position(|(lhs, rhs)| lhs != rhs)
-        {
-            return Ok(Some(at + index as u64));
-        }
-        at += take as u64;
-    }
-    if left.len() != right.len() {
+    let found = left.with_reader(|lhs| {
+        right.with_reader(|rhs| {
+            let mut at = 0u64;
+            let mut left_buf = vec![0u8; CHUNK];
+            let mut right_buf = vec![0u8; CHUNK];
+            while at < shared {
+                let take = ((shared - at) as usize).min(CHUNK);
+                lhs.read_exact(&mut left_buf[..take])
+                    .map_err(|err| msg(format!("left payload ends early at byte {at}: {err}")))?;
+                rhs.read_exact(&mut right_buf[..take])
+                    .map_err(|err| msg(format!("right payload ends early at byte {at}: {err}")))?;
+                if let Some(index) = left_buf[..take]
+                    .iter()
+                    .zip(&right_buf[..take])
+                    .position(|(a, b)| a != b)
+                {
+                    return Ok(Some(at + index as u64));
+                }
+                at += take as u64;
+            }
+            Ok(None)
+        })
+    })?;
+    if found.is_none() && left.len() != right.len() {
         return Ok(Some(shared));
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn push_metadata(findings: &mut Vec<Finding>, left: &Archive, right: &Archive) {
@@ -927,6 +936,44 @@ mod tests {
     use super::*;
     use crate::formats::safetensors::{self, OutTensor};
     use crate::payload::Payload;
+
+    /// first_mismatch reads each side once through one reader. A deflated
+    /// npz member used to be re-inflated from its start for every chunk.
+    #[cfg(format_npz)]
+    #[test]
+    fn first_mismatch_streams_multi_chunk_payloads() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let len = CHUNK * 3 + 17;
+        let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+        let mut changed = data.clone();
+        let at = CHUNK * 2 + 5;
+        changed[at] ^= 0xff;
+
+        let zip_path = dir.path().join("a.npz");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in [("same.npy", &data), ("changed.npy", &changed)] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(b"HDR").unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+        let member = |entry: &str| Payload::Zip { path: zip_path.clone(), entry: entry.into(), skip: 3, len: len as u64 };
+
+        let raw_path = dir.path().join("raw.bin");
+        std::fs::write(&raw_path, [b"xxxx".as_slice(), &data].concat()).unwrap();
+        let range = Payload::Range { path: raw_path, offset: 4, len: len as u64 };
+
+        assert_eq!(first_mismatch(&member("same.npy"), &range).unwrap(), None);
+        assert_eq!(first_mismatch(&member("same.npy"), &Payload::Bytes(data.clone())).unwrap(), None);
+        assert_eq!(first_mismatch(&member("same.npy"), &member("changed.npy")).unwrap(), Some(at as u64));
+        assert_eq!(first_mismatch(&range, &member("changed.npy")).unwrap(), Some(at as u64));
+        // Equal up to the shorter length: the mismatch is at that length.
+        let short = Payload::Bytes(data[..CHUNK + 1].to_vec());
+        assert_eq!(first_mismatch(&member("same.npy"), &short).unwrap(), Some(CHUNK as u64 + 1));
+        assert_eq!(first_mismatch(&short, &range).unwrap(), Some(CHUNK as u64 + 1));
+    }
 
     fn f32_tensor(name: &str, values: &[f32]) -> OutTensor {
         let mut bytes = Vec::new();

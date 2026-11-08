@@ -1,7 +1,6 @@
 //! bitsandbytes 4-bit quant state stored as tensors.
 //!
-//! The packed codes stay packed. Remove this file and the `bitsandbytes` line
-//! in `local/supported-formats.txt` to drop the format.
+//! The packed codes stay packed.
 
 pub fn detail(name: &str, peers: &[&str]) -> Option<&'static str> {
     if name.contains("bitsandbytes__") {

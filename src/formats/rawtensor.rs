@@ -448,7 +448,9 @@ pub fn to_out(
     payload: &Payload,
     fortran: bool,
 ) -> Result<OutTensor> {
-    let canonical = canonical_id(dtype)?.to_string();
+    let canonical = canonical_id(dtype)
+        .map_err(|err| msg(format!("member {name}: {err}")))?
+        .to_string();
     Ok(OutTensor {
         name: name.to_string(),
         canonical,

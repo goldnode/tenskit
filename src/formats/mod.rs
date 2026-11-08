@@ -1,8 +1,6 @@
-//! One module per format. `build.rs` includes only the ids listed in
-//! `local/supported-formats.txt` (recorded in `generated/formats.txt` for a
-//! clone without it), so deleting a line there drops that format from the
-//! build. Deleting the matching file under `src/formats/` then
-//! removes it from the source tree as well.
+//! One module per format. The formats compiled in are the `+` lines of
+//! `generated/formats.txt`. `generated/enabled_formats.rs` declares their
+//! modules, and `build.rs` sets a `format_<id>` cfg for each.
 
 include!("../../generated/enabled_formats.rs");
 
@@ -13,18 +11,18 @@ mod tests {
         let text = include_str!("../../generated/formats.txt");
         let ids: Vec<&str> = text.lines().filter_map(|line| line.strip_prefix("+ ")).collect();
         assert_eq!(ids, super::ENABLED_IDS);
-        // local/supported-formats.txt is not in every clone; when it is, the
-        // generated list must follow it.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("local/supported-formats.txt");
-        let Ok(text) = std::fs::read_to_string(path) else { return };
-        let mut ids = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.ends_with(':') {
-                continue;
-            }
-            ids.push(line);
-        }
-        assert_eq!(ids, super::ENABLED_IDS);
+    }
+
+    /// build.rs keeps its own list for the `format_<id>` cfgs; it must name
+    /// the same formats, in the same order, with `-` written as `_`.
+    #[test]
+    fn build_rs_enables_the_same_formats() {
+        let build = include_str!("../../build.rs");
+        let start = build.find("const ENABLED_FORMATS").expect("build.rs has ENABLED_FORMATS");
+        let list = &build[start..];
+        let list = &list[list.find("= &[").unwrap() + 4..list.find("];").unwrap()];
+        let cfgs: Vec<&str> = list.split(',').map(|item| item.trim().trim_matches('"')).filter(|item| !item.is_empty()).collect();
+        let expected: Vec<String> = super::ENABLED_IDS.iter().map(|id| id.replace('-', "_")).collect();
+        assert_eq!(cfgs, expected);
     }
 }

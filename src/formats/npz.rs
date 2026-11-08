@@ -176,6 +176,27 @@ pub fn copy_entry(
     len: u64,
     out: &mut impl Write,
 ) -> Result<()> {
+    with_entry_reader(path, zip_name, skip, len, |payload| {
+        let copied = std::io::copy(payload, out)?;
+        if copied != len {
+            return Err(msg(format!(
+                "{zip_name}: expected {len} payload bytes, read {copied}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Call `f` with a reader over the `len` payload bytes that follow the
+/// `skip` header bytes of `zip_name`. The entry is opened and inflated once,
+/// so a caller that reads it front to back does linear work.
+pub fn with_entry_reader<T>(
+    path: &Path,
+    zip_name: &str,
+    skip: u64,
+    len: u64,
+    f: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<T> {
     let file = File::open(path).map_err(|err| io_err(path, err))?;
     let mut archive =
         ZipArchive::new(file).map_err(|err| msg(format!("{}: {err}", path.display())))?;
@@ -186,13 +207,7 @@ pub fn copy_entry(
     if discarded != skip {
         return Err(msg(format!("{zip_name}: short npy header")));
     }
-    let copied = std::io::copy(&mut (&mut entry).take(len), out)?;
-    if copied != len {
-        return Err(msg(format!(
-            "{zip_name}: expected {len} payload bytes, read {copied}"
-        )));
-    }
-    Ok(())
+    f(&mut (&mut entry).take(len))
 }
 
 pub enum NpzMemberBody {

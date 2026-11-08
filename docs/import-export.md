@@ -14,7 +14,7 @@ Byte layouts, dtype codes, and validation rules are in the format specifications
 
 `version` on `-i` is the file's own format version when it has one: `2` or `3` for little-endian GGUF, `1.0`, `2.0`, or `3.0` for `.npy`, `1` for rawtensor, the text of the pytorch `version` record, and `ir N` for ONNX. The other labels are tenspile's: `header+blob`, `index`, and `zip`.
 
-Which formats exist in a build is [local/supported-formats.txt](../local/supported-formats.txt). A format left out of that file is not compiled in.
+Which formats exist in a build is listed in [generated/formats.txt](../generated/formats.txt): `+` is compiled in, `-` is not.
 
 ## Operands
 

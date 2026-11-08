@@ -2,8 +2,7 @@
 //!
 //! Loading uses a restricted unpickler: a global outside the tensor rebuild
 //! allowlist is rejected, and no code from the file runs. Legacy pickle streams
-//! and the old tar container are recognized and refused. Remove this file and
-//! the `pytorch` line in `local/supported-formats.txt` to drop the format.
+//! and the old tar container are recognized and refused.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;

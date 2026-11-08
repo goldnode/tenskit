@@ -29,7 +29,32 @@ pub fn safe_dtype(name: &str) -> Result<SafeDtype> {
         .iter()
         .find(|row| row.name == name || row.canonical == name)
         .map(row_to_safe)
-        .ok_or_else(|| msg(format!("unknown safetensors dtype {name}")))
+        .ok_or_else(|| unknown(name, "unknown safetensors dtype"))
+}
+
+/// The byte width of a numpy void descr such as `<V2` or `|V1` (npy.yaml:
+/// raw bytes with no type, no canonical dtype), or None for any other name.
+pub fn numpy_void_width(name: &str) -> Option<&str> {
+    name.strip_prefix(['<', '>', '|', '='])
+        .and_then(|rest| rest.strip_prefix('V'))
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The error for a dtype name that has no row. A numpy void descr (`<V2`,
+/// `|V1`) gets an explanation: npy.yaml gives it no canonical dtype, because
+/// it is raw bytes whose type the file does not record.
+fn unknown(name: &str, what: &str) -> crate::error::Error {
+    match numpy_void_width(name) {
+        Some(width) => {
+            let unit = if width == "1" { "byte" } else { "bytes" };
+            msg(format!(
+                "dtype {name} is a numpy void type: {width} raw {unit} per element, and the file does not \
+                 say what they are (ml_dtypes saves bfloat16 as <V2, and float8 and int4 as <V1), so it has \
+                 no canonical dtype"
+            ))
+        }
+        None => msg(format!("{what} {name}")),
+    }
 }
 
 /// The name tenspile lists for a member dtype. PyTorch, ONNX, and rawtensor
@@ -59,7 +84,7 @@ pub fn canonical_id(name: &str) -> Result<&'static str> {
     if CANON.iter().any(|row| row.id == name) {
         return Ok(CANON.iter().find(|row| row.id == name).unwrap().id);
     }
-    Err(msg(format!("unknown dtype {name}")))
+    Err(unknown(name, "unknown dtype"))
 }
 
 /// Byte length of a canonical tensor. Block dtypes use the last axis as the block axis.
@@ -270,6 +295,21 @@ pub fn ggml_payload_bytes(id: u32, shape: &[u64]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// npy.yaml: a void descr has no canonical dtype; say why, not just "unknown".
+    #[test]
+    fn a_numpy_void_dtype_is_explained() {
+        let text = |result: Result<&str>| result.unwrap_err().to_string();
+        let v2 = text(canonical_id("<V2"));
+        assert!(v2.contains("<V2 is a numpy void type: 2 raw bytes per element"), "{v2}");
+        assert!(v2.contains("no canonical dtype"), "{v2}");
+        let v1 = text(safe_dtype("|V1").map(|row| row.name));
+        assert!(v1.contains("|V1 is a numpy void type: 1 raw byte per element"), "{v1}");
+        assert_eq!(text(canonical_id("<V")), "unknown dtype <V");
+        assert_eq!(text(canonical_id("<V2x")), "unknown dtype <V2x");
+        assert_eq!(text(canonical_id("nonsense")), "unknown dtype nonsense");
+        assert_eq!(text(safe_dtype("nonsense").map(|row| row.name)), "unknown safetensors dtype nonsense");
+    }
 
     #[test]
     fn packed_f4_needs_an_even_nibble_count() {

@@ -3,8 +3,6 @@
 //!
 //! `<V2` in npy is a void descr. The npy spec says that is ambiguous, so the
 //! dtype is left unchanged and `-i` records that MLX would call it bfloat16.
-//! Remove this file and the `mlx` line in `local/supported-formats.txt` to
-//! drop the format.
 
 pub fn void_note(descr: &str) -> Option<&'static str> {
     if descr.contains('V') {

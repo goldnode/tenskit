@@ -1,7 +1,7 @@
 //! GGML block dequantization from `formats/gguf.yaml` `dtypes[].dequantize`.
 //!
 //! Q8_1 is marked inferred and is refused. Lookup grids are the Rust arrays
-//! `build.rs` generates from `tables/ggml-lookup-tables.json`.
+//! generated from `tables/ggml-lookup-tables.json`.
 
 use crate::dtype::{self, ggml_row};
 use crate::error::{msg, Result};
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn the_generated_grids_are_the_spec_table() {
-        let Some(expected) = crate::spec_expected::load("ggml-lookup-tables.json") else { return };
+        let expected = crate::spec_expected::load("ggml-lookup-tables.json");
         let g = grids();
         let list = |values: &[f32]| serde_json::json!({ "values": values.iter().map(|v| *v as i64).collect::<Vec<_>>() });
         let ints = |values: &[u32]| serde_json::json!({ "values": values });

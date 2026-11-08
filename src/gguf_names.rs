@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use crate::archive::Archive;
 
 /// One architecture: the Hugging Face pattern to GGUF pattern pairs and the
-/// role to GGUF pattern list, resolved by `build.rs` from `mappings`,
+/// role to GGUF pattern list, resolved when generated from `mappings`,
 /// `block_mappings`, and this architecture's `overrides` (rows whose tensor
 /// is one of its roles, last write winning), and its converter records.
 pub(crate) struct ArchTable {
@@ -43,6 +43,10 @@ impl Pairs {
 pub(crate) struct ConverterSpec {
     pub(crate) class: &'static str,
     pub(crate) hf_architectures: &'static [&'static str],
+    /// Kept so the table matches the spec (the round-trip test reads it).
+    /// Never use it to decide a permutation: only LlamaModel is transcribed
+    /// (GGUF-030), and the other classes that set it must be refused.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) undo_permute: Option<bool>,
     pub(crate) modify: ModifySpec,
     pub(crate) filter: Option<FilterSpec>,
@@ -190,7 +194,6 @@ pub struct TensorBranch {
 pub struct ConverterRecord {
     pub class: String,
     pub hf_architectures: Vec<String>,
-    pub undo_permute: bool,
     pub complete: bool,
     pub unexpanded: Vec<String>,
     pub branches: Vec<TensorBranch>,
@@ -266,7 +269,6 @@ pub fn converter_records(arch: &str) -> Vec<ConverterRecord> {
             ConverterRecord {
                 class: item.class.to_string(),
                 hf_architectures: owned(item.hf_architectures),
-                undo_permute: item.undo_permute.unwrap_or(false),
                 complete: item.modify.complete,
                 unexpanded: owned(item.modify.unexpanded.unwrap_or_default()),
                 branches: item
@@ -593,7 +595,7 @@ mod tests {
     /// value and in order.
     #[test]
     fn the_generated_roles_are_the_spec_table() {
-        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        let expected = crate::spec_expected::load("gguf-tensor-roles.json");
         let spec_arches = expected["architectures"].as_object().unwrap();
         let mut ids: Vec<&str> = spec_arches.keys().map(String::as_str).collect();
         ids.sort();
@@ -647,7 +649,7 @@ mod tests {
     /// same entries.
     #[test]
     fn the_generated_catalog_matches_the_old_loader() {
-        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        let expected = crate::spec_expected::load("gguf-tensor-roles.json");
         type Row = (String, String, Vec<String>);
         let rows = |value: &Value| -> Vec<Row> {
             value.as_array().unwrap().iter().map(|row| (
@@ -697,7 +699,7 @@ mod tests {
     /// first architecture in the spec's order whose converters list it.
     #[test]
     fn the_class_index_matches_the_old_scan() {
-        let Some(expected) = crate::spec_expected::load("gguf-tensor-roles.json") else { return };
+        let expected = crate::spec_expected::load("gguf-tensor-roles.json");
         let mut classes = std::collections::BTreeSet::new();
         let old_scan = |class: &str| -> Option<String> {
             for (arch, entry) in expected["architectures"].as_object().unwrap() {

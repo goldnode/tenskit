@@ -461,8 +461,8 @@ Options:
   -C, --directory DIR       Directory for extracted files (default: .).
   -o, --output FILE         Write the new archive here instead of replacing -f.
   --format NAME             Container to read or write. This build's names are
-                            printed when the name is unknown. Which formats are
-                            compiled in is local/supported-formats.txt.
+                            printed when the name is unknown. The source tree
+                            lists the formats compiled in at generated/formats.txt.
                             raw is rawtensor/1 (a .rawtensor.json manifest plus a .bin).
   --dtype NAME              Dtype for a headerless input file (safetensors name or canonical id).
   --shape LIST              Shape for a headerless input, for example 2,2 or [2, 2].

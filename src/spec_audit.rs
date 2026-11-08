@@ -985,6 +985,41 @@ fn a_fortran_order_member_extracts_to_npy_as_stored() {
     assert_eq!(member.payload.read_vec().unwrap(), data);
 }
 
+/// npy.yaml: a void descr such as `<V2` (bfloat16 from ml_dtypes) has no
+/// canonical dtype, but an npz member is an .npy file, so extracting it to
+/// .npy or .npz copies it as stored. Formats that need a type still refuse.
+#[cfg(all(format_npz, format_npy, format_safetensors, format_raw_sidecar))]
+#[test]
+fn a_void_member_extracts_to_npy_and_npz_as_stored() {
+    use std::io::Read;
+    let source = vectors().join("small.npz");
+    let stored = {
+        let mut zip = zip::ZipArchive::new(fs::File::open(&source).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        zip.by_name("e_bf16.npy").unwrap().read_to_end(&mut bytes).unwrap();
+        bytes
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let src = source.display().to_string();
+    crate::run(&["-xf".into(), src.clone(), "-C".into(), dir.path().display().to_string(), "e_bf16".into()]).unwrap();
+    assert_eq!(fs::read(dir.path().join("e_bf16.npy")).unwrap(), stored);
+
+    let npz = dir.path().join("again.npz");
+    crate::run(&["-xf".into(), src.clone(), "--format".into(), "npz".into(), "-o".into(), npz.display().to_string()]).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(&npz).unwrap()).unwrap();
+    let mut again = Vec::new();
+    zip.by_name("e_bf16.npy").unwrap().read_to_end(&mut again).unwrap();
+    assert_eq!(again, stored);
+
+    for (format, out) in [("safetensors", "x.safetensors"), ("raw", "x.rawtensor.json")] {
+        let out = dir.path().join(out).display().to_string();
+        let err = crate::run(&["-xf".into(), src.clone(), "--format".into(), format.into(), "-o".into(), out, "e_bf16".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("member e_bf16: dtype <V2 is a numpy void type"), "{format}: {err}");
+    }
+}
+
 #[cfg(all(format_mlx, format_npz, format_safetensors))]
 #[test]
 fn the_mlx_void_note_is_only_for_a_void_descr() {

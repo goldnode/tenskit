@@ -20,14 +20,14 @@ That covers a bare pickle stream (detected by its 14-byte prefix) and the tar co
 ```
 $ tenspile -tvf small.pt
 name	dtype	shape	bytes	offset	params	shard	detail
-w_f32	float32	[4, 64]	1024	1024	256	-	-
-b_f16	float16	[8]	16	2112	8	-	-
-e_bf16	bfloat16	[2, 3]	12	2240	6	-	-
-i_i32	int32	[3, 2]	24	2368	6	-	-
-s_f32	float32	[]	4	2496	1	-	-
+w_f32	F32	[4, 64]	1024	1024	256	-	-
+b_f16	F16	[8]	16	2112	8	-	-
+e_bf16	BF16	[2, 3]	12	2240	6	-	-
+i_i32	I32	[3, 2]	24	2368	6	-	-
+s_f32	F32	[]	4	2496	1	-	-
 ```
 
-dtypes are canonical ids. `offset` is where the tensor's bytes start in the zip, inside its `data/<key>` record.
+A dtype is listed by its safetensors name, such as `F16`, when it has one, and otherwise by its canonical id. `offset` is where the tensor's bytes start in the zip, inside its `data/<key>` record.
 
 - **Names:** a tensor's name is its path in the pickled object, joined with `.` (PT-012). A string key is used as it is, and an integer key or a list index is its number. So `{'state_dict': {'w': …}}` lists as `state_dict.w`, and an Adam optimizer's state lists as `optimizer.state.0.exp_avg`.
 - **Unnamed tensors:** a tensor reached through any other kind of key, such as `None` or a tuple, has no name. A note gives its path, dtype, and shape, for example `the tensor at root[None] (float32 [2]) has no name`. It is not listed or extracted, and an edit keeps it as stored.
@@ -42,13 +42,13 @@ dtypes are canonical ids. `offset` is where the tensor's bytes start in the zip,
 ```
 $ tenspile -tvf small-pt-fp8.pt
 name	dtype	shape	bytes	offset	params	shard	detail
-f8e4m3	float8_e4m3fn	[2, 3]	6	1216	6	-	-
-f8e5m2	float8_e5m2	[4]	4	1344	4	-	-
-c64_conj	complex64	[2]	16	0	2	-	-
-imag_neg	float32	[2]	8	0	2	-	-
-tied_a	float32	[2, 2]	16	1728	4	-	-
-tied_b	float32	[2, 2]	16	1728	4	-	-
-row1	float32	[2]	8	1736	2	-	-
+f8e4m3	F8_E4M3	[2, 3]	6	1216	6	-	-
+f8e5m2	F8_E5M2	[4]	4	1344	4	-	-
+c64_conj	C64	[2]	16	0	2	-	-
+imag_neg	F32	[2]	8	0	2	-	-
+tied_a	F32	[2, 2]	16	1728	4	-	-
+tied_b	F32	[2, 2]	16	1728	4	-	-
+row1	F32	[2]	8	1736	2	-	-
 ```
 
 ```bash

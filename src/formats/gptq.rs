@@ -1,8 +1,7 @@
 //! GPTQ names inside a safetensors or pytorch container.
 //!
 //! The packed integers stay packed. Dequant is a separate conversion, and this
-//! tool does not run it. Remove this file and the `gptq` line in
-//! `local/supported-formats.txt` to drop the format.
+//! tool does not run it.
 
 /// Note for a tensor that belongs to a GPTQ group (`qweight` plus `g_idx`).
 pub fn detail(name: &str, peers: &[&str]) -> Option<&'static str> {

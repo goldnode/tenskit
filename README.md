@@ -45,9 +45,9 @@ Start with [Getting started](docs/getting-started.md), a five-minute walk-throug
 
 ## Specifications
 
-Every format tenskit reads or writes follows a set of YAML and JSON format specifications. The specification tree is kept outside this repository. `build.rs` turns it into Rust source under [generated/](generated/README.md): the dtype registry, the cross-format mapping, and the format ids; the GGML lookup grids; the GGUF tensor roles and config keys; the Hugging Face config defaults; and a copy of the test vectors. Nothing is parsed from the specifications at run time. Those files are tracked, so a clone builds from them without the specification tree. If a specification and tenskit disagree, the specification wins. The spec file names below, such as `gguf.yaml`, name files in that tree.
+Every format tenskit reads or writes follows a set of YAML and JSON format specifications. If a specification and tenskit disagree, the specification wins. The spec file names below, such as `gguf.yaml`, name those specifications.
 
-Which formats are compiled in is listed in [generated/formats.txt](generated/formats.txt). `build.rs` includes only those modules from [src/formats/](src/formats/).
+Which formats are compiled in is listed in [generated/formats.txt](generated/formats.txt). Only those modules from [src/formats/](src/formats/) are built.
 
 The formats implemented now:
 

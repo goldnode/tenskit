@@ -467,7 +467,7 @@ fn planned_export(archive: &Archive, member: &Member, pack: Pack) -> Result<Plan
         )));
     }
     if matches!(pack, Pack::Npy) {
-        numpy_descr(&member.dtype)?;
+        numpy_descr(&member.dtype).map_err(|err| msg(format!("member {}: {err}", member.name)))?;
     }
     let mut shape = member.shape.clone();
     #[cfg(format_gguf)]
@@ -1952,7 +1952,7 @@ fn upsert_meta(pairs: &mut Vec<(String, MetaValue)>, key: &str, value: MetaValue
 }
 
 fn validate_safe(item: &Planned) -> Result<()> {
-    let dtype = dtype::safe_dtype(&item.dtype)?;
+    let dtype = dtype::safe_dtype(&item.dtype).map_err(|err| msg(format!("member {}: {err}", item.name)))?;
     let expected = dtype::packed_bytes(dtype, &item.shape)?;
     if expected != item.payload.len() {
         return Err(msg(format!(
@@ -1967,7 +1967,7 @@ fn validate_safe(item: &Planned) -> Result<()> {
 
 #[cfg(format_safetensors)]
 fn as_out(item: &Planned) -> Result<OutTensor> {
-    let dtype = dtype::safe_dtype(&item.dtype)?;
+    let dtype = dtype::safe_dtype(&item.dtype).map_err(|err| msg(format!("member {}: {err}", item.name)))?;
     let expected = dtype::packed_bytes(dtype, &item.shape)?;
     if expected != item.payload.len() {
         return Err(msg(format!(
@@ -1986,6 +1986,12 @@ fn as_out(item: &Planned) -> Result<OutTensor> {
 }
 
 fn numpy_descr(dtype_name: &str) -> Result<String> {
+    // A void member (`<V2`, as ml_dtypes saves bfloat16) goes back to .npy
+    // with the descr it was stored with. It has no canonical dtype (npy.yaml),
+    // and this copy does not need one: the bytes and the descr are unchanged.
+    if dtype::numpy_void_width(dtype_name).is_some() {
+        return Ok(dtype_name.to_string());
+    }
     let dtype = dtype::safe_dtype(dtype_name)?;
     dtype.numpy.map(str::to_string).ok_or_else(|| {
         msg(format!(
@@ -2002,7 +2008,26 @@ fn write_npy(path: &Path, item: &Planned) -> Result<()> {
 
 #[cfg(format_npz)]
 fn npz_member(item: &Planned) -> Result<NpzMember> {
-    validate_safe(item)?;
+    if let Some(width) = dtype::numpy_void_width(&item.dtype) {
+        // A void member keeps its descr (see numpy_descr); check its length
+        // against the void width, since it has no safetensors dtype.
+        let width: u64 = width.parse().map_err(|_| msg(format!("member {}: void width {width} is too large", item.name)))?;
+        let expected = item
+            .shape
+            .iter()
+            .try_fold(width, |n, dim| n.checked_mul(*dim))
+            .ok_or_else(|| msg(format!("member {}: shape is too large", item.name)))?;
+        if expected != item.payload.len() {
+            return Err(msg(format!(
+                "tensor {} is {} bytes and dtype {} needs {expected}",
+                item.name,
+                item.payload.len(),
+                item.dtype
+            )));
+        }
+    } else {
+        validate_safe(item)?;
+    }
     let body = if let Some(path) = &item.npy_file {
         NpzMemberBody::WholeFile(path.clone())
     } else if let Payload::Zip { path, entry, .. } = &item.payload {

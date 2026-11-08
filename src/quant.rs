@@ -132,7 +132,8 @@ pub(crate) struct FloatTensor {
 /// copied unchanged, since float32 cannot hold every int32 or int64 value;
 /// float tensors are widened to float32.
 fn plain_tensor(archive: &Archive, member: &Member) -> Result<FloatTensor> {
-    let canonical = dtype::canonical_id(&member.dtype)?;
+    let canonical = dtype::canonical_id(&member.dtype)
+        .map_err(|err| msg(format!("tensor {}: {err}", member.name)))?;
     if matches!(dtype::canon_kind(canonical), Some("int" | "uint" | "bool")) {
         return Ok(FloatTensor {
             name: member.name.clone(),
@@ -838,43 +839,8 @@ pub fn dequant_4bit(
     Ok(values)
 }
 
-const NF4: [f32; 16] = [
-    -1.0,
-    -0.6961928009986877,
-    -0.5250730514526367,
-    -0.39491748809814453,
-    -0.28444138169288635,
-    -0.18477343022823334,
-    -0.09105003625154495,
-    0.0,
-    0.07958029955625534,
-    0.16093020141124725,
-    0.24611230194568634,
-    0.33791524171829224,
-    0.44070982933044434,
-    0.5626170039176941,
-    0.7229568362236023,
-    1.0,
-];
-
-const FP4: [f32; 16] = [
-    0.0,
-    0.0052083334885537624,
-    0.6666666865348816,
-    1.0,
-    0.3333333432674408,
-    0.5,
-    0.1666666716337204,
-    0.25,
-    -0.0,
-    -0.0052083334885537624,
-    -0.6666666865348816,
-    -1.0,
-    -0.3333333432674408,
-    -0.5,
-    -0.1666666716337204,
-    -0.25,
-];
+// NF4 and FP4: the bitsandbytes 4-bit codebooks, from bitsandbytes.yaml.
+include!("../generated/bnb_tables.rs");
 
 /// compressed-tensors pack-quantized. Each module's scheme comes from
 /// config_groups (CT-008), and `w = (q - zp) * (scale / global_scale)` is
@@ -2256,7 +2222,8 @@ fn quantize_file(request: &Request) -> Result<Vec<String>> {
         ("general.file_type".into(), MetaValue::U32(file_type)),
     ];
     for member in &archive.members {
-        let canonical = dtype::canonical_id(&member.dtype)?;
+        let canonical = dtype::canonical_id(&member.dtype)
+            .map_err(|err| msg(format!("tensor {}: {err}", member.name)))?;
         let shape = canonical_shape(&archive, member);
         let mut ne = shape.clone();
         ne.reverse();
@@ -2553,6 +2520,26 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generated codebooks are the spec's values, in code order, as the
+    /// same f32 bits (so the sign of FP4 code 8, -0.0, counts). Each spec
+    /// value is an exact f32, so reading the JSON number as f64 and
+    /// narrowing it gives that f32 even if the last f64 digit is off.
+    #[test]
+    fn the_generated_codebooks_are_the_spec_tables() {
+        let expected = crate::spec_expected::load("bitsandbytes-codebooks.json");
+        for (name, table) in [("NF4Codebook", &NF4), ("FP4Codebook", &FP4)] {
+            let values: Vec<u32> = expected[name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| (value.as_f64().unwrap() as f32).to_bits())
+                .collect();
+            let generated: Vec<u32> = table.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(generated, values, "{name}");
+        }
+        assert!(FP4[8] == 0.0 && FP4[8].is_sign_negative(), "FP4 code 8 is -0.0");
+    }
 
     #[test]
     fn cuda_pack_dequant_matches_the_formula() {

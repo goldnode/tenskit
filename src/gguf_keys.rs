@@ -89,7 +89,7 @@ impl Lit {
     }
 }
 
-/// tables/hf-config-defaults.json, generated as Rust by build.rs.
+/// tables/hf-config-defaults.json, generated as Rust.
 pub(crate) mod hf_defaults {
     use super::Lit;
 
@@ -606,9 +606,9 @@ pub(crate) fn sampling_keys(dir: &std::path::Path) -> (Vec<(String, MetaValue)>,
 // ---------------------------------------------------------------------------
 // GGUF-037: the keys a converter class's set_gguf_parameters chain writes.
 
-/// tables/gguf-config-keys.json, generated as Rust by build.rs: typed
-/// records, sorted for binary search, with every cross-reference resolved to
-/// an index and checked at build time.
+/// tables/gguf-config-keys.json, generated as Rust: typed records, sorted
+/// for binary search, with every cross-reference resolved to an index and
+/// checked when it is generated.
 pub(crate) mod index {
     /// An index into `METHODS`.
     #[derive(Debug, Clone, Copy, PartialEq)]
@@ -945,7 +945,7 @@ impl Walk<'_> {
                 self.raise_event(&method, line, event, now, hparams, &overrides, &mut method_vars, found)?;
             } else if let index::Event::Write { method, index: at } = *event {
                 let method = index::method_at(method);
-                // build.rs checked that the method has this write.
+                // Checked when generated: the method has this write.
                 let write = &method.writes.unwrap_or_default()[at as usize];
                 self.write(method.name, write, now, hparams, &overrides, &mut method_vars, found)?;
             } else if let index::Event::Mutation { site } = *event {
@@ -3096,7 +3096,7 @@ mod tests {
     /// The defaults rebuilt from the compiled statics are the spec's.
     #[test]
     fn the_generated_defaults_are_the_spec_table() {
-        let Some(expected) = crate::spec_expected::load("hf-config-defaults.json") else { return };
+        let expected = crate::spec_expected::load("hf-config-defaults.json");
         let mut model_types = Map::new();
         for row in hf_defaults::MODEL_TYPES {
             let derived: Map<String, Value> = row
@@ -3142,7 +3142,7 @@ mod tests {
     /// every record, field, and resolved reference.
     #[test]
     fn the_generated_index_is_the_spec_table() {
-        let Some(expected) = crate::spec_expected::load("gguf-config-keys.json") else { return };
+        let expected = crate::spec_expected::load("gguf-config-keys.json");
         let site_name = |id: index::SiteId| index::site(id).id;
         let refs = |items: &[index::SiteRef]| -> Value {
             Value::Array(items.iter().map(|item| json!({"phase": item.phase, "site": site_name(item.site)})).collect())

@@ -1,9 +1,8 @@
 //! ONNX models, read as graph initializers.
 //!
 //! The reader walks the protobuf for `ModelProto.graph.initializer` and does
-//! not load a protobuf code generator. Graph nodes are not tensors and are
-//! left in the file. Remove this file and the `onnx` line in
-//! `local/supported-formats.txt` to drop the format.
+//! not load a protobuf code generator. Graph nodes are not tensors and are left
+//! in the file.
 
 use std::collections::BTreeSet;
 use std::fs::File;

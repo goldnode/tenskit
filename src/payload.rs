@@ -86,53 +86,32 @@ impl Payload {
         })
     }
 
-    /// Read `buf` from `at` bytes into the payload.
-    pub fn read_at(&self, at: u64, buf: &mut [u8]) -> Result<()> {
-        let end = at
-            .checked_add(buf.len() as u64)
-            .ok_or_else(|| msg("read is too large"))?;
-        if end > self.len() {
-            return Err(msg("read runs past the payload"));
-        }
+    /// Call `f` with one reader over the whole payload, opened once, so
+    /// reading it front to back is linear even for a deflated npz member.
+    /// The reader yields at most `len()` bytes; a short source shows up as an
+    /// early end of input.
+    pub fn with_reader<T>(&self, f: impl FnOnce(&mut dyn Read) -> Result<T>) -> Result<T> {
         match self {
-            Self::Range { path, offset, .. } => {
+            Self::Range { path, offset, len } => {
                 let mut file = File::open(path).map_err(|err| io_err(path, err))?;
-                file.seek(SeekFrom::Start(offset + at))
+                file.seek(SeekFrom::Start(*offset))
                     .map_err(|err| io_err(path, err))?;
-                file.read_exact(buf).map_err(|err| io_err(path, err))?;
-                Ok(())
+                f(&mut file.take(*len))
             }
-            Self::Bytes(bytes) => {
-                let start = usize::try_from(at).map_err(|_| msg("read is too large"))?;
-                buf.copy_from_slice(&bytes[start..start + buf.len()]);
-                Ok(())
-            }
+            Self::Bytes(bytes) => f(&mut bytes.as_slice()),
             Self::Zip {
-                path, entry, skip, ..
+                path,
+                entry,
+                skip,
+                len,
             } => {
                 #[cfg(format_npz)]
                 {
-                    let mut got = Vec::new();
-                    crate::formats::npz::copy_entry(
-                        path,
-                        entry,
-                        skip + at,
-                        buf.len() as u64,
-                        &mut got,
-                    )?;
-                    if got.len() != buf.len() {
-                        return Err(msg(format!(
-                            "{entry}: expected {} payload bytes, read {}",
-                            buf.len(),
-                            got.len()
-                        )));
-                    }
-                    buf.copy_from_slice(&got);
-                    Ok(())
+                    crate::formats::npz::with_entry_reader(path, entry, *skip, *len, f)
                 }
                 #[cfg(not(format_npz))]
                 {
-                    let _ = (path, entry, skip, at, buf);
+                    let _ = (path, entry, skip, len, f);
                     Err(msg("npz support is not compiled in"))
                 }
             }
