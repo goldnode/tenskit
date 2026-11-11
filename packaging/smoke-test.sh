@@ -35,7 +35,8 @@ else
     [ -f "$pkg" ] || fail "$pkg is missing"
     listing=$(rpm -qlp "$pkg" 2>/dev/null)
     [ "$(rpm -qp --qf '%{ARCH}' "$pkg" 2>/dev/null)" = "$rpm_arch" ] || fail "wrong architecture in $pkg"
-    license=usr/share/licenses/tenskit/LICENSE
+    license=usr/share/licenses/tenskit/LICENSE-MIT
+    has_also=usr/share/licenses/tenskit/LICENSE-APACHE
     if command -v dnf >/dev/null 2>&1; then
         dnf install -y "$pkg"
     elif command -v zypper >/dev/null 2>&1; then
@@ -54,6 +55,7 @@ has() {
     esac
 }
 has "$license"
+[ -z "${has_also:-}" ] || has "$has_also"
 for tool in $tools; do
     has "usr/bin/$tool"
     has "usr/share/man/man1/$tool.1.gz"

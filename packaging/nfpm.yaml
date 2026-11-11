@@ -10,7 +10,7 @@ priority: optional
 maintainer: Nick Reynolds <pkgs@goldnode.org>
 description: Utilities to inspect, edit, compare, convert, and quantize tensor container files
 homepage: https://tenskit.org
-license: MIT
+license: MIT OR Apache-2.0
 
 contents:
   - src: target/package-stage/bin/tenspile
@@ -50,12 +50,17 @@ contents:
     file_info: {mode: 0644}
 
   # Each format has its own place for the license.
-  - src: LICENSE
+  - src: packaging/copyright
     dst: /usr/share/doc/tenskit/copyright
     packager: deb
     file_info: {mode: 0644}
-  - src: LICENSE
-    dst: /usr/share/licenses/tenskit/LICENSE
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/tenskit/LICENSE-MIT
+    type: license
+    packager: rpm
+    file_info: {mode: 0644}
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/tenskit/LICENSE-APACHE
     type: license
     packager: rpm
     file_info: {mode: 0644}

@@ -125,17 +125,17 @@ Download the file for your system from the latest release:
 | Debian, Ubuntu | `tenskit_VERSION-1_amd64.deb` | `tenskit_VERSION-1_arm64.deb` |
 | RHEL and clones, Fedora, openSUSE | `tenskit-VERSION-1.x86_64.rpm` | `tenskit-VERSION-1.aarch64.rpm` |
 
-Run `uname -m` to see which architecture you have. Then install it, shown here for version 0.3.0 on x86_64. The `./` is needed so the tool reads the file instead of searching its repositories.
+Run `uname -m` to see which architecture you have. Then install it, shown here for version 0.4.0 on x86_64. The `./` is needed so the tool reads the file instead of searching its repositories.
 
 ```bash
 # Debian, Ubuntu
-sudo apt install ./tenskit_0.3.0-1_amd64.deb
+sudo apt install ./tenskit_0.4.0-1_amd64.deb
 
 # RHEL and clones, Fedora
-sudo dnf install ./tenskit-0.3.0-1.x86_64.rpm
+sudo dnf install ./tenskit-0.4.0-1.x86_64.rpm
 
 # openSUSE
-sudo zypper install --allow-unsigned-rpm ./tenskit-0.3.0-1.x86_64.rpm
+sudo zypper install --allow-unsigned-rpm ./tenskit-0.4.0-1.x86_64.rpm
 ```
 
 Packages from Releases aren't GPG-signed, which is why zypper needs `--allow-unsigned-rpm`. To check a download, see [Verify a download](#verify-a-download).
@@ -145,7 +145,7 @@ Packages from Releases aren't GPG-signed, which is why zypper needs `--allow-uns
 The `.tar.gz` archive from [Releases](https://github.com/goldnode/tenskit/releases) installs into your home directory. Set `version` to the latest release:
 
 ```bash
-version=0.3.0
+version=0.4.0
 arch=$(uname -m)
 name=tenskit-$version-$arch-linux
 
@@ -217,7 +217,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 Releases also have build provenance, which shows the file was built by this repository's GitHub workflow. To check it, use the [GitHub CLI](https://cli.github.com/):
 
 ```bash
-gh attestation verify tenskit_0.3.0-1_amd64.deb --repo goldnode/tenskit
+gh attestation verify tenskit_0.4.0-1_amd64.deb --repo goldnode/tenskit
 ```
 
 ## Check the install

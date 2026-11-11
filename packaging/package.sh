@@ -49,7 +49,7 @@ tree=$stage/$name
 mkdir -p "$tree/bin" "$tree/share/man/man1"
 cp "$stage"/bin/* "$tree/bin/"
 cp "$stage"/man/* "$tree/share/man/man1/"
-cp LICENSE README.md "$tree/"
+cp LICENSE-MIT LICENSE-APACHE README.md "$tree/"
 tar -C "$stage" --owner=0 --group=0 -czf "$dist/$name.tar.gz" "$name"
 
 ls -l "$dist"

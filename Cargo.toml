@@ -1,10 +1,10 @@
 [package]
 name = "tenskit"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Utilities to inspect, edit, compare, convert, and quantize tensor container files"
 authors = ["Nick Reynolds (goldnode)"]
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/goldnode/tenskit"
 readme = "README.md"
 publish = false

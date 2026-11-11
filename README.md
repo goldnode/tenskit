@@ -63,4 +63,6 @@ The other format specifications are in scope for this project and are not implem
 
 ## License
 
-[MIT](LICENSE). Copyright 2026 Nick Reynolds (goldnode).
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. Copyright 2026 Nick Reynolds (goldnode).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in tenskit by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
